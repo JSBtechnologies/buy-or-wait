@@ -687,6 +687,10 @@ pub fn llm_evidence(
     prompt: &PromptSet,
     decoding: &DecodingConfig,
     candidate: &CandidateConfig,
+    // User-requested backup frontier model (board decision, PLAN.md Phase 2d): tried for
+    // this same batch when `candidate`'s call errors or its reply doesn't parse into valid
+    // records — a fresh call, not a retry of the failed one.
+    fallback: Option<&CandidateConfig>,
     messages: &[&Message],
     home_currency: &str,
 ) -> anyhow::Result<Vec<EvidenceRecord>> {
@@ -698,7 +702,14 @@ pub fn llm_evidence(
     if unresolved.is_empty() {
         return Ok(Vec::new());
     }
-    let by_id = extract_batch(client, cold, prompt, decoding, candidate, &unresolved)?;
+    let by_id = match extract_batch(client, cold, prompt, decoding, candidate, &unresolved) {
+        Ok(by_id) => by_id,
+        Err(e) => {
+            eprintln!("llm: batch via {} failed: {e:#}", candidate.id);
+            let Some(fallback) = fallback else { return Ok(Vec::new()) };
+            extract_batch(client, cold, prompt, decoding, fallback, &unresolved)?
+        }
+    };
     let mut out = Vec::new();
     for message in unresolved {
         let Some(records) = by_id.get(&message.message_id) else { continue };

@@ -59,10 +59,21 @@ pub struct ImageFigures {
     pub line_items_sum_check: Option<f64>,
 }
 
-const TOL: f64 = 0.01;
+/// Rounding tolerance for reconciliation checks combining two printed terms (e.g.
+/// subtotal+tax=total). Analyst audit RULES.md S5 image_07: subtotal 8,122 + tax 406.10 =
+/// 8,528.10 exactly, but the same page also prints a plain "8,528" total — both readings
+/// are legitimate, and an exact-cent check rejects a genuinely reconciling document. Allow
+/// each of the two printed terms in a check to be off by up to half a currency unit
+/// (0.5), for a combined tolerance of 1.0, and log whenever the looser bound is what
+/// actually let a check pass (never silently — a human should be able to see it happened).
+const ROUNDING_TOLERANCE_2TERM: f64 = 1.0;
 
-fn close(a: f64, b: f64) -> bool {
-    (a - b).abs() <= TOL
+fn close(a: f64, b: f64, tolerance: f64) -> bool {
+    let diff = (a - b).abs();
+    if diff > 0.0 && diff <= tolerance {
+        eprintln!("reconcile: {a} vs {b} accepted within rounding tolerance {tolerance} (off by {diff})");
+    }
+    diff <= tolerance
 }
 
 fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -76,7 +87,12 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
         (EventType::Income, Status::Settled | Status::Scheduled) => {
             figures.net_pay.or(figures.total)
         }
-        (_, Status::Settled) => figures.amount_paid.or(figures.total),
+        // engine analyst audit RULES.md S5 image_12: prefer the labeled `total` over
+        // `amount_paid` for a settled expense. A receipt's "amount paid"/"cash" line can be
+        // the cash tendered (e.g. "Cash 40.00, Change 6.50" against a 33.50 total), which is
+        // not the expense amount; the printed total is the authoritative figure whenever
+        // it's present, with amount_paid only as a fallback when no total is printed.
+        (_, Status::Settled) => figures.total.or(figures.amount_paid),
         (_, Status::Pending | Status::Scheduled) => {
             if let (Some(before), Some(before_val), Some(after)) = (
                 figures.amount_due_before_date,
@@ -98,30 +114,43 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
 }
 
 /// Every check that has the data to run, must pass, or the figure is rejected
-/// (PLAN.md §2.3: subtotal+tax=total, gross-deductions=net, currency match, and the VLM's
-/// own line-item sum against whatever it lines up with).
+/// (PLAN.md §2.3: subtotal+tax=total, gross-deductions=net, amount_paid+balance_due=total,
+/// currency match). `line_items_sum_check` is a fallback signal only, checked solely when
+/// none of the labeled-field checks above had enough data to run at all — analyst audit
+/// RULES.md S5 image_11: a multi-section hospital bill's itemized breakup sums to 3,150
+/// while the labeled Total/Balance (which already reconcile against each other, 0 + 3,650 =
+/// 3,650) say 3,650. Re-summing an arbitrary itemized breakup is not as reliable as the
+/// document's own labeled totals, so it never overrides them.
 pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
+    let mut checked_labeled_fields = false;
+
     if let (Some(sub), Some(tax), Some(total)) = (figures.subtotal, figures.tax, figures.total) {
-        if !close(sub + tax, total) {
+        if !close(sub + tax, total, ROUNDING_TOLERANCE_2TERM) {
             return false;
         }
+        checked_labeled_fields = true;
     }
     if let (Some(gross), Some(ded), Some(net)) = (figures.gross_pay, figures.deductions, figures.net_pay)
     {
-        if !close(gross - ded, net) {
+        if !close(gross - ded, net, ROUNDING_TOLERANCE_2TERM) {
             return false;
         }
+        checked_labeled_fields = true;
     }
     if let (Some(paid), Some(bal), Some(total)) = (figures.amount_paid, figures.balance_due, figures.total)
     {
-        if !close(paid + bal, total) {
+        if !close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
             return false;
         }
+        checked_labeled_fields = true;
     }
-    if let (Some(sum), Some(target)) = (figures.line_items_sum_check, figures.subtotal.or(figures.total))
-    {
-        if !close(sum, target) {
-            return false;
+    if !checked_labeled_fields {
+        if let (Some(sum), Some(target)) =
+            (figures.line_items_sum_check, figures.subtotal.or(figures.total))
+        {
+            if !close(sum, target, ROUNDING_TOLERANCE_2TERM) {
+                return false;
+            }
         }
     }
     if let Some(cur) = &figures.currency {
@@ -220,6 +249,11 @@ pub fn resolve_blank_amount(
     image_id: &str,
     vlm_primary: &CandidateConfig,
     vlm_escalation: Option<&CandidateConfig>,
+    // User-requested backup frontier model (board decision, PLAN.md Phase 2d): tried after
+    // `vlm_escalation` also fails to reconcile, or when an earlier candidate's call itself
+    // errored (network/provider outage) rather than just producing a bad reconcile — both
+    // cases already collapse to `attempt` returning `Ok(None)` below.
+    vlm_fallback: Option<&CandidateConfig>,
     event: &Event,
 ) -> anyhow::Result<Option<EvidenceRecord>> {
     let image_b64 = downscale_and_encode(image_path, image_max_dim_px)?;
@@ -234,11 +268,8 @@ pub fn resolve_blank_amount(
         }
     };
 
-    if let Some(record) = attempt(vlm_primary)? {
-        return Ok(Some(record));
-    }
-    if let Some(escalation) = vlm_escalation {
-        if let Some(record) = attempt(escalation)? {
+    for candidate in [Some(vlm_primary), vlm_escalation, vlm_fallback].into_iter().flatten() {
+        if let Some(record) = attempt(candidate)? {
             return Ok(Some(record));
         }
     }
@@ -283,6 +314,81 @@ mod tests {
         let event = income_event();
         assert!(reconciles(&figures, &event));
         assert_eq!(select(&figures, &event), Some(4_365_000.0));
+    }
+
+    fn expense_event(id: &str, category: &str, currency: &str, status: Status) -> Event {
+        Event {
+            id: id.into(),
+            event_type: EventType::Expense,
+            description: "x".into(),
+            category: category.into(),
+            direction: Direction::Debit,
+            amount: None,
+            currency: currency.into(),
+            event_date: NaiveDate::from_ymd_opt(2025, 10, 1).unwrap(),
+            settlement_date: Some(NaiveDate::from_ymd_opt(2025, 10, 1).unwrap()),
+            status,
+            linked_event_id: None,
+            flexibility: Flexibility::Fixed,
+            minimum_allowed_amount: None,
+        }
+    }
+
+    /// Analyst audit RULES.md S5 image_07: subtotal 8,122 + tax 406.10 = 8,528.10 exactly,
+    /// but the page also prints a plain "8,528" total. An exact-cent check would reject a
+    /// genuinely reconciling document; the documented rounding tolerance accepts it (and
+    /// selects the printed total, not a recomputed one).
+    #[test]
+    fn image_07_reconciles_within_rounding_tolerance() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Invoice),
+            currency: Some("INR".into()),
+            subtotal: Some(8122.0),
+            tax: Some(406.10),
+            total: Some(8528.0),
+            ..Default::default()
+        };
+        let event = expense_event("event_3231", "dining", "INR", Status::Settled);
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(8528.0));
+    }
+
+    /// Analyst audit RULES.md S5 image_11: a multi-section hospital bill's itemized
+    /// breakup sums to 3,150, but the labeled Amount Paid (0) + Balance (3,650) already
+    /// reconcile against the labeled Total (3,650). The line-item sum must never override
+    /// labeled fields that already reconcile among themselves.
+    #[test]
+    fn image_11_ignores_line_item_sum_when_labeled_fields_reconcile() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Invoice),
+            currency: Some("INR".into()),
+            total: Some(3650.0),
+            amount_paid: Some(0.0),
+            balance_due: Some(3650.0),
+            line_items_sum_check: Some(3150.0), // wrong: breakup subtotals miss a line
+            ..Default::default()
+        };
+        let event = expense_event("event_6859", "healthcare", "INR", Status::Scheduled);
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(3650.0));
+    }
+
+    /// Analyst audit RULES.md S5 image_12: a settled expense's "amount paid"/cash line can
+    /// be the cash TENDERED (40.00, with 6.50 change), not the expense itself (33.50
+    /// total). The selector must prefer the printed total over amount_paid whenever a
+    /// total is present.
+    #[test]
+    fn image_12_settled_expense_prefers_total_over_cash_tendered_amount_paid() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Receipt),
+            currency: Some("USD".into()),
+            total: Some(33.50),
+            amount_paid: Some(40.00), // cash tendered, not the expense amount
+            ..Default::default()
+        };
+        let event = expense_event("event_7307", "transport", "USD", Status::Settled);
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(33.50));
     }
 
     #[test]
@@ -347,6 +453,7 @@ mod tests {
             "image_01",
             vlm_primary,
             cfg.vlm_escalation(),
+            cfg.vlm_fallback(),
             &event,
         )
         .expect("call should not error")

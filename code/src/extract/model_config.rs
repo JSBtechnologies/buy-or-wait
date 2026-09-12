@@ -64,9 +64,17 @@ pub struct Selected {
     /// failure. May equal `vlm_primary` (same model, second attempt) or name a different
     /// candidate.
     pub vlm_escalation: Option<String>,
+    /// Candidate id from `[[candidates.vlm]]` for a backup frontier model, tried after
+    /// `vlm_escalation` also fails to reconcile (or when `vlm_primary`/`vlm_escalation`
+    /// themselves are unavailable — a network/provider error, not just a bad reconcile).
+    /// User-requested resilience layer beyond the primary bake-off pick.
+    pub vlm_fallback: Option<String>,
     /// Candidate id from `[[candidates.llm]]` for messages the deterministic skeleton
     /// parser does not recognize.
     pub llm_primary: Option<String>,
+    /// Candidate id from `[[candidates.llm]]` for a backup frontier model, tried when
+    /// `llm_primary`'s call fails or its reply doesn't parse into valid records.
+    pub llm_fallback: Option<String>,
     /// Image max dimension in px to actually ship with (one of
     /// `image_preprocessing.candidate_max_dimensions_px`, PLAN.md §3 token-efficiency
     /// lever). Defaults to 1024 if unset — the bake-off's resolution sweep should
@@ -88,8 +96,16 @@ impl ModelsConfig {
         self.selected.vlm_escalation.as_deref().and_then(|id| self.find_vlm(id))
     }
 
+    pub fn vlm_fallback(&self) -> Option<&CandidateConfig> {
+        self.selected.vlm_fallback.as_deref().and_then(|id| self.find_vlm(id))
+    }
+
     pub fn llm_primary(&self) -> Option<&CandidateConfig> {
         self.selected.llm_primary.as_deref().and_then(|id| self.find_llm(id))
+    }
+
+    pub fn llm_fallback(&self) -> Option<&CandidateConfig> {
+        self.selected.llm_fallback.as_deref().and_then(|id| self.find_llm(id))
     }
 
     pub fn image_max_dim_px(&self) -> u32 {
@@ -128,7 +144,9 @@ mod tests {
         .unwrap();
         assert!(cfg.vlm_primary().is_none());
         assert!(cfg.vlm_escalation().is_none());
+        assert!(cfg.vlm_fallback().is_none());
         assert!(cfg.llm_primary().is_none());
+        assert!(cfg.llm_fallback().is_none());
         assert_eq!(cfg.image_max_dim_px(), 1024);
     }
 
@@ -146,7 +164,9 @@ mod tests {
             [selected]
             vlm_primary = "vendor/VlmA"
             vlm_escalation = "vendor/VlmB"
+            vlm_fallback = "vendor/VlmC"
             llm_primary = "vendor/LlmA"
+            llm_fallback = "vendor/LlmB"
             image_max_dim_px = 768
             [[candidates.vlm]]
             id = "vendor/VlmA"
@@ -156,16 +176,26 @@ mod tests {
             id = "vendor/VlmB"
             provider = "p2"
             model_revision = "rev2"
+            [[candidates.vlm]]
+            id = "vendor/VlmC"
+            provider = "p4"
+            model_revision = "rev4"
             [[candidates.llm]]
             id = "vendor/LlmA"
             provider = "p3"
             model_revision = "rev3"
+            [[candidates.llm]]
+            id = "vendor/LlmB"
+            provider = "p5"
+            model_revision = "rev5"
             "#,
         )
         .unwrap();
         assert_eq!(cfg.vlm_primary().unwrap().id, "vendor/VlmA");
         assert_eq!(cfg.vlm_escalation().unwrap().id, "vendor/VlmB");
+        assert_eq!(cfg.vlm_fallback().unwrap().id, "vendor/VlmC");
         assert_eq!(cfg.llm_primary().unwrap().id, "vendor/LlmA");
+        assert_eq!(cfg.llm_fallback().unwrap().id, "vendor/LlmB");
         assert_eq!(cfg.image_max_dim_px(), 768);
     }
 }
