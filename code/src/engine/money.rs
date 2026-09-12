@@ -1,5 +1,9 @@
-//! Exact money arithmetic in minor units (hundredths) and every money formatting/rounding
-//! rule in one place (PLAN.md risk table: "keep rounding in one function").
+//! Exact money arithmetic and every money formatting/rounding rule in one place (PLAN.md
+//! risk table: "keep rounding in one function").
+//!
+//! Amounts are held in 1/10,000 of the currency unit: CSV amounts and rates carry at most two
+//! decimals, so every converted amount is exact and RULES S2.2 ("do not round converted
+//! amounts, round only at output") holds. Rounding to cents happens only when formatting.
 
 use std::fmt;
 use std::iter::Sum;
@@ -7,82 +11,81 @@ use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
 use serde::{Deserialize, Serialize};
 
-/// An amount in hundredths of the currency unit. All engine arithmetic is integer, so the
-/// forecast is exact and deterministic; floats only exist at the CSV boundary.
+/// Internal units per currency unit.
+pub const SCALE: i64 = 10_000;
+/// Internal units per cent.
+const CENT: i64 = SCALE / 100;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Cents(pub i64);
+pub struct Money(pub i64);
 
-impl Cents {
-    pub const ZERO: Cents = Cents(0);
+impl Money {
+    pub const ZERO: Money = Money(0);
 
-    /// From a CSV float that carries at most two decimals.
-    pub fn from_f64(v: f64) -> Cents {
-        Cents((v * 100.0).round() as i64)
+    /// From a CSV float (at most a few decimals).
+    pub fn from_f64(v: f64) -> Money {
+        Money((v * SCALE as f64).round() as i64)
     }
 
-    pub fn from_units(units: i64) -> Cents {
-        Cents(units * 100)
+    pub fn from_units(units: i64) -> Money {
+        Money(units * SCALE)
     }
 
-    pub fn is_negative(self) -> bool {
-        self.0 < 0
+    pub fn to_f64(self) -> f64 {
+        self.0 as f64 / SCALE as f64
     }
 
-    pub fn max(self, other: Cents) -> Cents {
+    pub fn max(self, other: Money) -> Money {
         if self >= other { self } else { other }
     }
 
-    pub fn min(self, other: Cents) -> Cents {
+    pub fn min(self, other: Money) -> Money {
         if self <= other { self } else { other }
     }
 
-    pub fn abs(self) -> Cents {
-        Cents(self.0.abs())
+    /// Multiply by an exact decimal rate, rounding half away from zero to the internal unit.
+    pub fn convert(self, rate: &DecimalRate) -> Money {
+        Money(div_round(self.0 as i128 * rate.mantissa, 10i128.pow(rate.scale)) as i64)
     }
 
-    pub fn is_whole(self) -> bool {
-        self.0 % 100 == 0
+    /// Round half away from zero to whole cents.
+    pub fn round_to_cent(self) -> Money {
+        Money(div_round(self.0 as i128, CENT as i128) as i64 * CENT)
     }
 
-    /// Multiply by an exact decimal rate, rounding half away from zero to the cent.
-    pub fn convert(self, rate: &DecimalRate) -> Cents {
-        let num = self.0 as i128 * rate.mantissa;
-        let den = 10i128.pow(rate.scale);
-        let q = num / den;
-        let r = num % den;
-        let q = if 2 * r.abs() >= den { q + num.signum() } else { q };
-        Cents(q as i64)
+    /// Round toward negative infinity to whole cents.
+    pub fn floor_to_cent(self) -> Money {
+        Money(self.0.div_euclid(CENT) * CENT)
     }
 
-    /// Plain CSV form with trailing zeros trimmed: `25256`, `603.3`, `87170.56`.
+    fn cents(self) -> i64 {
+        self.round_to_cent().0 / CENT
+    }
+
+    /// Plain CSV form, rounded to 2 dp with trailing zeros trimmed: `25256`, `603.3`, `87170.56`.
     pub fn fmt_plain(self) -> String {
-        let s = self.fmt_fixed2();
+        let s = fixed2(self.cents());
         if let Some(stripped) = s.strip_suffix(".00") {
             return stripped.to_string();
         }
-        if s.contains('.') && s.ends_with('0') {
+        if s.ends_with('0') {
             return s[..s.len() - 1].to_string();
         }
         s
     }
 
-    /// Payment-plan / reduce_to form: whole amounts bare, otherwise two decimals
+    /// Payment-plan / reduce_to form: whole amounts bare, otherwise exactly 2 dp
     /// (`25256`, `620.40`, `23.50`).
     pub fn fmt_plan(self) -> String {
-        if self.is_whole() {
-            format!("{}", self.0 / 100)
-        } else {
-            self.fmt_fixed2()
-        }
+        let c = self.cents();
+        if c % 100 == 0 { format!("{}", c / 100) } else { fixed2(c) }
     }
 
     /// Explanation form with thousands separators: `25,256`, `620.40`, `15,952,906.67`.
     pub fn fmt_grouped(self) -> String {
-        let neg = self.0 < 0;
-        let abs = self.0.unsigned_abs();
-        let units = abs / 100;
-        let frac = abs % 100;
-        let digits = units.to_string();
+        let c = self.cents();
+        let abs = c.unsigned_abs();
+        let digits = (abs / 100).to_string();
         let mut grouped = String::new();
         for (i, ch) in digits.chars().enumerate() {
             if i > 0 && (digits.len() - i) % 3 == 0 {
@@ -90,63 +93,66 @@ impl Cents {
             }
             grouped.push(ch);
         }
-        let sign = if neg { "-" } else { "" };
-        if frac == 0 {
-            format!("{sign}{grouped}")
-        } else {
-            format!("{sign}{grouped}.{frac:02}")
+        let sign = if c < 0 { "-" } else { "" };
+        match abs % 100 {
+            0 => format!("{sign}{grouped}"),
+            frac => format!("{sign}{grouped}.{frac:02}"),
         }
-    }
-
-    fn fmt_fixed2(self) -> String {
-        let neg = self.0 < 0;
-        let abs = self.0.unsigned_abs();
-        format!("{}{}.{:02}", if neg { "-" } else { "" }, abs / 100, abs % 100)
     }
 }
 
-impl fmt::Display for Cents {
+fn fixed2(cents: i64) -> String {
+    let abs = cents.unsigned_abs();
+    format!("{}{}.{:02}", if cents < 0 { "-" } else { "" }, abs / 100, abs % 100)
+}
+
+fn div_round(num: i128, den: i128) -> i128 {
+    let q = num / den;
+    let r = num % den;
+    if 2 * r.abs() >= den { q + num.signum() } else { q }
+}
+
+impl fmt::Display for Money {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.fmt_plain())
     }
 }
 
-impl Add for Cents {
-    type Output = Cents;
-    fn add(self, o: Cents) -> Cents {
-        Cents(self.0 + o.0)
+impl Add for Money {
+    type Output = Money;
+    fn add(self, o: Money) -> Money {
+        Money(self.0 + o.0)
     }
 }
-impl Sub for Cents {
-    type Output = Cents;
-    fn sub(self, o: Cents) -> Cents {
-        Cents(self.0 - o.0)
+impl Sub for Money {
+    type Output = Money;
+    fn sub(self, o: Money) -> Money {
+        Money(self.0 - o.0)
     }
 }
-impl Neg for Cents {
-    type Output = Cents;
-    fn neg(self) -> Cents {
-        Cents(-self.0)
+impl Neg for Money {
+    type Output = Money;
+    fn neg(self) -> Money {
+        Money(-self.0)
     }
 }
-impl AddAssign for Cents {
-    fn add_assign(&mut self, o: Cents) {
+impl AddAssign for Money {
+    fn add_assign(&mut self, o: Money) {
         self.0 += o.0;
     }
 }
-impl SubAssign for Cents {
-    fn sub_assign(&mut self, o: Cents) {
+impl SubAssign for Money {
+    fn sub_assign(&mut self, o: Money) {
         self.0 -= o.0;
     }
 }
-impl Sum for Cents {
-    fn sum<I: Iterator<Item = Cents>>(iter: I) -> Cents {
-        Cents(iter.map(|c| c.0).sum())
+impl Sum for Money {
+    fn sum<I: Iterator<Item = Money>>(iter: I) -> Money {
+        Money(iter.map(|c| c.0).sum())
     }
 }
 
-/// An exchange rate held as an exact decimal (`mantissa / 10^scale`) so conversion of
-/// large IDR amounts never picks up float error.
+/// An exchange rate held as an exact decimal (`mantissa / 10^scale`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecimalRate {
     pub mantissa: i128,
@@ -161,12 +167,8 @@ impl DecimalRate {
 
     pub fn parse(s: &str) -> Option<DecimalRate> {
         let s = s.trim();
-        let (int, frac) = match s.split_once('.') {
-            Some((i, f)) => (i, f),
-            None => (s, ""),
-        };
-        let digits = format!("{int}{frac}");
-        let mantissa: i128 = digits.parse().ok()?;
+        let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+        let mantissa: i128 = format!("{int}{frac}").parse().ok()?;
         Some(DecimalRate { mantissa, scale: frac.len() as u32 })
     }
 
@@ -184,21 +186,22 @@ mod tests {
 
     #[test]
     fn formats() {
-        assert_eq!(Cents::from_f64(25256.0).fmt_plain(), "25256");
-        assert_eq!(Cents::from_f64(603.3).fmt_plain(), "603.3");
-        assert_eq!(Cents::from_f64(17229139.2).fmt_plain(), "17229139.2");
-        assert_eq!(Cents::from_f64(620.4).fmt_plan(), "620.40");
-        assert_eq!(Cents::from_f64(25256.0).fmt_plan(), "25256");
-        assert_eq!(Cents::from_f64(15952906.67).fmt_grouped(), "15,952,906.67");
-        assert_eq!(Cents::from_f64(620.4).fmt_grouped(), "620.40");
-        assert_eq!(Cents::from_f64(122400.0).fmt_grouped(), "122,400");
+        assert_eq!(Money::from_f64(25256.0).fmt_plain(), "25256");
+        assert_eq!(Money::from_f64(603.3).fmt_plain(), "603.3");
+        assert_eq!(Money::from_f64(17229139.2).fmt_plain(), "17229139.2");
+        assert_eq!(Money::from_f64(284.565).fmt_plain(), "284.57");
+        assert_eq!(Money::from_f64(620.4).fmt_plan(), "620.40");
+        assert_eq!(Money::from_f64(25256.0).fmt_plan(), "25256");
+        assert_eq!(Money::from_f64(15952906.67).fmt_grouped(), "15,952,906.67");
+        assert_eq!(Money::from_f64(620.4).fmt_grouped(), "620.40");
+        assert_eq!(Money::from_f64(122400.0).fmt_grouped(), "122,400");
     }
 
     #[test]
     fn converts_exactly() {
-        let r = DecimalRate::from_f64(16250.5);
-        assert_eq!(Cents::from_f64(1800.0).convert(&r), Cents::from_f64(29250900.0));
+        let r = DecimalRate::from_f64(15833.33);
+        assert_eq!(Money::from_f64(1800.0).convert(&r), Money::from_f64(28499994.0));
         let r = DecimalRate::from_f64(0.92);
-        assert_eq!(Cents::from_f64(10.01).convert(&r), Cents(921));
+        assert_eq!(Money::from_f64(10.01).convert(&r), Money(92092));
     }
 }

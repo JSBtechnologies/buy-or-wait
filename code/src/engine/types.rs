@@ -11,7 +11,7 @@ use anyhow::{anyhow, bail, Result};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use super::money::{Cents, DecimalRate};
+use super::money::{Money, DecimalRate};
 use crate::model;
 
 macro_rules! string_enum {
@@ -100,14 +100,14 @@ pub struct Event {
     pub category: String,
     pub direction: Direction,
     /// `None` when the row is blank: the figure must come from an image, never zero.
-    pub amount: Option<Cents>,
+    pub amount: Option<Money>,
     pub currency: String,
     pub event_date: NaiveDate,
     pub settlement_date: Option<NaiveDate>,
     pub status: Status,
     pub linked_event_id: Option<String>,
     pub flexibility: Flexibility,
-    pub minimum_allowed_amount: Option<Cents>,
+    pub minimum_allowed_amount: Option<Money>,
 }
 
 impl Event {
@@ -120,8 +120,8 @@ impl Event {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     pub home_currency: String,
-    pub current_available_balance: Cents,
-    pub minimum_balance_to_keep: Cents,
+    pub current_available_balance: Money,
+    pub minimum_balance_to_keep: Money,
     pub financial_priorities: Vec<String>,
     pub protected_categories: Vec<String>,
     pub reducible_categories: Vec<String>,
@@ -144,7 +144,7 @@ impl Profile {
 /// CSV columns (batch) or a model parse of free text (interactive).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestSpec {
-    pub amount: Cents,
+    pub amount: Money,
     pub deadline: NaiveDate,
     pub request_type: String,
     pub allows_partial_payment: bool,
@@ -154,18 +154,18 @@ pub struct RequestSpec {
 pub struct PaymentOption {
     pub id: String,
     pub method: PaymentMethod,
-    pub payment_amount: Cents,
+    pub payment_amount: Money,
     pub number_of_payments: u32,
     pub first_payment_date: NaiveDate,
     pub payment_frequency_days: Option<u32>,
-    pub financing_fee: Cents,
-    pub total_payable_amount: Cents,
+    pub financing_fee: Money,
+    pub total_payable_amount: Money,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Payment {
     pub date: NaiveDate,
-    pub amount: Cents,
+    pub amount: Money,
 }
 
 impl PaymentOption {
@@ -211,8 +211,15 @@ impl RateTable {
 }
 
 impl RateProvider for RateTable {
+    /// The row for `date` in the stated direction; for a date with no row (projected
+    /// occurrences), the latest row on or before it for the same pair (RULES S2.2).
     fn rate(&self, date: NaiveDate, from: &str, to: &str) -> Option<DecimalRate> {
-        self.rates.get(&(date, from.to_string(), to.to_string())).copied()
+        let pair_matches = |k: &(NaiveDate, String, String)| k.1 == from && k.2 == to;
+        self.rates
+            .range(..=(date, from.to_string(), to.to_string()))
+            .rev()
+            .find(|(k, _)| pair_matches(k))
+            .map(|(_, r)| *r)
     }
 }
 
@@ -236,14 +243,14 @@ impl Event {
             description: e.description.clone(),
             category: e.category.clone(),
             direction: e.direction.parse()?,
-            amount: e.amount.map(Cents::from_f64),
+            amount: e.amount.map(Money::from_f64),
             currency: e.currency.clone(),
             event_date: e.event_date,
             settlement_date: e.settlement_date,
             status: e.status.parse()?,
             linked_event_id: opt_str(&e.linked_event_id),
             flexibility: e.flexibility.parse()?,
-            minimum_allowed_amount: e.minimum_allowed_amount.map(Cents::from_f64),
+            minimum_allowed_amount: e.minimum_allowed_amount.map(Money::from_f64),
         })
     }
 }
@@ -256,8 +263,8 @@ impl Profile {
             .collect::<Result<Vec<PaymentMethod>>>()?;
         Ok(Profile {
             home_currency: p.home_currency.clone(),
-            current_available_balance: Cents::from_f64(p.current_available_balance),
-            minimum_balance_to_keep: Cents::from_f64(p.minimum_balance_to_keep),
+            current_available_balance: Money::from_f64(p.current_available_balance),
+            minimum_balance_to_keep: Money::from_f64(p.minimum_balance_to_keep),
             financial_priorities: split_list(&p.financial_priorities),
             protected_categories: split_list(&p.expense_categories_to_protect),
             reducible_categories: split_list(&p.expense_categories_user_is_willing_to_reduce),
@@ -272,7 +279,7 @@ impl RequestSpec {
     /// Batch intake: the four fields straight from the CSV columns (0 tokens).
     pub fn from_model(r: &model::Request) -> RequestSpec {
         RequestSpec {
-            amount: Cents::from_f64(r.requested_amount),
+            amount: Money::from_f64(r.requested_amount),
             deadline: r.desired_completion_date,
             request_type: r.request_type.clone(),
             allows_partial_payment: r.allows_partial_payment,
@@ -289,12 +296,12 @@ impl PaymentOption {
         Ok(PaymentOption {
             id: o.payment_option_id.clone(),
             method,
-            payment_amount: Cents::from_f64(o.payment_amount),
+            payment_amount: Money::from_f64(o.payment_amount),
             number_of_payments: o.number_of_payments,
             first_payment_date: o.first_payment_date,
             payment_frequency_days: o.payment_frequency_days,
-            financing_fee: Cents::from_f64(o.financing_fee),
-            total_payable_amount: Cents::from_f64(o.total_payable_amount),
+            financing_fee: Money::from_f64(o.financing_fee),
+            total_payable_amount: Money::from_f64(o.total_payable_amount),
         })
     }
 }

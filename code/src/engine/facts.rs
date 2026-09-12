@@ -4,7 +4,7 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use super::money::Cents;
+use super::money::Money;
 use super::plans::{DropReason, RankKey};
 use super::types::{AffordabilityStatus, Payment, PaymentMethod};
 
@@ -13,7 +13,7 @@ pub struct CandidateFact {
     pub label: String,
     pub method: PaymentMethod,
     pub option_id: Option<String>,
-    pub total_paid: Cents,
+    pub total_paid: Money,
     pub payments: Vec<Payment>,
     pub changes: Vec<String>,
     pub outcome: CandidateOutcome,
@@ -21,7 +21,7 @@ pub struct CandidateFact {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CandidateOutcome {
-    Survived { rank: usize, key: RankKey, trough_balance: Cents, trough_date: NaiveDate },
+    Survived { rank: usize, key: RankKey, trough_balance: Money, trough_date: NaiveDate },
     Dropped(DropReason),
 }
 
@@ -32,7 +32,7 @@ pub struct ChangeFact {
     pub description: String,
     pub category: String,
     pub stop: bool,
-    pub new_amount: Option<Cents>,
+    pub new_amount: Option<Money>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -40,25 +40,26 @@ pub struct DecisionFacts {
     pub request_id: String,
     pub request_date: NaiveDate,
     pub currency: String,
-    pub requested_amount: Cents,
+    pub requested_amount: Money,
     pub desired_completion_date: NaiveDate,
     pub allows_partial_payment: bool,
+    pub accepted_methods: Vec<PaymentMethod>,
 
     // ---- position ----------------------------------------------------------------------
-    pub starting_balance: Cents,
-    pub minimum_balance: Cents,
-    pub reserved_pending_total: Cents,
+    pub starting_balance: Money,
+    pub minimum_balance: Money,
+    pub reserved_pending_total: Money,
     pub reserved_event_ids: Vec<String>,
     /// Lowest projected balance with no payment, and its first date.
-    pub trough_balance: Cents,
+    pub trough_balance: Money,
     pub trough_date: NaiveDate,
     /// `trough_balance - minimum_balance` (may be negative).
-    pub headroom: Cents,
+    pub headroom: Money,
     pub horizon_end: NaiveDate,
 
     // ---- the two hard numbers ----------------------------------------------------------
-    pub raw_safe_amount: Cents,
-    pub safe_amount: Cents,
+    pub raw_safe_amount: Money,
+    pub safe_amount: Money,
     pub earliest_full_date: Option<NaiveDate>,
 
     // ---- search ------------------------------------------------------------------------
@@ -73,9 +74,12 @@ pub struct DecisionFacts {
     pub option_id: Option<String>,
     pub changes: Vec<ChangeFact>,
     /// Trough with the chosen plan (and changes) applied.
-    pub plan_trough: Option<(Cents, NaiveDate)>,
+    pub plan_trough: Option<(Money, NaiveDate)>,
 
     // ---- data quality ------------------------------------------------------------------
+    /// Blank-amount rows with no accepted image figure (baseline v0): never zero, excluded
+    /// from cash and stream estimators, listed here by event id.
+    pub missing_amounts: Vec<String>,
     pub ledger_issues: Vec<String>,
     pub rejected_evidence: Vec<String>,
     pub applied_evidence: Vec<String>,

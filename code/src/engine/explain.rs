@@ -1,34 +1,35 @@
-//! Deterministic explanation templates, filled only from `DecisionFacts` (0 model tokens).
-//!
-//! Wording follows the sample outputs. PROVISIONAL until the analyst's template slice lands
-//! in RULES.md (in particular which variant each status uses).
+//! Deterministic explanation templates (RULES.md S1.6), filled only from `DecisionFacts`
+//! (0 model tokens).
 
 use chrono::{Datelike, NaiveDate};
 
 use super::facts::DecisionFacts;
-use super::money::Cents;
+use super::money::Money;
+use super::rules::{AffordableNowTemplate, NotRecommendedTemplate, Rules};
 use super::types::PaymentMethod;
 
-pub fn render(f: &DecisionFacts) -> String {
+pub fn render(f: &DecisionFacts, rules: &Rules) -> String {
     let cur = &f.currency;
-    let money = |c: Cents| format!("{cur} {}", c.fmt_grouped());
+    let money = |c: Money| format!("{cur} {}", c.fmt_grouped());
     let min = money(f.minimum_balance);
+    let req = money(f.requested_amount);
     match f.method {
-        PaymentMethod::FullPayment if f.changes.is_empty() => format!(
-            "Pay {} today. This leaves at least {min} available over the next 90 days.",
-            money(f.requested_amount)
-        ),
-        PaymentMethod::FullPayment => format!(
-            "{}, then pay {} today. This leaves at least {min} available.",
-            changes_clause(f),
-            money(f.requested_amount)
-        ),
+        PaymentMethod::FullPayment if f.changes.is_empty() => match rules.affordable_now_template {
+            AffordableNowTemplate::LeavesAtLeast => {
+                format!("Pay {req} today. This leaves at least {min} available over the next 90 days.")
+            }
+            AffordableNowTemplate::KeepsMinimum => {
+                format!("Pay {req} today. This keeps the {min} minimum available over the next 90 days.")
+            }
+        },
+        PaymentMethod::FullPayment => {
+            format!("{}, then pay {req} today. This leaves at least {min} available.", changes_clause(f))
+        }
         PaymentMethod::Installments => {
             let first = f.plan.first().expect("installment plan");
-            let lead = if f.changes.is_empty() { String::new() } else { format!("{}, then use", changes_clause(f)) };
-            let verb = if lead.is_empty() { "Use".to_string() } else { lead };
+            let lead = if f.changes.is_empty() { "Use".to_string() } else { format!("{}, then use", changes_clause(f)) };
             format!(
-                "{verb} {} installments of {}, starting {}. This leaves at least {min} available.",
+                "{lead} {} installments of {}, starting {}. This leaves at least {min} available.",
                 f.plan.len(),
                 money(first.amount),
                 long_date(first.date)
@@ -44,18 +45,20 @@ pub fn render(f: &DecisionFacts) -> String {
             )
         }
         PaymentMethod::Wait => {
-            let p = f.plan[0];
-            format!(
-                "Pay {} in full on {}. Paying earlier would take the balance below the {min} minimum.",
-                money(p.amount),
-                long_date(p.date)
-            )
+            let e = f.plan[0].date;
+            if e == f.desired_completion_date {
+                format!("Pay {req} in full on {}. Paying earlier would take the balance below the {min} minimum.", long_date(e))
+            } else {
+                format!("Wait until {}, then pay {req} in full. Paying sooner would put the {min} minimum at risk.", long_date(e))
+            }
         }
         PaymentMethod::NotRecommended => {
-            if f.safe_amount > Cents::ZERO && f.earliest_full_date.is_none() {
+            // Variant B iff methods == {partial_payment}, partial allowed, safe > 0, no E [FIT].
+            let only_partial = f.accepted_methods == [PaymentMethod::PartialPayment]
+                && rules.not_recommended_template == NotRecommendedTemplate::BIffPartialOnly;
+            if only_partial && f.allows_partial_payment && f.safe_amount > Money::ZERO && f.earliest_full_date.is_none() {
                 format!(
-                    "Do not proceed with the {} request. Although {} is available today, the full amount cannot be completed safely within 90 days.",
-                    money(f.requested_amount),
+                    "Do not proceed with the {req} request. Although {} is available today, the full amount cannot be completed safely within 90 days.",
                     money(f.safe_amount)
                 )
             } else {
@@ -68,32 +71,39 @@ pub fn render(f: &DecisionFacts) -> String {
     }
 }
 
-/// "Stop the online backup subscription and reduce the streaming subscription to USD 23.50"
+/// `Stop the online backup subscription and reduce the streaming subscription to USD 23.50`
 fn changes_clause(f: &DecisionFacts) -> String {
     let parts: Vec<String> = f
         .changes
         .iter()
         .map(|c| {
-            let what = c.description.to_lowercase();
+            let what = lower_first(&c.description);
             match c.new_amount {
                 None => format!("stop the {what}"),
-                Some(a) => format!("reduce the {what} to {} {}", f.currency, a.fmt_plan()),
+                Some(a) => format!("reduce the {what} to {} {}", f.currency, a.fmt_grouped()),
             }
         })
         .collect();
     let joined = match parts.len() {
         0 => String::new(),
         1 => parts[0].clone(),
-        2 => format!("{} and {}", parts[0], parts[1]),
-        _ => format!("{}, and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
+        n => format!("{} and {}", parts[..n - 1].join(", "), parts[n - 1]),
     };
-    capitalize(&joined)
+    upper_first(&joined)
 }
 
-fn capitalize(s: &str) -> String {
+fn upper_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_lowercase().collect::<String>() + c.as_str(),
         None => String::new(),
     }
 }
