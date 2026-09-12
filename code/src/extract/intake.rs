@@ -8,7 +8,10 @@ use serde::Deserialize;
 
 use crate::engine::money::Money;
 use crate::engine::types::RequestSpec;
-use crate::extract::{parse_json_reply, ModelClient};
+use crate::extract::model_config::{CandidateConfig, DecodingConfig};
+use crate::extract::parse_json_reply;
+use crate::extract::prompts::PromptSet;
+use crate::hf::{ContentPart, HfClient, ModelCall};
 
 #[derive(Debug, Clone, Deserialize)]
 struct RequestTextFields {
@@ -24,17 +27,33 @@ struct RequestTextFields {
 
 /// Parse free text into the same struct batch mode builds from CSV columns. Returns `None`
 /// when any required field (amount, deadline, type) could not be grounded in the text —
-/// this module never guesses a missing field into a decision-affecting default.
+/// this module never guesses a missing field into a decision-affecting default. Goes
+/// through `HfClient`'s own §2.11 disk cache. Uses the same `llm_primary` candidate as the
+/// message path (`code/config/models.toml`'s `[selected]` table).
 pub fn parse_request_text(
-    client: &dyn ModelClient,
-    system_prompt: &str,
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    candidate: &CandidateConfig,
     request_text: &str,
-) -> anyhow::Result<(Option<RequestSpec>, u32, u32)> {
-    let user_prompt = format!(
-        "Extract the four fields from this request. Respond with the JSON object only.\n\n{request_text}"
-    );
-    let response = client.complete(system_prompt, &user_prompt, &[])?;
-    let value = parse_json_reply(&response.text)?;
+) -> anyhow::Result<Option<RequestSpec>> {
+    let user_content = prompt.user_template.replace("{{REQUEST_TEXT}}", request_text);
+    let call = ModelCall {
+        model_id: candidate.id.clone(),
+        provider: candidate.provider.clone(),
+        model_revision: candidate.model_revision.clone(),
+        prompt_version: prompt.version.clone(),
+        system_prompt: prompt.system_prompt.clone(),
+        user_content: vec![ContentPart::Text(user_content)],
+        temperature: decoding.temperature,
+        seed: decoding.seed,
+        max_tokens: decoding.max_tokens_llm,
+        json_response: candidate.supports_structured_output,
+    };
+    let response =
+        if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
+    let value = parse_json_reply(&response.raw_text)?;
     let fields: RequestTextFields = serde_json::from_value(value)?;
 
     let spec = (|| {
@@ -49,5 +68,5 @@ pub fn parse_request_text(
         })
     })();
 
-    Ok((spec, response.prompt_tokens, response.completion_tokens))
+    Ok(spec)
 }

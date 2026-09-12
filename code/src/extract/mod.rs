@@ -11,30 +11,11 @@ pub mod grounding;
 pub mod images;
 pub mod intake;
 pub mod messages;
+pub mod model_config;
+pub mod prompts;
 pub mod retrieval;
 
 use anyhow::Result;
-
-/// One model call's raw result. `text` is expected to be strict JSON (see `code/prompts/`);
-/// token counts feed the usage report (ml-engineer, PLAN.md §2.5/§6.5).
-pub struct ModelResponse {
-    pub text: String,
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-}
-
-/// The model call boundary. ml-engineer's `crate::hf` provides the concrete client; this
-/// trait keeps `extract/` compilable and testable independent of which model the bake-off
-/// (PLAN.md Phase 2d) picks.
-pub trait ModelClient {
-    /// `images` are raw PNG bytes to attach (VLM calls only; empty for text-only calls).
-    fn complete(
-        &self,
-        system_prompt: &str,
-        user_prompt: &str,
-        images: &[Vec<u8>],
-    ) -> Result<ModelResponse>;
-}
 
 /// Parse a model's raw text reply as strict JSON, tolerating an accidental ```json fence
 /// despite the prompt instructing against one.

@@ -7,13 +7,21 @@
 //! A figure that fails reconciliation, or that the page simply does not contain, is never
 //! guessed or treated as zero (see `docs/gold_subset.json` image_04 for the canonical case).
 
+use std::io::Cursor;
+use std::path::Path;
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use chrono::NaiveDate;
 use serde::Deserialize;
 
 use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
 use crate::engine::money::Money;
 use crate::engine::types::{Event, EventType, Status};
-use crate::extract::{parse_json_reply, ModelClient};
+use crate::extract::model_config::{CandidateConfig, DecodingConfig};
+use crate::extract::parse_json_reply;
+use crate::extract::prompts::PromptSet;
+use crate::hf::{ContentPart, HfClient, ModelCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,19 +153,96 @@ pub fn to_evidence(image_id: &str, figures: &ImageFigures, event: &Event) -> Opt
     })
 }
 
+/// Downscale to `max_dim` on the longest side and PNG-encode as base64 (PLAN.md §3 token-
+/// efficiency lever: ship the smallest resolution that keeps gold accuracy — the bake-off's
+/// job to pick `max_dim`, not this function's).
+fn downscale_and_encode(path: &Path, max_dim: u32) -> anyhow::Result<String> {
+    let img = image::open(path).map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
+    let resized = img.thumbnail(max_dim, max_dim);
+    let mut buf = Vec::new();
+    resized
+        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("encoding downscaled PNG for {}: {e}", path.display()))?;
+    Ok(BASE64.encode(buf))
+}
+
 /// One call per image (PLAN.md §3 batching lever), per
-/// `code/prompts/image_transcription.v1.md`. Returns the transcription plus token counts
-/// for the usage report.
-pub fn extract_figures(
-    client: &dyn ModelClient,
-    system_prompt: &str,
-    image_bytes: Vec<u8>,
-) -> anyhow::Result<(ImageFigures, u32, u32)> {
-    let user_prompt = "Transcribe every labeled figure on this document. Respond with the JSON object only.";
-    let response = client.complete(system_prompt, user_prompt, &[image_bytes])?;
-    let value = parse_json_reply(&response.text)?;
-    let figures: ImageFigures = serde_json::from_value(value)?;
-    Ok((figures, response.prompt_tokens, response.completion_tokens))
+/// `code/prompts/image_transcription.v1.md`. Goes through `HfClient`'s own §2.11 disk
+/// cache (content hash + model id + revision + prompt version), so a repeated image/model/
+/// prompt combination costs zero tokens on rerun. `cold` selects `chat_completion_cold`
+/// (bypass the cache read, still write it) for a `--cold` full-dataset run.
+fn call_vlm(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    candidate: &CandidateConfig,
+    image_b64: &str,
+) -> anyhow::Result<ImageFigures> {
+    let call = ModelCall {
+        model_id: candidate.id.clone(),
+        provider: candidate.provider.clone(),
+        model_revision: candidate.model_revision.clone(),
+        prompt_version: prompt.version.clone(),
+        system_prompt: prompt.system_prompt.clone(),
+        user_content: vec![
+            ContentPart::Text(prompt.user_template.clone()),
+            ContentPart::ImageDataUrl { mime: "image/png".to_string(), base64_data: image_b64.to_string() },
+        ],
+        temperature: decoding.temperature,
+        seed: decoding.seed,
+        max_tokens: decoding.max_tokens_vlm,
+        json_response: candidate.supports_structured_output,
+    };
+    let response =
+        if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
+    let value = parse_json_reply(&response.raw_text)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+/// End-to-end resolution for one blank-amount event with a linked image (PLAN.md §2.3):
+/// downscale, transcribe with the primary VLM, select + reconcile; on a reconciliation
+/// failure (or a malformed/unparseable reply), escalate once to the second configured
+/// model — a fresh read, not a retry of the same call — and try again. Still failing, or no
+/// escalation model configured: `None`. Never a guess, never a zero.
+///
+/// `vlm_primary`/`vlm_escalation` come from `ModelsConfig::vlm_primary()` /
+/// `vlm_escalation()` (`code/config/models.toml`'s `[selected]` table, PLAN.md Phase 2d) —
+/// when the user has not picked yet, the caller simply does not call this function; the
+/// model path is inactive by construction, not by a special case here.
+pub fn resolve_blank_amount(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    image_max_dim_px: u32,
+    image_path: &Path,
+    image_id: &str,
+    vlm_primary: &CandidateConfig,
+    vlm_escalation: Option<&CandidateConfig>,
+    event: &Event,
+) -> anyhow::Result<Option<EvidenceRecord>> {
+    let image_b64 = downscale_and_encode(image_path, image_max_dim_px)?;
+
+    let attempt = |candidate: &CandidateConfig| -> anyhow::Result<Option<EvidenceRecord>> {
+        match call_vlm(client, cold, prompt, decoding, candidate, &image_b64) {
+            Ok(figures) => Ok(to_evidence(image_id, &figures, event)),
+            Err(e) => {
+                eprintln!("vlm: {image_id} via {}: {e:#}", candidate.id);
+                Ok(None)
+            }
+        }
+    };
+
+    if let Some(record) = attempt(vlm_primary)? {
+        return Ok(Some(record));
+    }
+    if let Some(escalation) = vlm_escalation {
+        if let Some(record) = attempt(escalation)? {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -228,5 +313,47 @@ mod tests {
         };
         assert!(reconciles(&figures, &event)); // nothing printed contradicts itself
         assert_eq!(select(&figures, &event), None); // but amount_paid/total genuinely absent
+    }
+
+    /// Live integration test (PLAN.md Phase 2d): once `code/config/models.toml`'s
+    /// `[selected]` names a real `vlm_primary`, this exercises the whole wired path —
+    /// downscale, call, select, reconcile — against image_01 (gold: Net Pay 4,365,000 IDR,
+    /// docs/gold_subset.json). Requires `HF_TOKEN` and `[selected]` to be set; skips
+    /// (does not fail) if the model has not been picked yet. Not run by default:
+    /// `cargo test -- --ignored resolve_blank_amount_image_01_live`.
+    #[test]
+    #[ignore]
+    fn resolve_blank_amount_image_01_live() {
+        let cfg = crate::extract::model_config::ModelsConfig::load(Path::new("config/models.toml"))
+            .expect("config/models.toml should parse");
+        let Some(vlm_primary) = cfg.vlm_primary() else {
+            eprintln!("skipping: config/models.toml [selected].vlm_primary not set yet");
+            return;
+        };
+        let prompt = crate::extract::prompts::load(
+            Path::new("prompts/image_transcription.v1.md"),
+            "User prompt template",
+        )
+        .expect("image_transcription.v1.md should parse");
+        let client = crate::hf::HfClient::new().expect("HF_TOKEN must be set");
+        let event = income_event();
+        let record = resolve_blank_amount(
+            &client,
+            false,
+            &prompt,
+            &cfg.decoding,
+            cfg.image_max_dim_px(),
+            Path::new("../dataset/media/images/image_01.png"),
+            "image_01",
+            vlm_primary,
+            cfg.vlm_escalation(),
+            &event,
+        )
+        .expect("call should not error")
+        .expect("image_01 should resolve to a figure");
+        match record.fact {
+            Fact::EventAmount { amount, .. } => assert_eq!(amount, Money::from_f64(4_365_000.0)),
+            other => panic!("expected EventAmount, got {other:?}"),
+        }
     }
 }
