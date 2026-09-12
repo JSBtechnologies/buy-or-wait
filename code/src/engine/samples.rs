@@ -56,4 +56,36 @@ mod tests {
         }
         println!("scores over {n}: {hits:?}");
     }
+
+    /// Runs every evaluation request (no evidence) and reports errors and distributions.
+    /// `cargo test --lib engine::samples::tests::full_dataset_smoke -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn full_dataset_smoke() {
+        let ds = Path::new("../dataset");
+        let profiles = model::load_financial_profiles(ds.join("financial_profiles.csv")).unwrap();
+        let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
+        let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
+        let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
+        let requests = model::load_requests(ds.join("requests.csv")).unwrap();
+        let mut dist: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut issues = 0;
+        let started = std::time::Instant::now();
+        for r in &requests {
+            let session = Session::from_model(&r.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
+            let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == r.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
+            match session.decide(&r.request_id, r.request_date, &RequestSpec::from_model(r), &opts) {
+                Ok(d) => {
+                    *dist.entry(format!("{}/{}", d.row.affordability_status, d.row.recommended_payment_method)).or_default() += 1;
+                    if !d.facts.ledger_issues.is_empty() {
+                        issues += 1;
+                        println!("{} issues {:?}", r.request_id, d.facts.ledger_issues);
+                    }
+                }
+                Err(e) => println!("{} ERROR {e:#}", r.request_id),
+            }
+        }
+        println!("{} requests in {:?}; rows with ledger issues: {issues}", requests.len(), started.elapsed());
+        for (k, v) in dist { println!("  {k}: {v}"); }
+    }
 }
