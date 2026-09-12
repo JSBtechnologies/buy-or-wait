@@ -7,6 +7,162 @@ Notation: `rd` = request_date, `due` = desired_completion_date, `req` = requeste
 
 ---
 
+## S2. Ledger: cash rules by status, linked chains, FX [EXACT unless tagged]
+
+`B0` (current_available_balance) already contains every **settled** row dated before `rd`. The forecast never re-applies history; history is used only to detect streams (§S3) and estimate amounts.
+
+### S2.1 Row → forecast cash effect
+
+| row | forecast effect | evidence |
+|---|---|---|
+| `settled`, settlement_date < rd | none (already in B0); feeds stream detection unless excluded below | all users |
+| `pending` debit | reserve: `−amount` on `max(rd, settlement_date)` (timing irrelevant for safe; on-date and day-0 give identical labels on 01–18) | user_03 event_254 (95,000) is required to reach 873,000; user_01 event_102, user_02 event_185 |
+| `pending` credit (refund, payout, bonus, commission) | **none** | spec; user_20 event_1785 (not tuned) |
+| `scheduled` debit | `−amount` on settlement_date | user_04 event_357 school fee 2024-06-11 |
+| `scheduled` credit (`Next confirmed salary`) | `+amount` on settlement_date; it **is** that month's salary occurrence (do not also project the stream that month) and the salary stream continues monthly afterwards at this amount | user_01 (needs 04-15/05-15 salaries to reach affordable_now), user_13, user_17 |
+| `failed` | none; not a stream occurrence | user_05 event_438 |
+| `cancelled` | none; not a stream occurrence | user_01 event_100, user_06 event_557 |
+| `unrealized` / direction `non_cash` (investment_valuation) | none, never cash | user_21/22 (not tuned) |
+| `investment_purchase` settled | historical one-off, not a stream | user_21–24 |
+| `refund` settled, or any row with `linked_event_id` | historical lifecycle: exclude BOTH the row and the row it links to from stream detection (net zero, already in B0) | user_01 event_98/99, user_17 event_1543/1544 |
+| authorization → settled purchase (`linked_event_id` → cancelled auth) | only the terminal settled row is real cash; still a one-off (single description) so no stream | user_01 event_100/101 |
+| blank `amount` | take the figure from the linked image (§S5); never 0 | user_03 event_253, user_16 event_1442, user_17 event_1545 |
+| `windfall`, bonus, commission, arrears (one-off income descriptions) | never projected | user_03 event_211, user_04 "Quarterly performance bonus", user_11 commissions, user_24 prize |
+
+Lead DECISION verify#13 (board `decision.dup_charges`): a settled row is terminal; a pending row flagged as an open-dispute duplicate of a settled charge **stays reserved**; charge + reversal pairs are excluded from spend history.
+
+Linked-chain rule: walk `linked_event_id` to the root; the chain is one transaction. Its cash effect = the terminal row's status per the table; every row in a chain is excluded from recurrence detection.
+
+### S2.2 FX [EXACT on data coverage]
+
+- Every foreign-currency row has a rate row with `rate_date == settlement_date`, `from_currency == row currency`, `to_currency == home_currency` (140/140 rows; 0 need inversion). `home_amount = amount * rate`.
+- Rates are constant per pair across all dates (EUR→ZAR 20, USD→IDR 15833.33, USD→INR 83.33, EUR→USD 1.09, USD→EUR 0.92). Extra rows exist on future 15ths (e.g. 2024-04-15 USD→IDR for user_25) = **projected foreign salaries convert at the row for the projected date**. If a projected date has no row, use the latest row ≤ that date for the pair (same value).
+- Do not round converted amounts (keep full precision; round only at output).
+
+### S2.3 Same-day ordering and day boundaries [EXACT]
+
+- Horizon: see §S3.1 (ends on the last day of month(rd)+2, not rd+90).
+- Events on `rd` itself are in the forecast (user_18 utilities due 2026-07-07 = rd).
+- **Within a day, debits are applied before credits.** The trough includes a debit that falls on salary day (request_18: dining on 2026-07-15 before the 2310 salary → safe 462; credits-first gives 546).
+- For `E`, a payment on day d is made **after** day d's credits: `headroom_from(d) = min(end_of_day_balance(d), min_{t>d} intraday_low(t)) − M`, where `intraday_low(t)` = balance after t's debits, before t's credits. `E = first d with headroom_from(d) ≥ req`. This yields salary days (2025-09-15, 2019-11-15, 2024-06-15 …) rather than the day after.
+- `safe = clamp(min_{t≥rd} intraday_low(t) − M, 0, req)`.
+
+---
+
+## S3. Recurrence, forecast horizon, estimators [FIT — see scoreboard S3.6]
+
+### S3.1 Horizon [FIT, strong]
+
+```
+horizon_end = last calendar day of month(rd) + 2        # e.g. rd 2025-02-07 → 2025-04-30
+days = rd ..= horizon_end
+```
+Not `rd+90`. Evidence (tightest bounds from tuning labels, each bound = the first projected rent that must be excluded):
+- request_08 E=2025-04-15 requires the 2025-05-01 rent to be outside → end ≤ rd+82 = 2025-04-30 = eom+2.
+- request_12 safe capped at 65,164 requires the 2026-07-01 rent outside → end ≤ rd+86 = 2026-06-30 = eom+2.
+- request_05 outflow requires the 2026-02-02 rent outside → end ≤ 2026-02-01; eom+2 = 2026-01-31.
+- request_13 E=2024-05-15 requires the 2024-06-02 rent outside; request_03 E=2019-11-15 requires end ≥ rd+74.
+- Fixed H=90: E exact 13/18. eom+2: E exact 15/18 and safe within 1% on 9/18 (vs 11/18 within 5% at H=90 but only 2 exact-cap).
+- The explanation text still says "90 days" (template constant).
+
+### S3.2 Stream detection [FIT]
+
+```
+hist = rows with status == settled, settlement_date < rd, no linked_event_id, not the target of a linked row,
+       event_type in {expense, subscription, debt_payment, income}, amount known (image-filled if blank)
+group hist by (category, direction)
+for each group:
+    if direction == debit and the group has > 1 distinct description:        # variable spending (groceries, transport, dining…)
+        step = modal gap in days between consecutive settlement_dates
+        require every gap % step == 0                                        # gaps of 2*step = a skipped week: still the stream
+        stream = Interval(step), next dates = last + k*step
+    else:                                                                    # split by description
+        for each description subgroup with >= 2 rows:
+            if every gap in 28..31: stream = Monthly(day_of_month(last)), next = same DOM each month, clamped to month length
+            else: not a stream (one-offs, bonus, arrears, commissions, irregular)
+```
+Worked: user_01 groceries 26 rows, 7 descriptions, gaps all 7 → Interval(7), last 2024-03-01 → 03-08, 03-15 …; user_03 rent "Landlord standing order" gaps 30/31 → Monthly(4) → 2019-09-04, 10-04, 11-04.
+- Minimum occurrences: 2, 3 or 4 give identical results on 01–18 (every real stream has ≥5 rows). Use 3.
+- Projected occurrences are included only if `rd <= date <= horizon_end`.
+
+### S3.3 Amount estimators [FIT]
+
+```
+if all historical amounts in the stream are identical: amount = that value            # rent 5148, streaming 19
+elif stream is Monthly  (variable bill: utilities, healthcare, shopping, entertainment): amount = mean(last 3 amounts)
+elif stream is Interval (groceries, transport, dining):                               amount = mean(all amounts in history)
+no rounding of estimates
+```
+- request_03 lead hypothesis max-of-last-3 for everything gives 872,452.60 (label 873,000) but is badly wrong elsewhere (08: −52%, 11: −36%, 13: −99%). Grid over {mean, max, median} × {last 3,4,6,8,12, all} for bills and variable spend separately; `bill=mean3, var=meanAll` maximises exact-ish matches (9/18 within 1%).
+- Labels imply integer-valued outflow totals (B0 − M − safe is an integer on every EUR row: 452, 624, 1134, 487), which no history statistic reproduces. The generator most likely used hidden integer base amounts; exact recovery of those is not possible from history. Expect ±1–3% on safe amounts.
+
+### S3.4 Income [FIT]
+
+```
+salary stream = Monthly stream in category salary (per description)
+project it at its LAST settled amount on its day-of-month, unless:
+  - a scheduled "Next confirmed salary" row exists → that row is the occurrence for its month; later months use its amount
+  - a message amends amount / date / end (§S5 facts)               # overrides history
+  - the description marks an end ("Final employer payroll")      # user_05 → no income
+  - the stream missed its expected occurrence before rd            # user_12 (last 2026-01-15, rd 2026-04-05), user_13 "Second household income" (no 2024-02-20) → stop
+never project: bonus, commission, arrears, prize, reimbursement, gig/platform payouts with irregular gaps (user_09, user_10)
+```
+Salary schedules that reproduce the tuning labels (engine test vectors):
+
+| user | projected salary |
+|---|---|
+| 01 | 2024-03-15 23,320 (scheduled) then monthly 15th |
+| 02 | 42,750,000 from 2025-08-15 (message_01 raise) monthly 15th |
+| 03 | 4,365,000 monthly 15th (image_01 net pay confirms; arrears event_211 is one-off) |
+| 04 | 38,190,000 monthly 15th; pending quarterly bonus (message_03) not counted |
+| 05 | none ("Final employer payroll") |
+| 06 | 1,037.52 monthly 15th (message_04 temporary pay) |
+| 07 | 149,000 on 2024-09-23 (message_05 date move) then monthly 23rd → E 2024-10-23 |
+| 08 | 1,422.85 monthly 15th (message_06) |
+| 11 | base 23,256,000 monthly 15th; commissions not counted (message_08) |
+| 12 | none (message_09 contract ended) |
+| 13 | 2024-03-15 1,343.54 (scheduled) then monthly; second household income stopped |
+| 14 | 2,717 from 2025-08-15 (message_10 resumes) |
+| 15 | 1,661 from 2026-01-15 (message_11) |
+| 16 | 173,000 monthly 15th |
+| 17 | 2026-03-15 206,000 (scheduled) then monthly |
+| 18 | 2,310 monthly 15th |
+
+### S3.5 Forecast assembly
+
+```
+items = pending debits (§S2) + scheduled rows + projected streams (§S3.2–3.4), each (date, signed home amount)
+per day: apply debits, record intraday_low; then credits, record end_of_day
+safe  = clamp(min_t intraday_low(t) − M, 0, req)
+E     = first d with min(end_of_day(d), min_{t>d} intraday_low(t)) − M >= req, else None
+plan_is_safe(pays): same simulation with each payment as a debit on its date; require intraday_low − M >= 0 every day
+```
+
+### S3.6 Scoreboard for this spec (request_01–18; relative error of safe, E match)
+
+| req | safe rel err | E | open issue |
+|---|---|---|---|
+| 01 | 0 (cap) | ✓ | |
+| 02 | −0.7% | ✓ | |
+| 03 | +11.9% | ✓ | max3 fits better here (−0.06%) |
+| 04 | +8.7% | ✓ | |
+| 05 | +44.8% | ✓ | no-income; outflow short |
+| 06 | −18.8% | ✗ (02-15 vs 01-15) | trough composition unresolved |
+| 07 | −0.8% | ✓ | |
+| 08 | +0.2% | ✓ | |
+| 09 | 0 (cap) | ✓ | |
+| 10 | +176% | ✓ | gig income handling unresolved |
+| 11 | −0.9% | ✗ (06-15 vs 07-15) | |
+| 12 | 0 (cap) | ✓ | |
+| 13 | +5.9% | ✓ | |
+| 14 | +3.3% | ✓ | childcare payment amount unknown (message_10) |
+| 15 | −100% | ✓ | trough composition unresolved |
+| 16 | 0 (cap) | ✓ | |
+| 17 | −0.3% | ✗ (04-15 vs 03-15) | |
+| 18 | −1.6% | ✓ | |
+
+---
+
 ## S1. Plan candidates, eligibility, selection, status/method mapping
 
 ### S1.1 Candidate generation [EXACT on 01–18]
@@ -59,8 +215,9 @@ if no cand in cands:                           # nothing safe without changes
            | (flexibility in {reducible, reducible_or_stoppable} and category ∈ willing_to_reduce) → action reduce_to:minimum_allowed_amount )
     for k in 1..3, for each combination of k actions on distinct events (no stop+reduce on one event):
         re-run forecast with the stream's future occurrences removed (stop) or set to minimum_allowed_amount (reduce)
-        re-run (a)(b)(c)(d) with that forecast
-    pick by ranking S1.3 (fewest changes first among change plans — see below)
+        re-run ONLY (a) full-now and (b) installments with that forecast      # lead DECISION rules#24: partial/wait pay on the
+                                                                              # no-change E, so they cannot use a changed forecast
+    pick by ranking S1.3 (change_preference = fewest changes first, lead rules#37)
 ```
 - The event id written is the **latest settled occurrence of the stream** (request_06: streaming stream events 444,452,460,468,476 → `stop:event_476`; request_11: dining stream last row event_989 → `reduce_to:event_989:665950`).
 - `reduce_to` amount = the stream's `minimum_allowed_amount` exactly (665950). [EXACT]
@@ -121,3 +278,11 @@ Consequences: full-now beats everything; partial (starts today, total=req) beats
 - `{desc_lower}` = the stream's `description` with only the first character lower-cased.
 - A vs B [FIT]: B only on request_14 (methods = `partial_payment` only, allows_partial=true, safe>0, E=None). request_10 (methods partial|installments, allows_partial=true, safe>0, E=None) uses A. Rule that fits 01–18: **B iff methods == {partial_payment} and allows_partial and safe > 0 and E is None; else A.**
 - The `min` in "leaves at least …" is always M itself (not the trough), so explanations need no extra forecast numbers.
+
+### S1.7 Verifier sample surprises (rules#5), checked on 01–18 only
+
+1. "leaves at least X" quotes `minimum_balance_to_keep`, not the trough — **confirmed** (01 ZAR 18,000; 02 IDR 29,158,400; 06 EUR 800; 07 INR 93,000 …).
+2. plan / reduce_to amounts are 2 dp when fractional (`620.40`), `amount_safe_to_pay` shortest form (`603.3`) — **confirmed** (§S1.5).
+3. wait dates == due: **4 of 5** tuning wait rows (03, 08, 13, 18; request_04 waits to 2024-06-15 < due 2024-06-19). Earliest dates on the 15th: 02, 03, 04, 06, 08, 11, 13, 17, 18 — **confirmed**; this is just salary day (credits land before a same-day payment, §S2.3), not a rule. Engine must not special-case due or the 15th; request_07 E = 2024-10-23 (salary moved to the 23rd).
+4. full_payment + changes ⇒ affordable_with_plan even when E > due — **confirmed** (06: E 01-15 > due 01-14; 11: E 07-15 > due 06-12).
+5. req_11 reduce saving needs ≥ 2 occurrences before trough — **refuted in label terms**: label gap = 13,110,000 − 12,510,645 = 599,355; the one dining occurrence before the 2025-05-14 trough saves (estimate − 665,950) ≈ 1,350,023 − 665,950 = 684,073 ≥ 599,355 with the S3.3 estimator. With the engine's own (slightly lower) safe 12,397,500 the single saving falls 28k short — so the verifier will see (5) whenever the engine's safe estimate is below the label. The rule stays: count only occurrences on or before each binding trough.
