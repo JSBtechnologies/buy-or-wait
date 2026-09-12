@@ -23,8 +23,13 @@ use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
 use crate::hf::{ContentPart, HfClient, ModelCall};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// `doc_type` is purely advisory metadata (`select`/`reconciles` never branch on it) and is
+/// deserialized leniently on purpose: a VLM's own wording for a document type is free text
+/// in practice ("TAX INVOICE", "PROVISIONAL BILL", ...), and a strict enum match on it was
+/// rejecting 58/112 otherwise-valid cached reads before `select()` ever ran (analyst audit
+/// board:verify.image_audit #184). Unrecognized text maps to `Other` rather than erroring —
+/// this field can never gate whether a figure is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocType {
     Payslip,
     Receipt,
@@ -33,6 +38,49 @@ pub enum DocType {
     DeliverySummary,
     BankStatementExcerpt,
     Other,
+}
+
+impl<'de> Deserialize<'de> for DocType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(DocType::from_free_text(&raw))
+    }
+}
+
+impl DocType {
+    fn from_free_text(raw: &str) -> DocType {
+        let normalized: String = raw
+            .trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+        match normalized.as_str() {
+            "payslip" | "pay_slip" | "salary_slip" | "pay_stub" | "paystub" => DocType::Payslip,
+            "receipt" | "cash_receipt" | "sales_receipt" | "bill_of_supply" | "cash_bill" => {
+                DocType::Receipt
+            }
+            "invoice" | "tax_invoice" | "gst_invoice" | "sales_invoice" | "gst_tax_invoice" => {
+                DocType::Invoice
+            }
+            "bill" | "provisional_bill" | "hospital_bill" | "utility_bill" | "rent_receipt" => {
+                DocType::Bill
+            }
+            "delivery_summary" | "order_summary" | "delivery_receipt" | "order_details" => {
+                DocType::DeliverySummary
+            }
+            "bank_statement_excerpt" | "bank_statement" | "statement" | "account_summary" => {
+                DocType::BankStatementExcerpt
+            }
+            _ => DocType::Other,
+        }
+    }
 }
 
 /// Every labeled figure the VLM transcribed off one document. Every field but `doc_type` is
@@ -137,12 +185,21 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
         }
         checked_labeled_fields = true;
     }
-    if let (Some(paid), Some(bal), Some(total)) = (figures.amount_paid, figures.balance_due, figures.total)
-    {
-        if !close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
-            return false;
+    // analyst audit board:verify.image_audit (image_12): cash tendered can legitimately
+    // exceed the total when change is given (40.00 tendered against a 33.50 total) -- that
+    // is consistent by construction, not a mismatch, regardless of what balance_due says.
+    // Only fall through to the paid+balance_due=total identity when paid is actually less
+    // than total (a real partial payment / balance-owed scenario).
+    if let (Some(paid), Some(total)) = (figures.amount_paid, figures.total) {
+        if paid + ROUNDING_TOLERANCE_2TERM >= total {
+            checked_labeled_fields = true;
+        } else if let Some(bal) = figures.balance_due {
+            if !close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
+                return false;
+            }
+            checked_labeled_fields = true;
         }
-        checked_labeled_fields = true;
+        // else: paid < total and no balance_due stated -- not enough to confirm or reject.
     }
     if !checked_labeled_fields {
         if let (Some(sum), Some(target)) =
@@ -379,16 +436,39 @@ mod tests {
     /// total is present.
     #[test]
     fn image_12_settled_expense_prefers_total_over_cash_tendered_amount_paid() {
+        // Exact shape of the cached VLM reads (analyst audit #184): balance_due present as
+        // 0.00 (nothing owed), amount_paid the cash tendered (40.00), which naively fails
+        // paid+balance_due=total (40 != 33.50) — paid >= total must be treated as
+        // consistent on its own, never requiring balance_due to explain the gap.
         let figures = ImageFigures {
             doc_type: Some(DocType::Receipt),
             currency: Some("USD".into()),
             total: Some(33.50),
             amount_paid: Some(40.00), // cash tendered, not the expense amount
+            balance_due: Some(0.00),
             ..Default::default()
         };
         let event = expense_event("event_7307", "transport", "USD", Status::Settled);
         assert!(reconciles(&figures, &event));
         assert_eq!(select(&figures, &event), Some(33.50));
+    }
+
+    /// analyst audit #184: strict enum matching on the VLM's own free-text doc_type wording
+    /// rejected 58/112 cached reads before `select()` ever ran. `doc_type` is advisory only
+    /// and must never gate a figure — unrecognized or synonymous wording maps to a known
+    /// variant or `Other`, never an error.
+    #[test]
+    fn doc_type_parses_leniently_from_free_text_synonyms() {
+        assert_eq!(DocType::from_free_text("TAX INVOICE"), DocType::Invoice);
+        assert_eq!(DocType::from_free_text("PROVISIONAL BILL"), DocType::Bill);
+        assert_eq!(DocType::from_free_text("  Pay Slip "), DocType::Payslip);
+        assert_eq!(DocType::from_free_text("Bill of Supply"), DocType::Receipt);
+        assert_eq!(DocType::from_free_text("Order Details"), DocType::DeliverySummary);
+        assert_eq!(DocType::from_free_text("something the model made up"), DocType::Other);
+
+        let value = serde_json::json!({"doc_type": "TAX INVOICE", "total": 100.0});
+        let figures: ImageFigures = serde_json::from_value(value).expect("should not reject on doc_type");
+        assert_eq!(figures.doc_type, Some(DocType::Invoice));
     }
 
     #[test]
