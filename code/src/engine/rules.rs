@@ -100,11 +100,17 @@ pub struct Rules {
     /// Settled rows whose amount came from an image are left out of stream detection (S5:
     /// image_03 bulk grocery purchase excluded from the groceries estimator).
     pub exclude_evidence_amounts_from_streams: bool,
+    /// A "next salary is X" fact sets every later projected occurrence, not only the next
+    /// one (S3.4 table: user_06 1,037.52 and user_08 1,422.85 monthly). [FIT]
+    pub next_income_amount_persists: bool,
     /// An income stream whose next expected occurrence fell before rd has stopped (S3.4).
     pub stop_income_after_missed_occurrence: bool,
-    /// A scheduled row replaces its calendar month's occurrence of a monthly stream with the
-    /// same category and direction (S2.1 for salary; verifier#45 for scheduled bills).
-    pub scheduled_replaces_month_occurrence: bool,
+    /// A scheduled row replaces a monthly stream's projected occurrence of the same category
+    /// and direction within this many days (S3.4(c): 15).
+    pub scheduled_replacement_window_days: i64,
+    /// Interval-stream occurrences earlier than rd + this many days are skipped (S3.2: 2,
+    /// i.e. rd and rd+1).
+    pub variable_skip_days: i64,
 
     // ---- plans (S1) ---------------------------------------------------------------------
     /// Plans finishing after desired_completion_date are dropped (S1.1 `pays[-1] <= due`).
@@ -133,12 +139,15 @@ impl Default for Rules {
             variable_estimator: AmountEstimator::MeanAll,
             income_estimator: AmountEstimator::Last,
             one_off_income_keywords: strings(&[
-                "bonus", "commission", "arrears", "prize", "lottery", "reimbursement", "refund", "payout", "windfall",
+                "bonus", "commission", "arrears", "incentive", "payout", "earnings", "reimburse", "prize", "lottery",
+                "refund", "windfall",
             ]),
             income_end_keywords: strings(&["final"]),
             exclude_evidence_amounts_from_streams: true,
+            next_income_amount_persists: true,
             stop_income_after_missed_occurrence: true,
-            scheduled_replaces_month_occurrence: true,
+            scheduled_replacement_window_days: 15,
+            variable_skip_days: 2,
             drop_late_plans: true,
             ignore_payments_after_horizon: true,
             max_spending_changes: 3,

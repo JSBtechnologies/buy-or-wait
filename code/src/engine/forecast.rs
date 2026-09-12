@@ -144,16 +144,20 @@ impl Forecast {
         for stream in &inp.streams.streams {
             let Some(amount) = changed_amount(stream, changes, rules) else { continue };
             let mut dates = stream.dates_between(start, end);
-            // A scheduled row replaces its calendar month's occurrence of a monthly stream with
-            // the same category and direction, even on a shifted day (verifier#45).
-            if rules.scheduled_replaces_month_occurrence && matches!(stream.cadence, Cadence::Monthly { .. }) {
+            // RULES S3.4(c): a scheduled row replaces the projected occurrence of a monthly
+            // stream with the same category and direction within the window (verifier#45).
+            if matches!(stream.cadence, Cadence::Monthly { .. }) {
                 dates.retain(|d| {
                     !scheduled.iter().any(|e| {
                         e.event.category == stream.category
                             && e.event.direction == stream.direction
-                            && (e.cash_date.year(), e.cash_date.month()) == (d.year(), d.month())
+                            && (e.cash_date - *d).num_days().abs() <= rules.scheduled_replacement_window_days
                     })
                 });
+            }
+            // RULES S3.2: interval (variable-spend) occurrences on rd or rd+1 are skipped.
+            if stream.kind == StreamKind::VariableSpend {
+                dates.retain(|d| (*d - start).num_days() >= rules.variable_skip_days);
             }
             for d in dates {
                 flows.push(Flow {
@@ -369,11 +373,16 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                 seed_monthly_income(flows, category, *amount, currency, *first_date, start, end, &src, &convert);
             }
             Fact::NextIncomeAmount { category, amount, currency, date } => {
-                if let Some(f) = flows
+                // RULES S3.4/S5 [FIT]: "next salary is reduced to X" (user_08) and "temporary pay
+                // continues for the next payroll" (user_06) project X for every later month,
+                // unless `next_income_amount_persists` is off (then only the next occurrence).
+                let mut income: Vec<&mut Flow> = flows
                     .iter_mut()
                     .filter(|f| is_income_flow(f, category) && date.map_or(true, |d| f.date >= d))
-                    .min_by_key(|f| f.date)
-                {
+                    .collect();
+                income.sort_by_key(|f| f.date);
+                let take = if inp.rules.next_income_amount_persists { income.len() } else { 1 };
+                for f in income.into_iter().take(take) {
                     if let Some(a) = convert(*amount, currency, f.date) {
                         f.amount = a;
                     }
@@ -427,6 +436,7 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                     event_id: rec.record_id.clone(),
                     description: description.clone(),
                     date: *first_date,
+                    event_date: *first_date,
                     amount: *amount,
                     flexibility: super::types::Flexibility::Fixed,
                     minimum_allowed_amount: None,

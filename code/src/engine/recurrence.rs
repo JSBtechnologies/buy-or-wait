@@ -37,7 +37,11 @@ pub enum StreamKind {
 pub struct Occurrence {
     pub event_id: String,
     pub description: String,
+    /// Cash (settlement) date.
     pub date: NaiveDate,
+    /// Booking date; monthly cadence and day of month come from it, since a late settlement
+    /// does not move the billing cycle (user_07 salary 08-15 settled 08-23).
+    pub event_date: NaiveDate,
     /// Home-currency magnitude.
     pub amount: Money,
     pub flexibility: Flexibility,
@@ -147,6 +151,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
             event_id: ev.id.clone(),
             description: ev.description.clone(),
             date: e.cash_date,
+            event_date: ev.event_date,
             amount,
             flexibility: ev.flexibility,
             minimum_allowed_amount: ev.minimum_allowed_amount.and_then(|m| {
@@ -155,6 +160,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
         });
     }
 
+    let final_payroll = final_payroll_date(ledger, as_of, rules);
     let mut out = Streams { as_of: Some(as_of), ..Default::default() };
     for ((category, direction), mut occs) in groups {
         occs.sort_by_key(|o| (o.date, id_rank(&o.event_id)));
@@ -200,13 +206,13 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
                 direction,
                 category: category.clone(),
                 description: Some(description),
-                cadence: Cadence::Monthly { day: occs.last().unwrap().date.day() },
+                cadence: Cadence::Monthly { day: occs.last().unwrap().event_date.day() },
                 projected_amount: estimator.estimate(&amounts),
                 occurrences: occs,
             };
             if income {
-                if occs_end(&stream, rules) {
-                    out.inactive.push((stream.id, "income ended (final payroll)".into()));
+                if category == SALARY && final_payroll.is_some() {
+                    out.inactive.push((stream.id, format!("income ended (final payroll {})", final_payroll.unwrap())));
                     continue;
                 }
                 if rules.stop_income_after_missed_occurrence && stream.next_expected() < as_of {
@@ -218,18 +224,31 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
             out.streams.push(stream);
         }
     }
-    anchor_scheduled_income(ledger, &mut out.streams, rules);
+    if final_payroll.is_none() {
+        anchor_scheduled_income(ledger, &mut out.streams, rules);
+    }
     out
 }
 
-fn occs_end(s: &Stream, rules: &Rules) -> bool {
-    s.occurrences.last().is_some_and(|o| rules.is_income_end(&o.description))
+const SALARY: &str = "salary";
+
+/// RULES S3.4(a): a settled salary row described as final ("Final employer payroll") stops
+/// every salary stream of the user.
+fn final_payroll_date(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Option<NaiveDate> {
+    ledger
+        .entries
+        .iter()
+        .filter(|e| e.treatment == CashTreatment::Settled && e.cash_date < as_of)
+        .filter(|e| e.event.category == SALARY && e.event.direction == Direction::Credit)
+        .filter(|e| rules.is_income_end(&e.event.description))
+        .map(|e| e.cash_date)
+        .max()
 }
 
 /// S3.2 monthly: every gap between consecutive rows within the configured range.
 fn is_monthly(occs: &[Occurrence], rules: &Rules) -> bool {
     let (lo, hi) = rules.monthly_gap_days;
-    occs.windows(2).all(|w| (lo..=hi).contains(&(w[1].date - w[0].date).num_days()))
+    occs.windows(2).all(|w| (lo..=hi).contains(&(w[1].event_date - w[0].event_date).num_days()))
 }
 
 /// S3.2 interval: the modal positive gap (smallest on ties), valid only if every gap is a
@@ -258,6 +277,7 @@ fn anchor_scheduled_income(ledger: &Ledger, streams: &mut Vec<Stream>, rules: &R
             event_id: e.event.id.clone(),
             description: e.event.description.clone(),
             date: e.cash_date,
+            event_date: e.cash_date,
             amount,
             flexibility: e.event.flexibility,
             minimum_allowed_amount: None,
@@ -268,6 +288,8 @@ fn anchor_scheduled_income(ledger: &Ledger, streams: &mut Vec<Stream>, rules: &R
             .max_by_key(|s| s.last_date());
         match existing {
             Some(s) if s.last_date() < e.cash_date => {
+                // S3.4(c): later months follow the scheduled row's day of month.
+                s.cadence = Cadence::Monthly { day: e.cash_date.day() };
                 s.occurrences.push(occ);
                 s.projected_amount = amount;
             }
