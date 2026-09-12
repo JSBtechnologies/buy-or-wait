@@ -185,28 +185,48 @@ alt_providers = [
 notes = "Cheapest LLM candidate overall on deepinfra; many redundant live providers if deepinfra is degraded."
 
 # ---------------------------------------------------------------------------
-# Backup / fallback models (USER REQUEST, 2026-09-12). Separate from the
-# primary bake-off candidates above and does NOT change the primary
-# selection. These are frontier-class, more-expensive models to fall back to
-# ONLY when the primary model's output fails validation/reconciliation
-# (PLAN.md §2.10 invariants / §2.3 reconciliation), or the primary is marked
-# `unavailable` by the circuit breaker (repeated call failures) — never used
-# as a first choice, and never silently swapped in without that trigger.
-# Bake-off evidence for these (N=3 on the same gold subset) lives in
-# docs/bakeoff.md's "Backup models" section. The user decides whether/which
-# to wire in; ml-engineer does not pick.
+# Backup / fallback models — CANDIDATE CATALOG ONLY (USER REQUEST,
+# 2026-09-12). `[fallback]` / `[[fallback.candidates]]` below is just a price
+# sheet (provider, pinned revision, pricing) for backup options. It is NOT
+# activation and does NOT change the primary bake-off candidates above.
 #
-# All three are live on the HF Inference Providers router — same HF_TOKEN,
-# no separate API key env var needed. A true out-of-catalog frontier model
-# (e.g. a proprietary API like GPT-5/Claude/Gemini, not on HF's router at
-# all) would need its own API key env var (OPENAI_API_KEY / ANTHROPIC_API_KEY
-# / GOOGLE_API_KEY) AND a second client implementation beyond hf.rs's
-# HF-router-only design (PLAN.md §2.11's single `HF_TOKEN` assumption) — a
-# real architecture change, not a models.toml addition, so not implemented.
+# ACTIVATION SCHEMA (read by extraction's model path, `code/src/extract/`):
+# a top-level `[selected]` table with these keys:
+#
+#   [selected]
+#   vlm_primary    = "<model id>"   # the chosen VLM (from candidates.vlm)
+#   vlm_escalation = "<model id>"   # second-read escalation on a reconciliation
+#                                   # failure (image_transcription.v1.md); may
+#                                   # repeat vlm_primary or name a stronger model
+#   llm_primary    = "<model id>"   # the chosen LLM (from candidates.llm)
+#   vlm_fallback   = "<model id>"   # OPTIONAL: must be an id from
+#                                   # [[fallback.candidates]] below
+#   llm_fallback   = "<model id>"   # OPTIONAL: must be an id from
+#                                   # [[fallback.candidates]] below
+#
+# `[selected]` is DELIBERATELY ABSENT from this file right now — the user
+# has not chosen yet (PLAN.md Phase 2d: the lead brings bake-off results to
+# the user, who decides). ml-engineer does not add `[selected]`; whoever
+# wires in the user's choice (lead/integrator, once decided) adds it. Until
+# then, `vlm_fallback`/`llm_fallback` are inert catalog entries with nothing
+# activating them — a model in `[[fallback.candidates]]` is used ONLY when
+# named under `[selected]`, and even then only as a fallback (primary output
+# fails validation/reconciliation, PLAN.md §2.10/§2.3, or primary is marked
+# `unavailable` by the circuit breaker) — never a routine first choice.
+#
+# All three fallback candidates below are live on the HF Inference Providers
+# router — same HF_TOKEN, no separate API key env var needed. A true
+# out-of-catalog frontier model (e.g. a proprietary API like GPT-5/Claude/
+# Gemini, not on HF's router at all) would need its own API key env var
+# (OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY) AND a second client
+# implementation beyond hf.rs's HF-router-only design (PLAN.md §2.11's
+# single `HF_TOKEN` assumption) — a real architecture change, not a
+# models.toml addition, so not implemented.
 # ---------------------------------------------------------------------------
 
 [fallback]
 trigger = "primary output fails validation/reconciliation (engine/verifier), or primary is marked unavailable by the bake-off/production circuit breaker (repeated call failures) — never a routine first choice"
+activation_note = "This table is a candidate catalog only. Activation is via a top-level [selected] table's vlm_fallback/llm_fallback keys (see comment block above), set only once the user picks — [selected] does not exist in this file yet."
 non_hf_provider_note = "None of the three candidates below need a separate API key: all are live on the HF router under the existing HF_TOKEN. A non-HF frontier model (proprietary API) would need its own key env var and a second client, out of scope for this change."
 
 [[fallback.candidates]]
