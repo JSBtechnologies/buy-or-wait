@@ -348,27 +348,34 @@ pub fn to_evidence(
     let category = |default: &str| record.category_hint.clone().unwrap_or_else(|| default.to_string());
 
     let fact = match record.record_type {
-        RecordType::SalaryChange | RecordType::SalaryFirstConfirmed => {
-            match (record.amount, record.date.as_deref()) {
-                (Some(a), Some(d)) => Fact::IncomeAmountChange {
-                    category: category("salary"),
-                    amount: Money::from_f64(a),
-                    currency: currency(),
-                    effective: parse_date(d)?,
-                },
-                (Some(a), None) => Fact::NextIncomeAmount {
-                    category: category("salary"),
-                    amount: Money::from_f64(a),
-                    currency: currency(),
-                    date: None,
-                },
-                (None, Some(d)) => Fact::IncomeDateMoved {
-                    category: category("salary"),
-                    new_date: parse_date(d)?,
-                },
-                (None, None) => return None,
-            }
-        }
+        RecordType::SalaryChange => match (record.amount, record.date.as_deref()) {
+            (Some(a), Some(d)) => Fact::IncomeAmountChange {
+                category: category("salary"),
+                amount: Money::from_f64(a),
+                currency: currency(),
+                effective: parse_date(d)?,
+            },
+            (Some(a), None) => Fact::NextIncomeAmount {
+                category: category("salary"),
+                amount: Money::from_f64(a),
+                currency: currency(),
+                date: None,
+            },
+            (None, Some(d)) => Fact::IncomeDateMoved {
+                category: category("salary"),
+                new_date: parse_date(d)?,
+            },
+            (None, None) => return None,
+        },
+        // engine#63/8cc70f3: first salary at a new employer, or pay resuming after a
+        // pause, is Fact::IncomeStarts — both amount and a first_date are required
+        // (never guessed); a record missing either is dropped.
+        RecordType::SalaryFirstConfirmed => Fact::IncomeStarts {
+            category: category("salary"),
+            amount: Money::from_f64(record.amount?),
+            currency: currency(),
+            first_date: parse_date(record.date.as_deref()?)?,
+        },
         RecordType::IncomeEnded => Fact::IncomeEnded {
             category: category("salary"),
             effective: record
@@ -434,14 +441,11 @@ pub fn to_evidence(
                 amount,
                 percent,
                 currency: record.currency.clone(),
-                // No explicit effective date (e.g. "the next rent payment"): anchor on the
-                // message's own sent_at date and let the recurrence detector find the next
-                // stream occurrence on/after it, rather than guessing a calendar date here.
-                effective: record
-                    .date
-                    .as_deref()
-                    .and_then(parse_date)
-                    .unwrap_or_else(|| observed_at.date()),
+                // engine#63/8cc70f3: effective is Option<NaiveDate> now — None means "the
+                // stream's next occurrence after the evidence was sent" (e.g. "the next
+                // rent payment"), which is exactly what a message with no explicit date
+                // means. Never invent a calendar date to fill this in.
+                effective: record.date.as_deref().and_then(parse_date),
             }
         }
         RecordType::InvestmentUnrealizedChange => {
@@ -549,6 +553,7 @@ mod tests {
             Fact::IncomeAmountChange { .. }
                 | Fact::NextIncomeAmount { .. }
                 | Fact::IncomeDateMoved { .. }
+                | Fact::IncomeStarts { .. } // message_11: first salary -> engine#63
         )));
     }
 
@@ -587,7 +592,9 @@ mod tests {
                 assert_eq!(amount, None);
                 assert_eq!(percent, Some(12.0));
                 assert_eq!(currency, None);
-                assert_eq!(effective, NaiveDate::from_ymd_opt(2023, 8, 1).unwrap());
+                // engine#63/8cc70f3: no explicit date -> None (next stream occurrence
+                // after sent_at, computed by engine), not the message's own sent_at date.
+                assert_eq!(effective, None);
             }
             other => panic!("expected ExpenseAmountChange, got {other:?}"),
         }
