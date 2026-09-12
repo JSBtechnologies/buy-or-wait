@@ -37,7 +37,11 @@ pub enum StreamKind {
 pub struct Occurrence {
     pub event_id: String,
     pub description: String,
+    /// Cash (settlement) date.
     pub date: NaiveDate,
+    /// Booking date; monthly cadence and day of month come from it, since a late settlement
+    /// does not move the billing cycle (user_07 salary 08-15 settled 08-23).
+    pub event_date: NaiveDate,
     /// Home-currency magnitude.
     pub amount: Money,
     pub flexibility: Flexibility,
@@ -147,6 +151,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
             event_id: ev.id.clone(),
             description: ev.description.clone(),
             date: e.cash_date,
+            event_date: ev.event_date,
             amount,
             flexibility: ev.flexibility,
             minimum_allowed_amount: ev.minimum_allowed_amount.and_then(|m| {
@@ -201,7 +206,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
                 direction,
                 category: category.clone(),
                 description: Some(description),
-                cadence: Cadence::Monthly { day: occs.last().unwrap().date.day() },
+                cadence: Cadence::Monthly { day: occs.last().unwrap().event_date.day() },
                 projected_amount: estimator.estimate(&amounts),
                 occurrences: occs,
             };
@@ -243,7 +248,7 @@ fn final_payroll_date(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Optio
 /// S3.2 monthly: every gap between consecutive rows within the configured range.
 fn is_monthly(occs: &[Occurrence], rules: &Rules) -> bool {
     let (lo, hi) = rules.monthly_gap_days;
-    occs.windows(2).all(|w| (lo..=hi).contains(&(w[1].date - w[0].date).num_days()))
+    occs.windows(2).all(|w| (lo..=hi).contains(&(w[1].event_date - w[0].event_date).num_days()))
 }
 
 /// S3.2 interval: the modal positive gap (smallest on ties), valid only if every gap is a
@@ -272,6 +277,7 @@ fn anchor_scheduled_income(ledger: &Ledger, streams: &mut Vec<Stream>, rules: &R
             event_id: e.event.id.clone(),
             description: e.event.description.clone(),
             date: e.cash_date,
+            event_date: e.cash_date,
             amount,
             flexibility: e.event.flexibility,
             minimum_allowed_amount: None,

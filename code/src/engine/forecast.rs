@@ -373,11 +373,16 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                 seed_monthly_income(flows, category, *amount, currency, *first_date, start, end, &src, &convert);
             }
             Fact::NextIncomeAmount { category, amount, currency, date } => {
-                if let Some(f) = flows
+                // RULES S3.4/S5 [FIT]: "next salary is reduced to X" (user_08) and "temporary pay
+                // continues for the next payroll" (user_06) project X for every later month,
+                // unless `next_income_amount_persists` is off (then only the next occurrence).
+                let mut income: Vec<&mut Flow> = flows
                     .iter_mut()
                     .filter(|f| is_income_flow(f, category) && date.map_or(true, |d| f.date >= d))
-                    .min_by_key(|f| f.date)
-                {
+                    .collect();
+                income.sort_by_key(|f| f.date);
+                let take = if inp.rules.next_income_amount_persists { income.len() } else { 1 };
+                for f in income.into_iter().take(take) {
                     if let Some(a) = convert(*amount, currency, f.date) {
                         f.amount = a;
                     }
@@ -431,6 +436,7 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                     event_id: rec.record_id.clone(),
                     description: description.clone(),
                     date: *first_date,
+                    event_date: *first_date,
                     amount: *amount,
                     flexibility: super::types::Flexibility::Fixed,
                     minimum_allowed_amount: None,
