@@ -133,3 +133,137 @@ fn scheduled_bill_and_retry_replace_the_stream_cycle() {
         .collect();
     assert_eq!(util, vec![(d("2025-08-12"), true), (d("2025-09-07"), false), (d("2025-10-07"), false)]);
 }
+
+#[test]
+fn evidence_records_serde_round_trip() {
+    use super::ledger::{EvidenceRecord, EvidenceSource, Fact};
+    let at = d("2025-07-29").and_hms_opt(9, 30, 0).unwrap();
+    let m = Money::from_f64(1422.85);
+    let facts = vec![
+        Fact::EventAmount { event_id: "event_1".into(), amount: m, currency: "INR".into() },
+        Fact::EventCancelled { event_id: "event_1".into() },
+        Fact::EventSettled { event_id: "event_1".into(), amount: Some(m), date: Some(d("2025-08-01")) },
+        Fact::EventAmended { event_id: "event_1".into(), amount: None, date: Some(d("2025-08-01")) },
+        Fact::DuplicateOf { event_id: "event_1".into(), of_event_id: Some("event_0".into()) },
+        Fact::OwnAccountTransfer { event_id: "event_1".into() },
+        Fact::IncomeAmountChange { category: "salary".into(), amount: m, currency: "EUR".into(), effective: d("2025-08-15") },
+        Fact::IncomeStarts { category: "salary".into(), amount: m, currency: "EUR".into(), first_date: d("2025-08-15") },
+        Fact::NextIncomeAmount { category: "salary".into(), amount: m, currency: "EUR".into(), date: None },
+        Fact::IncomeDateMoved { category: "salary".into(), new_date: d("2025-08-23") },
+        Fact::IncomeEnded { category: "salary".into(), effective: d("2025-08-01"), description: Some("Second household income".into()) },
+        Fact::NewRecurringExpense { description: "Childcare".into(), category: "family_support".into(), amount: m, currency: "EUR".into(), first_date: d("2025-08-01"), every_days: None },
+        Fact::ExpenseAmountChange { category: "rent".into(), amount: None, percent: Some(12.0), currency: None, effective: None },
+        Fact::OneTimeFlow { direction: Direction::Credit, category: "salary".into(), amount: m, currency: "EUR".into(), date: d("2025-08-20") },
+        Fact::Unconfirmed { category: "bonus".into(), amount: None, currency: None },
+    ];
+    for (i, fact) in facts.into_iter().enumerate() {
+        let rec = EvidenceRecord {
+            record_id: format!("message_{i}#0"),
+            source: if i == 0 { EvidenceSource::Image } else { EvidenceSource::Message { source_type: "employer".into() } },
+            observed_at: at,
+            fact,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: EvidenceRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rec, "{json}");
+    }
+    // Extraction's on-disk shape (code/store/evidence/user_02.json); IncomeEnded written
+    // before the selector existed still parses with description = None.
+    let disk = r#"[{"record_id":"message_01#0","source":{"Message":{"source_type":"employer"}},"observed_at":"2025-07-29T09:30:00",
+        "fact":{"IncomeAmountChange":{"category":"salary","amount":427500000000,"currency":"IDR","effective":"2025-08-15"}}},
+        {"record_id":"message_09#0","source":{"Message":{"source_type":"employer"}},"observed_at":"2026-03-01T09:30:00",
+        "fact":{"IncomeEnded":{"category":"salary","effective":"2026-03-01"}}}]"#;
+    let recs: Vec<EvidenceRecord> = serde_json::from_str(disk).unwrap();
+    assert!(matches!(&recs[0].fact, Fact::IncomeAmountChange { amount, .. } if *amount == Money::from_units(42_750_000)));
+    assert!(matches!(&recs[1].fact, Fact::IncomeEnded { description: None, .. }));
+}
+
+#[test]
+fn income_ended_selector_stops_only_the_matching_stream() {
+    use super::ledger::{EvidenceRecord, EvidenceSource, Fact};
+    use Direction::*;
+    let mut events = history(EventType::Income, "Payroll credit", "salary", Credit, 2000.0, 15, 1);
+    events.extend(history(EventType::Income, "Second household income", "salary", Credit, 500.0, 20, 11));
+    let rules = Rules::default();
+    let rates = Arc::new(RateTable::default());
+    let evidence = vec![EvidenceRecord {
+        record_id: "message_x#0".into(),
+        source: EvidenceSource::Message { source_type: "employer".into() },
+        observed_at: d("2025-08-01").and_hms_opt(9, 0, 0).unwrap(),
+        fact: Fact::IncomeEnded { category: "salary".into(), effective: d("2025-08-01"), description: Some("second household income".into()) },
+    }];
+    let ledger = Ledger::build("INR", &events, &evidence, rates.as_ref(), &rules);
+    let streams = recurrence::detect(&ledger, d("2025-08-05"), &rules);
+    let inputs = ForecastInputs {
+        ledger: &ledger,
+        streams: &streams,
+        opening_balance: Money::ZERO,
+        minimum_balance: Money::ZERO,
+        start: d("2025-08-05"),
+        rates: rates.as_ref(),
+        rules: &rules,
+    };
+    let f = Forecast::build(&inputs, &[]);
+    let amounts: Vec<Money> = f.flows.iter().filter(|x| x.category == "salary").map(|x| x.amount).collect();
+    assert_eq!(amounts, vec![Money::from_units(2000); 3]);
+}
+
+/// verify#65 on the real data: request_44's scheduled utility debit (event_date 02-04,
+/// settles 02-11) replaces the 02-05 utilities projection; no stream occurrence of a
+/// scheduled row's category lands within 15 days of it.
+#[test]
+fn request_44_scheduled_utility_projected_once() {
+    use crate::engine::session::Session;
+    use crate::model;
+    let ds = std::path::Path::new("../dataset");
+    let profiles = model::load_financial_profiles(ds.join("financial_profiles.csv")).unwrap();
+    let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
+    let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
+    let req = model::load_requests(ds.join("requests.csv")).unwrap().into_iter().find(|r| r.request_id == "request_44").unwrap();
+    let session = Session::from_model(&req.user_id, &profiles, &events, rates, Rules::default()).unwrap();
+    let dec = session.decide(&req.request_id, req.request_date, &RequestSpec::from_model(&req), &[]).unwrap();
+    let flows = &dec.baseline.flows;
+    let scheduled: Vec<_> = flows.iter().filter(|f| matches!(f.source, FlowSource::Scheduled { .. })).collect();
+    assert!(scheduled.iter().any(|s| s.category == "utilities" && s.date == d("2025-02-11")));
+    for s in scheduled {
+        let doubles: Vec<_> = flows
+            .iter()
+            .filter(|f| matches!(f.source, FlowSource::Stream { .. }) && f.category == s.category && f.amount.0.signum() == s.amount.0.signum())
+            .filter(|f| (f.date - s.date).num_days().abs() <= 15)
+            .collect();
+        assert!(doubles.is_empty(), "{} {:?} doubled by {:?}", s.category, s.date, doubles);
+    }
+}
+
+/// RULES S6.1 (extraction #125): IncomeDateMoved re-anchors ALL later months, not only the
+/// next occurrence; a month-end move clamps per month.
+#[test]
+fn income_date_moved_reanchors_every_later_month() {
+    use super::ledger::{EvidenceRecord, EvidenceSource, Fact};
+    let run = |new_date: &str, rd: &str| {
+        let events = history(EventType::Income, "Payroll credit", "salary", Direction::Credit, 149000.0, 15, 1);
+        let rules = Rules::default();
+        let rates = Arc::new(RateTable::default());
+        let evidence = vec![EvidenceRecord {
+            record_id: "message_05#0".into(),
+            source: EvidenceSource::Message { source_type: "employer".into() },
+            observed_at: d("2025-07-29").and_hms_opt(9, 30, 0).unwrap(),
+            fact: Fact::IncomeDateMoved { category: "salary".into(), new_date: d(new_date) },
+        }];
+        let ledger = Ledger::build("INR", &events, &evidence, rates.as_ref(), &rules);
+        let streams = recurrence::detect(&ledger, d(rd), &rules);
+        let inputs = ForecastInputs {
+            ledger: &ledger,
+            streams: &streams,
+            opening_balance: Money::ZERO,
+            minimum_balance: Money::ZERO,
+            start: d(rd),
+            rates: rates.as_ref(),
+            rules: &rules,
+        };
+        let f = Forecast::build(&inputs, &[]);
+        f.flows.iter().filter(|x| x.category == "salary").map(|x| x.date).collect::<Vec<_>>()
+    };
+    assert_eq!(run("2025-08-23", "2025-08-05"), vec![d("2025-08-23"), d("2025-09-23"), d("2025-10-23")]);
+    assert_eq!(run("2025-08-31", "2025-08-05"), vec![d("2025-08-31"), d("2025-09-30"), d("2025-10-31")]);
+}

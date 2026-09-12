@@ -12,7 +12,7 @@ use chrono::NaiveDate;
 use super::explain;
 use super::facts::{CandidateFact, CandidateOutcome, ChangeFact, DecisionFacts};
 use super::forecast::{Forecast, ForecastInputs, SpendingChange};
-use super::ledger::{EvidenceRecord, Ledger, LedgerIssue};
+use super::ledger::{AmountSource, EvidenceRecord, Ledger, LedgerIssue};
 use super::money::Money;
 use super::plans::{self, Outcome, PlanContext};
 use super::recurrence::{self, Streams};
@@ -253,6 +253,13 @@ impl Session {
             option_id,
             changes: change_facts,
             plan_trough,
+            missing_amounts: self
+                .ledger
+                .entries
+                .iter()
+                .filter(|e| e.amount_source == AmountSource::Missing)
+                .map(|e| e.event.id.clone())
+                .collect(),
             ledger_issues: self.ledger.issues.iter().map(issue_text).collect(),
             rejected_evidence: self.ledger.rejected.iter().map(|r| format!("{}: {}", r.record_id, r.reason)).collect(),
             applied_evidence: self

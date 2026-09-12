@@ -1,5 +1,5 @@
+use std::collections::HashMap;
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -9,9 +9,11 @@ use buyorwait::engine::types::{PaymentOption, RateTable, RequestSpec};
 use buyorwait::engine::Rules;
 use buyorwait::evaluation::{Finding, ForecastSeries, InvariantViolation, Invariants};
 use buyorwait::extract::{messages::deterministic_evidence, retrieval};
+use buyorwait::hf;
 use buyorwait::model;
 use buyorwait::store::cache::DiskCache;
 use buyorwait::store::processed::ProcessedStore;
+use serde::Deserialize;
 
 fn main() -> anyhow::Result<ExitCode> {
     let args: Vec<String> = env::args().collect();
@@ -136,10 +138,16 @@ fn main() -> anyhow::Result<ExitCode> {
     }
     writer.flush()?;
 
-    fs::create_dir_all("evaluation")?;
-    fs::write(
-        "evaluation/usage_report.md",
-        "# Usage report\n\nPending: populated by ml-engineer from the final full-dataset run.\n",
+    // No model calls in this baseline build (deterministic evidence only), so the usage
+    // records are empty; `write_usage_report` still renders every required section with
+    // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
+    let pricing = load_pricing(Path::new("config/models.toml"))?;
+    let usage_records: Vec<hf::Usage> = Vec::new();
+    hf::write_usage_report(
+        Path::new("evaluation/usage_report.md"),
+        &usage_records,
+        &pricing,
+        requests.len(),
     )?;
 
     eprintln!("model cache stats: {:?}", model_cache.stats());
@@ -189,6 +197,48 @@ fn decide_one(
     };
     let outcome = invariants.assert_row(&decision.row, &forecast);
     Ok((decision.row, outcome))
+}
+
+/// Reads `config/models.toml`'s candidate pricing into the map `hf::write_usage_report`
+/// expects, keyed by `model_id`. `hf.rs` deliberately has no TOML dependency of its own
+/// (its own doc comment: "the caller reads models.toml and builds this map"), so that
+/// caller is here.
+fn load_pricing(path: &Path) -> anyhow::Result<HashMap<String, hf::Pricing>> {
+    #[derive(Deserialize)]
+    struct ModelsConfig {
+        candidates: CandidatesConfig,
+    }
+    #[derive(Deserialize)]
+    struct CandidatesConfig {
+        vlm: Vec<CandidateConfig>,
+        llm: Vec<CandidateConfig>,
+    }
+    #[derive(Deserialize)]
+    struct CandidateConfig {
+        id: String,
+        pricing_usd_per_m_tokens: PricingConfig,
+    }
+    #[derive(Deserialize)]
+    struct PricingConfig {
+        input: f64,
+        output: f64,
+    }
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    let config: ModelsConfig = toml::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
+    let mut pricing = HashMap::new();
+    for c in config.candidates.vlm.into_iter().chain(config.candidates.llm) {
+        pricing.insert(
+            c.id,
+            hf::Pricing {
+                input_per_m: c.pricing_usd_per_m_tokens.input,
+                output_per_m: c.pricing_usd_per_m_tokens.output,
+            },
+        );
+    }
+    Ok(pricing)
 }
 
 /// Written only when the engine itself errors (e.g. a malformed upstream row) -- safe by

@@ -1,0 +1,18 @@
+[
+  {
+    "record_id": "message_212#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2025-02-02T09:30:00",
+    "fact": {
+      "Unconfirmed": {
+        "category": "windfall",
+        "amount": null,
+        "currency": null
+      }
+    }
+  }
+]

@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_171#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2024-06-04T09:30:00",
+    "fact": {
+      "NextIncomeAmount": {
+        "category": "salary",
+        "amount": 13464000,
+        "currency": "EUR",
+        "date": null
+      }
+    }
+  }
+]

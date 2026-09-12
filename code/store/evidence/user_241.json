@@ -1,0 +1,18 @@
+[
+  {
+    "record_id": "message_189#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2024-02-29T09:30:00",
+    "fact": {
+      "IncomeEnded": {
+        "category": "salary",
+        "effective": "2024-02-29",
+        "description": null
+      }
+    }
+  }
+]

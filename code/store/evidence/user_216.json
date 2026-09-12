@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_169#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2026-06-28T09:30:00",
+    "fact": {
+      "IncomeAmountChange": {
+        "category": "salary",
+        "amount": 24240000,
+        "currency": "USD",
+        "effective": "2026-07-15"
+      }
+    }
+  }
+]

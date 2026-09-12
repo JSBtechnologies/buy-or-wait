@@ -1,0 +1,20 @@
+[
+  {
+    "record_id": "message_109#0",
+    "source": {
+      "Message": {
+        "source_type": "service_provider"
+      }
+    },
+    "observed_at": "2024-12-04T09:30:00",
+    "fact": {
+      "OneTimeFlow": {
+        "direction": "Credit",
+        "category": "invoice_income",
+        "amount": 20400000,
+        "currency": "USD",
+        "date": "2024-12-15"
+      }
+    }
+  }
+]

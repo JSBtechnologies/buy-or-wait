@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_181#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2024-05-26T09:30:00",
+    "fact": {
+      "IncomeStarts": {
+        "category": "salary",
+        "amount": 27720000,
+        "currency": "EUR",
+        "first_date": "2024-06-15"
+      }
+    }
+  }
+]

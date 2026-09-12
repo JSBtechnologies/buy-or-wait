@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_196#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2024-12-01T09:30:00",
+    "fact": {
+      "IncomeStarts": {
+        "category": "salary",
+        "amount": 536800000,
+        "currency": "ZAR",
+        "first_date": "2024-12-15"
+      }
+    }
+  }
+]

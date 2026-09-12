@@ -1,0 +1,18 @@
+[
+  {
+    "record_id": "message_145#0",
+    "source": {
+      "Message": {
+        "source_type": "merchant"
+      }
+    },
+    "observed_at": "2026-04-03T09:30:00",
+    "fact": {
+      "Unconfirmed": {
+        "category": "windfall",
+        "amount": null,
+        "currency": null
+      }
+    }
+  }
+]

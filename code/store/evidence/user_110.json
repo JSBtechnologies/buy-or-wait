@@ -1,0 +1,20 @@
+[
+  {
+    "record_id": "message_83#0",
+    "source": {
+      "Message": {
+        "source_type": "service_provider"
+      }
+    },
+    "observed_at": "2025-08-05T09:30:00",
+    "fact": {
+      "OneTimeFlow": {
+        "direction": "Credit",
+        "category": "invoice_income",
+        "amount": 167200000,
+        "currency": "ZAR",
+        "date": "2025-08-15"
+      }
+    }
+  }
+]

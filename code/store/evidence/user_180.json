@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_143#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2026-06-29T09:30:00",
+    "fact": {
+      "IncomeStarts": {
+        "category": "salary",
+        "amount": 590000000,
+        "currency": "INR",
+        "first_date": "2026-07-15"
+      }
+    }
+  }
+]

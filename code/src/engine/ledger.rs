@@ -64,7 +64,15 @@ pub enum Fact {
     /// The next income occurrence moves to `new_date`.
     IncomeDateMoved { category: String, new_date: NaiveDate },
     /// Recurring income stops from `effective` onward.
-    IncomeEnded { category: String, effective: NaiveDate },
+    IncomeEnded {
+        category: String,
+        effective: NaiveDate,
+        /// Stream selector (RULES S6.2, lead-approved additive): only income streams whose
+        /// description matches (case-insensitive substring either way) end, e.g. "Second
+        /// household income". `None` ends every income stream of the category.
+        #[serde(default)]
+        description: Option<String>,
+    },
     /// A confirmed new recurring expense.
     NewRecurringExpense {
         description: String,
