@@ -2,6 +2,7 @@
 name = "buyorwait"
 version = "0.1.0"
 edition = "2021"
+default-run = "buyorwait"
 
 [[bin]]
 name = "buyorwait"
@@ -20,3 +21,6 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 sha2 = "0.10"
 anyhow = "1"
+toml = "0.8"
+regex = "1"
+image = "0.25"

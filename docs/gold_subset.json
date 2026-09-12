@@ -1,0 +1,402 @@
+{
+  "_meta": {
+    "purpose": "Fixed bake-off subset for VLM/LLM model selection (PLAN.md Phase 2d). Every entry is hand-verified against dataset/ and, for images, against the actual PNG pixels read directly.",
+    "owner": "extraction",
+    "prompt_versions_used": {
+      "message_extraction": "message_extraction.v1",
+      "image_transcription": "image_transcription.v1"
+    },
+    "record_schema_ref": "code/prompts/message_extraction.v1.md",
+    "figure_schema_ref": "code/prompts/image_transcription.v1.md",
+    "how_to_score": "Run each bake-off candidate model against every item with the referenced prompt file, temperature 0, 5 repeats. Compare parsed JSON to `expected` field-by-field. For images 06-16 (no `expected`), there is no ground truth — score only stability (identical output across the 5 runs) and cross-model agreement, per PLAN.md Phase 2d.",
+    "skeleton_families_survey": {
+      "total_messages": 215,
+      "note": "After masking numbers/dates/company-service-names, ~209/215 messages collapse into a small number of true semantic template families (see record_types_covered below), each present in both English and Indonesian with only the employer/service name, amount, and date varying. This is the basis for template induction (PLAN.md §3 batching lever): a skeleton already resolved by one model call is parsed deterministically for every later message that normalizes to the same skeleton.",
+      "source_type_counts": {"employer": 126, "service_provider": 31, "financial_service": 23, "bank": 18, "merchant": 17},
+      "related_event_id_populated": 39,
+      "related_event_id_blank": 176
+    },
+    "record_types_covered": [
+      "salary_change", "salary_first_confirmed", "income_ended", "one_time_adjustment",
+      "recurring_expense_change", "pending_unconfirmed_credit", "event_amendment",
+      "investment_unrealized_change", "no_actionable_fact", "rejected_instruction"
+    ]
+  },
+
+  "images": [
+    {
+      "image_id": "image_01",
+      "user_id": "user_03",
+      "request_id": "request_03",
+      "related_event_id": "event_253",
+      "labeled": true,
+      "event_context": {
+        "event_type": "income", "category": "salary", "status": "settled",
+        "description": "August 2019 net salary", "event_date": "2019-08-31", "currency": "IDR", "amount": "BLANK"
+      },
+      "risk_note": "user_03 salary oddity (PLAN.md §5 known risks). event_210 already pays the regular Aug-15 payroll credit of IDR 4,365,000 (settled, matches the Apr-Aug recurring pattern exactly). event_211 'Promotion arrears payment' of IDR 1,964,250 is a SEPARATE settled one-time credit on 2019-08-20. message_02 (2019-08-31, Indonesian) tells the user the confirmed regular salary for the NEXT payroll will appear separately from any one-time adjustment on the next payslip. image_01 IS that next payslip (Pay Slip Aug-2019, printed 2 Sep 2019). The figure selector must extract ONLY the Net Pay line (regular salary) from this payslip and must NOT add the already-separately-recorded arrears (event_211) to it, or the salary stream used for the 90-day forecast would be inflated by double-counting the arrears every month it recurs.",
+      "expected_figures": {
+        "doc_type": "payslip", "currency": "IDR",
+        "subtotal": 4780800, "tax": null, "total": null,
+        "amount_due": null, "amount_paid": null, "balance_due": null,
+        "gross_pay": 4780800, "deductions": 415800, "net_pay": 4365000,
+        "previous_balance": null, "amount_due_before_date": null, "amount_due_before_date_value": null,
+        "amount_due_after_date": null, "document_date": "2019-09-02", "period_label": "Aug-2019",
+        "line_items_sum_check": 4780800
+      },
+      "reconciliation": {
+        "earnings_sum_check": "4500000+90000+166500+10800+13500 = 4780800 (matches Subtotal Earnings)",
+        "deductions_sum_check": "90000+45000+166500+90000+10800+13500 = 415800 (matches Subtotal Deductions)",
+        "gross_minus_deductions": "4780800-415800 = 4365000 (matches printed Net Pay)",
+        "status": "PASS"
+      },
+      "selector_input": {"event_type": "income", "status": "settled"},
+      "expected_selected_amount": 4365000,
+      "expected_selected_field": "net_pay"
+    },
+    {
+      "image_id": "image_02",
+      "user_id": "user_16",
+      "request_id": "request_16",
+      "related_event_id": "event_1442",
+      "labeled": true,
+      "event_context": {
+        "event_type": "expense", "category": "rent", "status": "scheduled",
+        "description": "Outstanding rent balance", "event_date": "2023-08-11", "settlement_date": "2023-08-16",
+        "currency": "INR", "amount": "BLANK"
+      },
+      "expected_figures": {
+        "doc_type": "receipt", "currency": "INR",
+        "subtotal": null, "tax": null, "total": 200000,
+        "amount_due": null, "amount_paid": 100000, "balance_due": 100000,
+        "gross_pay": null, "deductions": null, "net_pay": null,
+        "previous_balance": null, "amount_due_before_date": null, "amount_due_before_date_value": null,
+        "amount_due_after_date": null, "document_date": "2023-08-11", "period_label": "April 2022 to September 2022",
+        "line_items_sum_check": 200000
+      },
+      "reconciliation": {
+        "components_sum_check": "Rent&Maintenance 180000 + Water 5000 + Rental Tax 5000 + Electrical 10000 = 200000 (matches Total Amount to be Received)",
+        "paid_plus_balance": "Amount Received 100000 + Balance Due 100000 = 200000 (matches total)",
+        "status": "PASS"
+      },
+      "selector_input": {"event_type": "expense", "status": "scheduled", "description_implies_existing_balance": true},
+      "expected_selected_amount": 100000,
+      "expected_selected_field": "balance_due",
+      "note": "Description literally says 'Outstanding rent balance' -> the Balance Due line, not the original Total Amount to be Received."
+    },
+    {
+      "image_id": "image_03",
+      "user_id": "user_17",
+      "request_id": "request_17",
+      "related_event_id": "event_1545",
+      "labeled": true,
+      "event_context": {
+        "event_type": "expense", "category": "groceries", "status": "settled",
+        "description": "Bulk groceries and pantry purchase", "event_date": "2026-02-27", "currency": "INR", "amount": "BLANK"
+      },
+      "expected_figures": {
+        "doc_type": "receipt", "currency": "INR",
+        "subtotal": null, "tax": null, "total": 41272.0,
+        "amount_due": null, "amount_paid": 41272.00, "balance_due": null,
+        "gross_pay": null, "deductions": null, "net_pay": null,
+        "previous_balance": null, "amount_due_before_date": null, "amount_due_before_date_value": null,
+        "amount_due_after_date": null, "document_date": "2026-02-27", "period_label": null,
+        "line_items_sum_check": 41272.0
+      },
+      "reconciliation": {
+        "items_sum_check": "5800+750+13920+4800+2500+2152+750+540+1690+7290+1080 = 41272 (11 items/76 qty, matches Net Amount and Cash Paid)",
+        "status": "PASS"
+      },
+      "selector_input": {"event_type": "expense", "status": "settled"},
+      "expected_selected_amount": 41272,
+      "expected_selected_field": "amount_paid"
+    },
+    {
+      "image_id": "image_04",
+      "user_id": "user_19",
+      "request_id": "request_19",
+      "related_event_id": "event_1700",
+      "labeled": true,
+      "event_context": {
+        "event_type": "expense", "category": "groceries", "status": "settled",
+        "description": "Delivered grocery order", "event_date": "2024-09-03", "currency": "INR", "amount": "BLANK"
+      },
+      "expected_figures": {
+        "doc_type": "delivery_summary", "currency": "INR",
+        "subtotal": 2854.00, "tax": null, "total": null,
+        "amount_due": null, "amount_paid": null, "balance_due": null,
+        "gross_pay": null, "deductions": null, "net_pay": null,
+        "previous_balance": null, "amount_due_before_date": null, "amount_due_before_date_value": null,
+        "amount_due_after_date": null, "document_date": null, "period_label": null,
+        "line_items_sum_check": 2854.00
+      },
+      "reconciliation": {
+        "items_sum_check": "95+531+0+186+122+464*2(928)+184+144+75+366+190+121+376 = 2854 (13 items, matches printed Item Bill exactly)",
+        "status": "PARTIAL - subtotal reconciles internally, but the page is cropped before the Grand Total: a truncated 'Delivery ... 16.00' line is visible below Item Bill, meaning the true order total is >= 2854 and unknown."
+      },
+      "selector_input": {"event_type": "expense", "status": "settled"},
+      "expected_selected_amount": null,
+      "expected_selected_field": null,
+      "resolution": "escalate_then_reject_partial_total",
+      "note": "Deliberately the hardest of the 5 labeled images. This is the canonical test of the 'never guess, never treat blank as zero' rule (PLAN.md §2.3): item subtotal (2854.00) is fully grounded and reconciles against its own line items, but the field the selector actually needs for a settled expense (total/amount_paid) is not visible in the image at all. Correct behavior: VLM reports total=null honestly (not 2854, which is only the item subtotal); Rust reconciliation sees amount_paid/total missing, escalates to a second read; second read cannot surface a number that genuinely is not on the page, so the fact is REJECTED rather than guessed. This event's amount stays unresolved evidence, not a fabricated figure."
+    },
+    {
+      "image_id": "image_05",
+      "user_id": "user_20",
+      "request_id": "request_20",
+      "related_event_id": "event_1786",
+      "labeled": true,
+      "event_context": {
+        "event_type": "expense", "category": "utilities", "status": "pending",
+        "description": "Outstanding telecom bill", "event_date": "2026-02-06", "settlement_date": "2026-02-09",
+        "currency": "INR", "amount": "BLANK"
+      },
+      "expected_figures": {
+        "doc_type": "bill", "currency": "INR",
+        "subtotal": null, "tax": 107.40, "total": 704.05,
+        "amount_due": 704.05, "amount_paid": null, "balance_due": null,
+        "gross_pay": null, "deductions": null, "net_pay": null,
+        "previous_balance": 3543.54,
+        "amount_due_before_date": 704.05, "amount_due_before_date_value": "2026-02-06",
+        "amount_due_after_date": 822.05,
+        "document_date": null, "period_label": null,
+        "line_items_sum_check": 704.05
+      },
+      "reconciliation": {
+        "charges_sum_check": "Rentals 580.65 + Usage charges 16.00 + Taxes 107.40 = 704.05 (matches This month's charges Total, and matches Amount due till 06-Feb-2026)",
+        "status": "PASS"
+      },
+      "selector_input": {"event_type": "expense", "status": "pending", "settlement_date": "2026-02-09", "printed_cutoff_date": "2026-02-06"},
+      "expected_selected_amount": 822.05,
+      "expected_selected_field": "amount_due_after_date",
+      "note": "Date-aware selection is the point of this image: the event's settlement_date (2026-02-09) falls AFTER the bill's printed cutoff (06-Feb-2026), so the correct due figure is the post-cutoff 822.05, not the pre-cutoff 704.05 that a naive 'first amount on the page' reader would grab."
+    },
+
+    { "image_id": "image_06", "user_id": "user_33", "request_id": "request_33", "related_event_id": "event_3051", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_07", "user_id": "user_35", "request_id": "request_35", "related_event_id": "event_3231", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_08", "user_id": "user_48", "request_id": "request_48", "related_event_id": "event_4535", "labeled": false, "purpose": "cross_model_agreement",
+      "note": "event_4535 is 'Property maintenance invoice' (blank amount, settled 2026-07-24). message_35 (same request) confirms the payment date but not the amount, deliberately pointing the amount back to this image only." },
+    { "image_id": "image_09", "user_id": "user_55", "request_id": "request_55", "related_event_id": "event_5170", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_10", "user_id": "user_64", "request_id": "request_64", "related_event_id": "event_6033", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_11", "user_id": "user_73", "request_id": "request_73", "related_event_id": "event_6859", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_12", "user_id": "user_78", "request_id": "request_78", "related_event_id": "event_7307", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_13", "user_id": "user_84", "request_id": "request_84", "related_event_id": "event_7941", "labeled": false, "purpose": "cross_model_agreement",
+      "note": "event_7941 is 'Tote bag order' (blank amount, settled 2026-04-03). message_64 confirms the payment date/currency (INR) but not the amount, same pattern as image_08." },
+    { "image_id": "image_14", "user_id": "user_101", "request_id": "request_101", "related_event_id": "event_9421", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_15", "user_id": "user_105", "request_id": "request_105", "related_event_id": "event_9806", "labeled": false, "purpose": "cross_model_agreement" },
+    { "image_id": "image_16", "user_id": "user_113", "request_id": "request_113", "related_event_id": "event_10521", "labeled": false, "purpose": "cross_model_agreement",
+      "note": "event_10521 is 'EV charging wallet payment' (blank amount, settled 2026-09-03). message_86 (same user) confirms the charge date but not its amount, and additionally carries an unrelated salary-confirmation sentence in the SAME message (multi-fact message, see messages gold set)." }
+  ],
+
+  "messages": [
+    { "message_id": "message_26", "language": "en", "record_type": "salary_change",
+      "text": "Hi, Northstar Labs payroll here. Your monthly salary has increased to USD 2988. The change applies from 2026-07-15. The revised amount will appear on your next payslip. Payroll ref EMP-0026.",
+      "expected": [ { "record_type": "salary_change", "amount": 2988, "currency": "USD", "percent": null, "date": "2026-07-15", "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "salary_increase" } ] },
+    { "message_id": "message_01", "language": "id", "record_type": "salary_change",
+      "text": "Rincian penggajian Anda di Cobalt Systems telah berubah. Gaji bulanan Anda naik menjadi IDR 42750000. Perubahan ini berlaku mulai 2025-08-15. Jumlah yang diperbarui akan terlihat pada slip gaji berikutnya. Ref payroll EMP-0001.",
+      "expected": [ { "record_type": "salary_change", "amount": 42750000, "currency": "IDR", "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "salary_increase" } ] },
+
+    { "message_id": "message_04", "language": "en", "record_type": "salary_change",
+      "text": "Here’s the latest payroll information from Northstar Labs. Your temporary monthly pay is EUR 1037.52. The reduced amount continues for the next payroll. This is the amount currently scheduled for the affected pay cycle. Payroll ref EMP-0004.",
+      "expected": [ { "record_type": "salary_change", "amount": 1037.52, "currency": "EUR", "percent": null, "date": null, "related_event_id": null, "status_hint": "scheduled", "direction": "decrease", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "temporary_reduction" } ] },
+    { "message_id": "message_36", "language": "id", "record_type": "salary_change",
+      "text": "Rincian penggajian Anda di Greenfield Foods telah berubah. Gaji bulanan sementara Anda adalah IDR 31464000. Jumlah yang lebih rendah masih berlaku untuk penggajian berikutnya. Inilah jumlah yang saat ini dijadwalkan untuk periode penggajian tersebut. Ref payroll EMP-0036.",
+      "expected": [ { "record_type": "salary_change", "amount": 31464000, "currency": "IDR", "percent": null, "date": null, "related_event_id": null, "status_hint": "scheduled", "direction": "decrease", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "temporary_reduction" } ] },
+
+    { "message_id": "message_06", "language": "en", "record_type": "salary_change",
+      "text": "Hi, Greenfield Foods payroll here. Your next salary is reduced to EUR 1422.85. The adjustment is due to approved unpaid leave. The adjustment will be visible on your next payslip. Payroll ref EMP-0006.",
+      "expected": [ { "record_type": "salary_change", "amount": 1422.85, "currency": "EUR", "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": "decrease", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "unpaid_leave_reduction" } ] },
+
+    { "message_id": "message_11", "language": "en", "record_type": "salary_first_confirmed",
+      "text": "A quick update from the payroll team at Riverline Retail. Your first salary will be EUR 1661. The confirmed credit date is 2026-01-15. The money will appear after the bank posts the credit. Payroll ref EMP-0011.",
+      "expected": [ { "record_type": "salary_first_confirmed", "amount": 1661, "currency": "EUR", "percent": null, "date": "2026-01-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "new_employer_first_salary" } ] },
+    { "message_id": "message_31", "language": "id", "record_type": "salary_first_confirmed",
+      "text": "Ada pembaruan singkat dari tim payroll HarborWorks. Gaji pertama dari perusahaan baru adalah IDR 32870000. Pembayaran sudah dikonfirmasi untuk 2024-09-15. Pemrosesan bank dapat memerlukan waktu seperti biasa setelah gaji dikirim. Ref payroll EMP-0031.",
+      "expected": [ { "record_type": "salary_first_confirmed", "amount": 32870000, "currency": "IDR", "percent": null, "date": "2024-09-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "new_employer_first_salary" } ] },
+    { "message_id": "message_81", "language": "en", "record_type": "salary_first_confirmed",
+      "text": "Greenfield Foods payroll has posted a new update. Your first salary of EUR 2123 is scheduled for 2025-05-15. Payroll has approved the payment and sent it for processing. The credit will show only after the bank processes the payroll file. Payroll ref EMP-0081.",
+      "expected": [ { "record_type": "salary_first_confirmed", "amount": 2123, "currency": "EUR", "percent": null, "date": "2025-05-15", "related_event_id": null, "status_hint": "scheduled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "new_employer_first_salary_approved" } ] },
+
+    { "message_id": "message_05", "language": "en", "record_type": "salary_change",
+      "text": "BrightPath Media has updated your payroll record. Your confirmed salary is now expected on 2024-09-23. This replaces the payroll date shown in the earlier update. Please use the revised date for anything you normally pay around payday. Payroll ref EMP-0005.",
+      "expected": [ { "record_type": "salary_change", "amount": null, "currency": null, "percent": null, "date": "2024-09-23", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "pay_date_moved_supersedes_prior" } ] },
+    { "message_id": "message_165", "language": "id", "record_type": "salary_change",
+      "text": "Ada informasi baru dari Greenfield Foods tentang gaji Anda. Gaji yang sudah dikonfirmasi kini diperkirakan masuk pada 2025-02-23. Tanggal ini menggantikan tanggal penggajian pada pemberitahuan sebelumnya. Gunakan tanggal terbaru ini untuk pembayaran yang biasanya dilakukan saat gajian. Ref payroll EMP-0165.",
+      "expected": [ { "record_type": "salary_change", "amount": null, "currency": null, "percent": null, "date": "2025-02-23", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "pay_date_moved_supersedes_prior" } ] },
+
+    { "message_id": "message_10", "language": "en", "record_type": "salary_first_confirmed+recurring_expense_change",
+      "text": "Here’s the latest payroll information from HarborWorks. Regular salary of EUR 2717 resumes on 2025-08-15. A new recurring childcare payment begins in the same month. The updated pay and deductions will appear from the next cycle. Payroll ref EMP-0010.",
+      "expected": [
+        { "record_type": "salary_first_confirmed", "amount": 2717, "currency": "EUR", "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "resumes_after_pause" },
+        { "record_type": "recurring_expense_change", "amount": null, "currency": null, "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "childcare", "note": "new_recurring_expense_amount_unknown" }
+      ],
+      "note": "engine#63/8cc70f3: 'resumes' maps to Fact::IncomeStarts (re-anchors monthly cadence from first_date), same as salary_first_confirmed — not a plain salary_change." },
+
+    { "message_id": "message_20", "language": "en", "record_type": "salary_change+one_time_adjustment",
+      "text": "A quick update from the payroll team at Cedar Health. Your regular salary for the next payroll is EUR 1452. The same payroll includes a one-time arrears adjustment of EUR 653.40. Your next payslip will show the regular pay and any one-off adjustment separately. Payroll ref EMP-0020.",
+      "expected": [
+        { "record_type": "salary_change", "amount": 1452, "currency": "EUR", "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "regular_salary_confirmed" },
+        { "record_type": "one_time_adjustment", "amount": 653.40, "currency": "EUR", "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "arrears_same_payroll_do_not_recur" }
+      ] },
+    { "message_id": "message_27", "language": "id", "record_type": "salary_change+one_time_adjustment",
+      "text": "Cedar Health telah memperbarui catatan penggajian Anda. Gaji rutin Anda untuk penggajian berikutnya adalah IDR 21090000. Penggajian yang sama mencakup penyesuaian tunggakan satu kali sebesar IDR 9490500. Slip gaji berikutnya akan menampilkan gaji rutin dan penyesuaian satu kali secara terpisah. Ref payroll EMP-0027.",
+      "expected": [
+        { "record_type": "salary_change", "amount": 21090000, "currency": "IDR", "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "regular_salary_confirmed" },
+        { "record_type": "one_time_adjustment", "amount": 9490500, "currency": "IDR", "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "arrears_same_payroll_do_not_recur" }
+      ] },
+
+    { "message_id": "message_02", "language": "id", "record_type": "salary_change",
+      "text": "Tim payroll BrightPath Media telah mengirim pembaruan. Gaji rutin untuk penggajian berikutnya sudah dikonfirmasi. Slip gaji berikutnya akan menampilkan gaji rutin dan penyesuaian satu kali secara terpisah. Ref payroll EMP-0002.",
+      "expected": [ { "record_type": "salary_change", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "next_payslip_shows_regular_and_onetime_separately" } ],
+      "risk_note": "THE user_03 risk case (PLAN.md known risks + image_01 above). No amount is stated here — this message's only job is to tell the figure selector that the upcoming payslip (image_01, event_253) will show regular pay and a one-off separately, so image_01's Net Pay line (4,365,000 IDR) must be read alone and NOT combined with the already-separately-recorded arrears (event_211, 1,964,250 IDR, settled 2019-08-20). This record alone amends nothing; its value is purely as corroborating context for image_01's selector." },
+
+    { "message_id": "message_57", "language": "en", "record_type": "income_ended",
+      "text": "A quick update from the payroll team at Northstar Labs. Your employment has ended. There are no regular salary payments scheduled after the final settlement. Details of any final settlement will be sent separately. Payroll ref EMP-0057.",
+      "expected": [ { "record_type": "income_ended", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "ended", "direction": null, "scope": "full_employment", "is_duplicate_transfer": null, "category_hint": "salary", "note": "stop_projecting_this_salary_stream" } ] },
+    { "message_id": "message_84", "language": "id", "record_type": "income_ended",
+      "text": "Ada informasi baru dari HarborWorks tentang gaji Anda. Hubungan kerja Anda telah berakhir. Tidak ada pembayaran gaji rutin yang dijadwalkan setelah penyelesaian akhir. Rincian penyelesaian akhir akan dikirim secara terpisah. Ref payroll EMP-0084.",
+      "expected": [ { "record_type": "income_ended", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "ended", "direction": null, "scope": "full_employment", "is_duplicate_transfer": null, "category_hint": "salary", "note": "stop_projecting_this_salary_stream" } ] },
+
+    { "message_id": "message_09", "language": "en", "record_type": "income_ended",
+      "text": "A note from Cobalt Systems about your upcoming pay. The current seasonal contract has ended. No off-season income or renewal has been confirmed. We’ll contact you separately if another shift block or contract is approved. Payroll ref EMP-0009.",
+      "expected": [ { "record_type": "income_ended", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "ended", "direction": null, "scope": "seasonal_contract", "is_duplicate_transfer": null, "category_hint": "salary", "note": "no_confirmed_renewal_do_not_project" } ] },
+    { "message_id": "message_103", "language": "id", "record_type": "income_ended",
+      "text": "Rincian penggajian Anda di HarborWorks telah berubah. Kontrak musiman saat ini telah berakhir. Belum ada pendapatan di luar musim atau perpanjangan kontrak yang dikonfirmasi. Kami akan menghubungi Anda jika jadwal kerja atau kontrak berikutnya disetujui. Ref payroll EMP-0103.",
+      "expected": [ { "record_type": "income_ended", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "ended", "direction": null, "scope": "seasonal_contract", "is_duplicate_transfer": null, "category_hint": "salary", "note": "no_confirmed_renewal_do_not_project" } ] },
+
+    { "message_id": "message_30", "language": "en", "record_type": "income_ended",
+      "text": "A quick update from the payroll team at Greenfield Foods. One household employment record has ended. The remaining confirmed monthly salary is INR 148000. Any income that has ended should be removed from future estimates. Payroll ref EMP-0030.",
+      "expected": [ { "record_type": "income_ended", "amount": 148000, "currency": "INR", "percent": null, "date": null, "related_event_id": null, "status_hint": "ended", "direction": null, "scope": "household_partial", "is_duplicate_transfer": null, "category_hint": "salary", "note": "amount_is_remaining_confirmed_stream_not_the_ended_one" } ] },
+    { "message_id": "message_42", "language": "id", "record_type": "income_ended",
+      "text": "Rincian penggajian Anda di Cedar Health telah berubah. Salah satu sumber pendapatan kerja rumah tangga telah berakhir. Sisa gaji bulanan yang dikonfirmasi adalah IDR 25840000. Pendapatan yang sudah berakhir harus dikeluarkan dari perkiraan berikutnya. Ref payroll EMP-0042.",
+      "expected": [ { "record_type": "income_ended", "amount": 25840000, "currency": "IDR", "percent": null, "date": null, "related_event_id": null, "status_hint": "ended", "direction": null, "scope": "household_partial", "is_duplicate_transfer": null, "category_hint": "salary", "note": "amount_is_remaining_confirmed_stream_not_the_ended_one" } ] },
+
+    { "message_id": "message_48", "language": "en", "record_type": "pending_unconfirmed_credit",
+      "text": "Your payroll details at Northstar Labs have changed. Your quarterly bonus is still subject to the final performance review. The final amount and payment date have not been approved yet. We’ll send another update once payroll confirms the amount and date. Payroll ref EMP-0048.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "bonus_unconfirmed_do_not_count" } ] },
+    { "message_id": "message_03", "language": "id", "record_type": "pending_unconfirmed_credit",
+      "text": "Rincian penggajian Anda di Greenfield Foods telah berubah. Bonus kuartalan Anda masih menunggu hasil akhir penilaian kinerja. Jumlah akhir dan tanggal pembayaran belum disetujui. Kami akan mengirim pembaruan setelah tim payroll mengonfirmasi jumlah dan tanggalnya. Ref payroll EMP-0003.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "bonus_unconfirmed_do_not_count" } ] },
+
+    { "message_id": "message_08", "language": "id", "record_type": "salary_change+pending_unconfirmed_credit",
+      "text": "Berikut informasi penggajian terbaru dari Greenfield Foods. Gaji pokok yang dikonfirmasi adalah IDR 38760000. Komisi dari transaksi yang masih berjalan belum disetujui. Transaksi yang masih berjalan tidak masuk pembayaran sampai komisinya dinyatakan diperoleh. Ref payroll EMP-0008.",
+      "expected": [
+        { "record_type": "salary_change", "amount": 38760000, "currency": "IDR", "percent": null, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "base_salary_confirmed" },
+        { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "commission_open_deals_do_not_count" }
+      ] },
+
+    { "message_id": "message_07", "language": "en", "record_type": "pending_unconfirmed_credit",
+      "text": "Here’s the latest service update from QuickCrew. The next QuickCrew payout is still pending. The weekly earnings shown in the QuickCrew app can change until the payout is closed. The balance isn’t withdrawable until the payout shows as completed. Case ref SER-0007.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "gig_payout_pending_do_not_count" } ] },
+    { "message_id": "message_34", "language": "id", "record_type": "pending_unconfirmed_credit",
+      "text": "RideGrid ingin memberi tahu Anda tentang perubahan pada akun. Pembayaran berikutnya dari RideGrid masih tertunda. Penghasilan mingguan di aplikasi RideGrid masih dapat berubah sampai pembayaran diselesaikan. Saldo belum dapat ditarik sampai status pembayaran menunjukkan selesai. Ref kasus SER-0034.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "gig_payout_pending_do_not_count" } ] },
+
+    { "message_id": "message_14", "language": "en", "record_type": "pending_unconfirmed_credit",
+      "text": "CartLane has new information about your payment or refund. Your refund has been initiated but has not reached your account yet. We’ll send another update when the credit is completed. Order ref MER-0014.",
+      "related_event_id_csv": "event_1785",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "shopping", "note": "refund_initiated_not_settled_do_not_count" } ] },
+
+    { "message_id": "message_16", "language": "en", "record_type": "pending_unconfirmed_credit",
+      "text": "Here’s the latest account information from DrawPay. Your prize claim has been verified and is still in payment processing. The payment has not been credited to your account yet. We’ll confirm again if and when the money is actually credited. Account ref FIN-0016.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "processing", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "windfall", "note": "prize_processing_not_credited_do_not_count" } ] },
+    { "message_id": "message_134", "language": "id", "record_type": "pending_unconfirmed_credit",
+      "text": "Ada pembaruan baru untuk akun WinPoint Anda. Klaim hadiah Anda sudah diverifikasi dan masih dalam proses pembayaran. Pembayaran tersebut belum masuk ke rekening Anda. Kami akan mengonfirmasi kembali jika dana benar-benar masuk. Ref akun FIN-0134.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "processing", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "windfall", "note": "prize_processing_not_credited_do_not_count" } ] },
+
+    { "message_id": "message_17", "language": "en", "record_type": "event_amendment",
+      "text": "Here’s the latest account information from PrizeTrack. The prize proceeds have reached your account after withholding. The claim is now closed and there are no further scheduled payments. There won’t be another payment unless a separate prize is confirmed. Account ref FIN-0017.",
+      "related_event_id_csv": "event_2165",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "windfall", "note": "prize_settled_claim_closed_no_further_payments" } ],
+      "note": "event_2165 is already status=settled with amount 33550 INR in financial_events.csv. This message is pure corroboration — no new amount — whose real value is 'no further scheduled payments', so the forecaster must not project a recurring prize stream." },
+
+    { "message_id": "message_67", "language": "en", "record_type": "rejected_instruction",
+      "text": "A note from QuickPrize about your recent financial activity. Congratulations! You’ve been selected for a cash prize. Pay the release charge today to receive the funds immediately. Pay the processing charge now to avoid losing the claim. Account ref FIN-0067.",
+      "expected": [ { "record_type": "rejected_instruction", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": null, "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": null, "note": "advance_fee_prize_scam_no_verifiable_fact" } ],
+      "security_note": "Injection-guard canary. This message is an advance-fee scam pattern (pay a fee to unlock a prize) with an embedded call to action. It must never produce a pending_unconfirmed_credit, must never suggest the user pay anything, and must never influence a request decision — it has literally no field in the schema for an instruction to land in. The correct output is record_type=rejected_instruction with every other field null." },
+    { "message_id": "message_142", "language": "id", "record_type": "rejected_instruction",
+      "text": "Pemberitahuan baru tersedia untuk akun RewardNow Anda. Selamat! Anda terpilih untuk menerima hadiah uang tunai. Bayar biaya pencairan hari ini agar dana segera diterima. Bayar biaya pemrosesan sekarang agar klaim tidak hangus. Ref akun FIN-0142.",
+      "expected": [ { "record_type": "rejected_instruction", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": null, "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": null, "note": "advance_fee_prize_scam_no_verifiable_fact" } ],
+      "security_note": "Same injection-guard canary as message_67, Indonesian variant. Confirms the guard is language-independent." },
+
+    { "message_id": "message_24", "language": "en", "record_type": "pending_unconfirmed_credit",
+      "text": "Hi, InvoiceLane here. The client approved an invoice payment of INR 196000. Settlement is expected on 2024-12-15; the other submitted invoices are still awaiting approval. Only invoices marked as confirmed should be included in the upcoming payout. Case ref SER-0024.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": 196000, "currency": "INR", "percent": null, "date": "2024-12-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "windfall", "note": "invoice_approved_settles_2024_12_15_only_this_one_confirmed" } ],
+      "note": "Unlike the bonus/gig/prize variants above, this one DOES carry a stated amount and settlement date because the client explicitly approved it — it is confirmed-but-not-yet-settled, so it counts on its settlement date (2024-12-15), not before." },
+    { "message_id": "message_18", "language": "id", "record_type": "pending_unconfirmed_credit",
+      "text": "Halo, ini InvoiceFlow. Klien menyetujui pembayaran faktur sebesar IDR 30780000. Penyelesaian diperkirakan pada 2025-08-15; faktur lain yang diajukan masih menunggu persetujuan. Hanya faktur yang sudah dikonfirmasi yang dapat dimasukkan dalam pembayaran berikutnya. Ref kasus SER-0018.",
+      "expected": [ { "record_type": "pending_unconfirmed_credit", "amount": 30780000, "currency": "IDR", "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "windfall", "note": "invoice_approved_settles_2025_08_15_only_this_one_confirmed" } ] },
+
+    { "message_id": "message_13", "language": "en", "record_type": "event_amendment",
+      "text": "There’s an update from Summit Bank on your recent account activity. The matching debit and credit came from a transfer between your two accounts. Both accounts are registered under the same account holder. Both entries will remain visible in your transaction history. Txn ref BAN-0013.",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": null, "direction": null, "scope": null, "is_duplicate_transfer": true, "category_hint": null, "note": "own_account_transfer_exclude_one_leg_from_cash_flow" } ] },
+
+    { "message_id": "message_106", "language": "en", "record_type": "event_amendment",
+      "text": "Here’s the latest transaction update from Summit Bank. The extra card charge is still being investigated. A reversal has not been posted to the account yet. The dispute is open and no reversal has been posted yet. Txn ref BAN-0106.",
+      "related_event_id_csv": "event_12709",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "pending", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": null, "note": "disputed_charge_not_reversed_stays_reserved" } ],
+      "note": "event_12709 is already status=pending in financial_events.csv. This corroborates it: the disputed debit is NOT reversed, so it must stay reserved, not be dropped." },
+
+    { "message_id": "message_69", "language": "en", "record_type": "event_amendment",
+      "text": "Cedar Bank has new information about one of your transactions. The previous debit attempt failed. The bill is still outstanding and another debit will be attempted. The bill is still open and another debit may be attempted. Txn ref BAN-0069.",
+      "related_event_id_csv": "event_8575",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "failed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "utilities", "note": "prior_attempt_failed_retry_expected_bill_still_owed" } ],
+      "note": "event_8575 is already status=failed (dropped from cash flow per §2.1). This message confirms the failed status and warns a retry is expected — it does not itself create a new reserved amount; any actual retry would appear as its own event row." },
+
+    { "message_id": "message_12", "language": "en", "record_type": "recurring_expense_change",
+      "text": "StayLedger wanted to let you know about a change on your account. The renewed lease increases monthly rent by 12%. The new amount will be used for the next rent payment. Case ref SER-0012.",
+      "expected": [ { "record_type": "recurring_expense_change", "amount": null, "currency": null, "percent": 12, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "rent", "note": "rent_up_12pct_next_payment_apply_to_existing_stream_amount" } ] },
+    { "message_id": "message_175", "language": "id", "record_type": "recurring_expense_change",
+      "text": "HomePortal memiliki informasi baru tentang pembayaran berikutnya. Perpanjangan sewa menaikkan biaya sewa bulanan sebesar 12%. Jumlah baru berlaku mulai pembayaran sewa berikutnya. Jumlah baru akan digunakan untuk pembayaran sewa berikutnya. Ref kasus SER-0175.",
+      "expected": [ { "record_type": "recurring_expense_change", "amount": null, "currency": null, "percent": 12, "date": null, "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "rent", "note": "rent_up_12pct_next_payment_apply_to_existing_stream_amount" } ] },
+
+    { "message_id": "message_35", "language": "en", "record_type": "event_amendment",
+      "text": "Your property maintenance payment was received on 24 July 2026. The receipt has the final INR amount and the original due date. Payment ref SER-0035.",
+      "related_event_id_csv": "event_4535",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": "INR", "percent": null, "date": "2026-07-24", "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "housing", "note": "confirms_settlement_date_amount_is_on_the_receipt_image" } ],
+      "note": "Companion to image_08 (event_4535, blank amount). The message gives currency and date but never states the number — by design, so the amount can only come from the linked receipt image, never from message text alone." },
+    { "message_id": "message_64", "language": "en", "record_type": "event_amendment",
+      "text": "BuyBox confirmed that the tote bag order was paid in INR on 3 April 2026. The receipt has the final amount. Order ref MER-0064.",
+      "related_event_id_csv": "event_7941",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": "INR", "percent": null, "date": "2026-04-03", "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "shopping", "note": "confirms_settlement_date_amount_is_on_the_receipt_image" } ],
+      "note": "Companion to image_13 (event_7941), same pattern as message_35." },
+
+    { "message_id": "message_15", "language": "en", "record_type": "investment_unrealized_change",
+      "text": "Here’s the latest account information from ClearFund. Your portfolio’s displayed market value has increased substantially. No units have been sold and no cash proceeds have been generated. The displayed value will continue to move with market prices. Account ref FIN-0015.",
+      "related_event_id_csv": "event_1960",
+      "expected": [ { "record_type": "investment_unrealized_change", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": null, "direction": "up", "scope": null, "is_duplicate_transfer": null, "category_hint": "investment", "note": "unrealized_mark_to_market_never_counts_as_cash" } ] },
+    { "message_id": "message_163", "language": "id", "record_type": "investment_unrealized_change",
+      "text": "Berikut informasi akun terbaru dari Nova Securities. Nilai investasi yang ditampilkan telah turun. Investasi tersebut belum dijual dan tidak ada transaksi tunai. Nilai yang ditampilkan akan terus berubah mengikuti harga pasar. Ref akun FIN-0163.",
+      "related_event_id_csv": "event_19182",
+      "expected": [ { "record_type": "investment_unrealized_change", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": null, "direction": "down", "scope": null, "is_duplicate_transfer": null, "category_hint": "investment", "note": "unrealized_mark_to_market_never_counts_as_cash" } ] },
+
+    { "message_id": "message_108", "language": "en", "record_type": "event_amendment",
+      "text": "ClearFund has updated the latest account activity. The proceeds from your investment sale have settled in the cash account. The sale order is complete and there are no remaining proceeds pending. The transaction history shows the amount that actually reached the cash account. Account ref FIN-0108.",
+      "related_event_id_csv": "event_13032",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "investment", "note": "sale_proceeds_now_cash_use_ledger_amount_not_a_new_figure" } ],
+      "note": "event_13032 is already status=settled, amount 53350 INR in financial_events.csv. Pure corroboration, no new number — confirms it is real settled cash, distinct from the never-counted unrealized-change messages above." },
+
+    { "message_id": "message_117", "language": "en", "record_type": "event_amendment",
+      "text": "Your payroll details at Greenfield Foods have changed. The latest employer credit is the reimbursement for your earlier work expense. The claim is now closed and no additional reimbursement is scheduled. This payment is linked to an earlier work expense, not your regular salary. Payroll ref EMP-0117.",
+      "related_event_id_csv": "event_14026",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "work_expense", "note": "reimbursement_not_salary_exclude_from_salary_stream_detection" } ],
+      "note": "event_14026 is already settled (818.40 ZAR) in financial_events.csv, source_type=employer. Without this message, a naive recurrence detector could mistake an employer-sourced credit for part of the recurring salary stream; the message's real value is telling the detector this one is NOT recurring salary." },
+    { "message_id": "message_174", "language": "id", "record_type": "event_amendment",
+      "text": "Ada informasi baru dari BrightPath Media tentang gaji Anda. Dana terbaru dari perusahaan adalah penggantian atas biaya kerja Anda sebelumnya. Klaim sudah ditutup dan tidak ada penggantian tambahan yang dijadwalkan. Pembayaran ini terkait biaya kerja sebelumnya, bukan gaji rutin Anda. Ref payroll EMP-0174.",
+      "related_event_id_csv": "event_20615",
+      "expected": [ { "record_type": "event_amendment", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "work_expense", "note": "reimbursement_not_salary_exclude_from_salary_stream_detection" } ] },
+
+    { "message_id": "message_136", "language": "en", "record_type": "no_actionable_fact",
+      "text": "Hi, Summit Bank here. There are minimum payments due on two separate card accounts this month. A payment to one card will not cover the amount due on the other card. The minimums belong to separate accounts, so one payment won’t clear the other. Txn ref BAN-0136.",
+      "expected": [ { "record_type": "no_actionable_fact", "amount": null, "currency": null, "percent": null, "date": null, "related_event_id": null, "status_hint": null, "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": null, "note": "reminder_two_separate_card_minimums_already_in_ledger" } ] },
+
+    { "message_id": "message_86", "language": "en", "record_type": "event_amendment+salary_change",
+      "text": "MoneyHub account update: Your wallet was charged for the session at Charge Point 1110 in Krishnagiri on 3 September 2026 at 12:35 a.m. The receipt contains the final INR amount. Your employer has confirmed a USD 1296 salary credit for 15 September 2026. The salary will use the exchange rate when it settles. Account ref FIN-0086.",
+      "related_event_id_csv": "event_10521",
+      "expected": [
+        { "record_type": "event_amendment", "amount": null, "currency": "INR", "percent": null, "date": "2026-09-03", "related_event_id": null, "status_hint": "settled", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "transport", "note": "confirms_ev_charge_date_amount_is_on_the_receipt_image" },
+        { "record_type": "salary_change", "amount": 1296, "currency": "USD", "percent": null, "date": "2026-09-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "fx_settle_date_rate_applies_use_exchange_rates_csv" }
+      ],
+      "note": "Multi-fact test: one message yields two unrelated records, an EV-charge receipt confirmation (companion to image_16 / event_10521, amount withheld same pattern as message_35/64) AND an unrelated salary confirmation with FX. The extractor must not merge or drop either." }
+  ]
+}

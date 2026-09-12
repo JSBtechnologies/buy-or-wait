@@ -1,0 +1,178 @@
+//! Ship-time sign-off: everything that must hold for the submitted `output.csv` and
+//! `evaluation/usage_report.md`, in one pass/fail report.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use super::contract::{self, Severity};
+use super::data::Dataset;
+
+#[derive(Debug, Default)]
+pub struct Signoff {
+    pub checks: Vec<(String, bool, String)>,
+    pub contract: Option<contract::Report>,
+}
+
+impl Signoff {
+    fn check(&mut self, name: &str, ok: bool, detail: impl Into<String>) {
+        self.checks.push((name.to_string(), ok, detail.into()));
+    }
+
+    pub fn passed(&self) -> bool {
+        self.checks.iter().all(|(_, ok, _)| *ok)
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        if let Some(rep) = &self.contract {
+            for f in rep.findings.iter().filter(|f| f.severity == Severity::Error).take(40) {
+                out.push_str(&format!("{f}\n"));
+            }
+        }
+        for (name, ok, detail) in &self.checks {
+            out.push_str(&format!("[{}] {name}: {detail}\n", if *ok { "PASS" } else { "FAIL" }));
+        }
+        out.push_str(&format!("SIGN-OFF: {}\n", if self.passed() { "PASS" } else { "FAIL" }));
+        out
+    }
+}
+
+/// Phrases that should never reach an explanation: they only come from untrusted evidence.
+const INJECTION_MARKERS: [&str; 10] = [
+    "ignore previous",
+    "ignore all",
+    "instruction",
+    "system prompt",
+    "as an ai",
+    "http://",
+    "https://",
+    "approve this",
+    "release charge",
+    "processing charge",
+];
+
+fn looks_like_secret(text: &str) -> Option<&'static str> {
+    let bytes = text.as_bytes();
+    let token_after = |prefix: &str| {
+        text.match_indices(prefix).any(|(i, _)| {
+            bytes[i + prefix.len()..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b == b'-').count() >= 20
+        })
+    };
+    if token_after("hf_") {
+        Some("hf_ token")
+    } else if token_after("sk-") {
+        Some("sk- key")
+    } else if text.contains("Authorization: Bearer") || text.contains("HF_TOKEN=") {
+        Some("credential header/assignment")
+    } else {
+        None
+    }
+}
+
+pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>) -> Result<Signoff> {
+    let mut s = Signoff::default();
+    let ds = Dataset::load(dataset_dir, &dataset_dir.join("requests.csv"))?;
+    let (header, rows) = contract::read_output(output)?;
+    let rep = contract::validate_rows(&ds, &header, &rows);
+    s.check(
+        "contract",
+        rep.passed(),
+        format!("{} rows (expected {}), {} errors, {} warnings", rep.rows, ds.requests.len(), rep.errors().count(), rep.warnings().count()),
+    );
+
+    let mut by_status: BTreeMap<&str, usize> = BTreeMap::new();
+    for r in &rows {
+        *by_status.entry(r.affordability_status.as_str()).or_default() += 1;
+    }
+    let dominant = by_status.values().copied().max().unwrap_or(0);
+    s.check(
+        "status distribution",
+        rows.is_empty() || dominant * 10 < rows.len() * 9,
+        format!("{by_status:?} (fails if one status is >= 90% of rows)"),
+    );
+
+    let tainted: Vec<&str> = rows
+        .iter()
+        .filter(|r| {
+            let t = r.decision_explanation.to_lowercase();
+            INJECTION_MARKERS.iter().any(|m| t.contains(m))
+        })
+        .map(|r| r.request_id.as_str())
+        .collect();
+    s.check("explanations free of injected text", tainted.is_empty(), format!("{tainted:?}"));
+
+    let raw_output = std::fs::read_to_string(output)?;
+    s.check("output.csv has no secrets", looks_like_secret(&raw_output).is_none(), looks_like_secret(&raw_output).unwrap_or("none found"));
+
+    match std::fs::read_to_string(usage) {
+        Err(e) => s.check("usage report present", false, format!("{}: {e}", usage.display())),
+        Ok(text) => {
+            let lower = text.to_lowercase();
+            let required = [
+                ("provider", "provider"),
+                ("model", "model"),
+                ("calls", "call"),
+                ("input tokens", "input"),
+                ("output tokens", "output"),
+                ("tokens", "token"),
+                ("per request", "per request"),
+                ("cost", "cost"),
+            ];
+            let missing: Vec<&str> = required.iter().filter(|(_, k)| !lower.contains(k)).map(|(n, _)| *n).collect();
+            s.check("usage report present", !text.trim().is_empty() && !lower.contains("pending"), format!("{} bytes", text.len()));
+            s.check("usage report sections", missing.is_empty(), format!("missing: {missing:?}"));
+            s.check("usage report has no secrets", looks_like_secret(&text).is_none(), looks_like_secret(&text).unwrap_or("none found"));
+        }
+    }
+
+    if let Some(rerun) = rerun {
+        let a = std::fs::read(output)?;
+        let b = std::fs::read(rerun).with_context(|| format!("read {}", rerun.display()))?;
+        let first_diff = a.iter().zip(&b).position(|(x, y)| x != y);
+        s.check(
+            "warm rerun byte-identical",
+            a == b,
+            match (a == b, first_diff) {
+                (true, _) => format!("{} bytes identical", a.len()),
+                (false, Some(i)) => format!("first difference at byte {i}"),
+                (false, None) => format!("lengths differ: {} vs {}", a.len(), b.len()),
+            },
+        );
+    }
+    s.contract = Some(rep);
+    Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_patterns() {
+        assert!(looks_like_secret("token hf_abcdefghijklmnopqrstuvwxyz123").is_some());
+        assert!(looks_like_secret("the hf_router config").is_none());
+        assert!(looks_like_secret("sk-ABCDEFGHIJKLMNOPQRSTUVWX").is_some());
+        assert!(looks_like_secret("Pay IDR 5,491,000 in full").is_none());
+    }
+
+    #[test]
+    fn signoff_on_sample_shaped_files() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
+        let tmp = std::env::temp_dir().join(format!("verifier_signoff_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // The blank template fails the contract; a missing usage report fails too.
+        let s = run(&dir, &dir.join("output.csv"), &tmp.join("nope.md"), Some(&dir.join("output.csv"))).unwrap();
+        assert!(!s.passed());
+        let names: Vec<(&str, bool)> = s.checks.iter().map(|(n, ok, _)| (n.as_str(), *ok)).collect();
+        assert!(names.contains(&("contract", false)));
+        assert!(names.contains(&("usage report present", false)));
+        assert!(names.contains(&("warm rerun byte-identical", true)));
+        let usage = tmp.join("usage.md");
+        std::fs::write(&usage, "Provider: x. Model: y. 3 calls. Input tokens 1, output tokens 2. Per request avg. Cost $0.").unwrap();
+        let s = run(&dir, &dir.join("output.csv"), &usage, None).unwrap();
+        assert!(s.checks.iter().any(|(n, ok, _)| n == "usage report sections" && *ok));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}
