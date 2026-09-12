@@ -111,6 +111,39 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         .collect();
     s.check("no engine-error fallback rows", fallbacks.is_empty(), format!("{fallbacks:?}"));
 
+    let ex = super::explanation::check(&ds, &rows);
+    let ex_err: Vec<String> = ex.iter().filter(|f| f.severity == Severity::Error).map(|f| f.to_string()).collect();
+    let ex_warn = ex.len() - ex_err.len();
+    s.check(
+        "explanations grounded, worded for their method, not copied across rows",
+        ex_err.is_empty(),
+        if ex_err.is_empty() { format!("0 errors, {ex_warn} duplicate-template warnings") } else { ex_err.iter().take(10).cloned().collect::<Vec<_>>().join(" | ") },
+    );
+
+    // Engine-backed stage: re-run the batch path and check what the file alone cannot show.
+    match super::mirror::run(dataset_dir, &dataset_dir.join("requests.csv"), &rows) {
+        Err(e) => s.check("engine mirror", false, format!("could not run: {e}")),
+        Ok(m) => {
+            let errs: Vec<String> = m.findings.iter().filter(|f| f.severity == Severity::Error).map(|f| f.to_string()).collect();
+            let blank: Vec<&String> = errs.iter().filter(|e| e.contains("[BA")).collect();
+            let inv: Vec<&String> = errs.iter().filter(|e| !e.contains("[BA") && !e.contains("[EX1_number_not_in_facts]")).collect();
+            let exf: Vec<&String> = errs.iter().filter(|e| e.contains("[EX1_number_not_in_facts]")).collect();
+            s.check("engine errors", m.engine_errors.is_empty(), format!("{:?}", m.engine_errors));
+            s.check("invariants on every row (engine forecast replay)", inv.is_empty(), format!("{} rows; {}", m.rows, inv.iter().take(8).map(|x| x.as_str()).collect::<Vec<_>>().join(" | ")));
+            s.check(
+                "blank amounts: reconciled image figure or flagged missing, never zero",
+                blank.is_empty(),
+                format!(
+                    "{}; rows with missing_amounts: {:?}",
+                    if blank.is_empty() { "ok".to_string() } else { blank.iter().take(8).map(|x| x.as_str()).collect::<Vec<_>>().join(" | ") },
+                    m.missing_amount_rows
+                ),
+            );
+            s.check("explanation numbers match DecisionFacts", exf.is_empty(), exf.iter().take(8).map(|x| x.as_str()).collect::<Vec<_>>().join(" | "));
+            s.check("shipped rows equal the engine's rows", m.diverged.is_empty(), format!("{} diverged {:?}", m.diverged.len(), m.diverged.iter().take(10).collect::<Vec<_>>()));
+        }
+    }
+
     let raw_output = std::fs::read_to_string(output)?;
     s.check("output.csv has no secrets", looks_like_secret(&raw_output).is_none(), looks_like_secret(&raw_output).unwrap_or("none found"));
 
