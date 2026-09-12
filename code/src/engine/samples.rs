@@ -27,12 +27,12 @@ mod tests {
             if only.as_deref().is_some_and(|o| o != s.request_id) { continue; }
             let session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
             let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == s.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
-            let spec = RequestSpec { amount: crate::engine::money::Cents::from_f64(s.requested_amount), deadline: s.desired_completion_date, request_type: s.request_type.clone(), allows_partial_payment: s.allows_partial_payment };
+            let spec = RequestSpec { amount: crate::engine::money::Money::from_f64(s.requested_amount), deadline: s.desired_completion_date, request_type: s.request_type.clone(), allows_partial_payment: s.allows_partial_payment };
             let d = match session.decide(&s.request_id, s.request_date, &spec, &opts) { Ok(d) => d, Err(e) => { println!("{} ERROR {e}", s.request_id); continue; } };
             let r = &d.row;
             let exp_earliest = s.earliest_date_for_full_payment.map(|x| x.to_string()).unwrap_or_default();
             let checks = [
-                ("safe", r.amount_safe_to_pay == crate::engine::money::Cents::from_f64(s.amount_safe_to_pay).fmt_plain()),
+                ("safe", r.amount_safe_to_pay == crate::engine::money::Money::from_f64(s.amount_safe_to_pay).fmt_plain()),
                 ("status", r.affordability_status == s.affordability_status),
                 ("method", r.recommended_payment_method == s.recommended_payment_method),
                 ("plan", r.payment_plan == s.payment_plan),
@@ -50,6 +50,7 @@ mod tests {
             if only.is_some() {
                 for st in &d.streams.streams { println!("  stream {} {:?} amt {} last {}", st.id, st.cadence, st.projected_amount, st.last_date()); }
                 for f in &d.baseline.flows { println!("  flow {} {} {} {:?}", f.date, f.amount, f.category, f.source); }
+                for c in &d.facts.candidates { println!("  cand {} {:?}", c.label, c.outcome); }
                 println!("  expl: {}", r.decision_explanation);
             }
         }

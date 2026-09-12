@@ -10,7 +10,7 @@ use chrono::{Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use super::ledger::{Fact, Ledger, LedgerEntry};
-use super::money::Cents;
+use super::money::Money;
 use super::recurrence::{Cadence, Stream, StreamKind, Streams};
 use super::rules::Rules;
 use super::types::{Direction, Payment, RateProvider};
@@ -31,7 +31,7 @@ pub enum FlowSource {
 pub struct Flow {
     pub date: NaiveDate,
     /// Signed: credits positive, debits negative (home currency).
-    pub amount: Cents,
+    pub amount: Money,
     pub category: String,
     pub source: FlowSource,
 }
@@ -40,7 +40,7 @@ pub struct Flow {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SpendingChange {
     Stop { event_id: String },
-    ReduceTo { event_id: String, amount: Cents },
+    ReduceTo { event_id: String, amount: Money },
 }
 
 impl SpendingChange {
@@ -61,31 +61,34 @@ impl SpendingChange {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Forecast {
     pub start: NaiveDate,
-    pub opening_balance: Cents,
-    pub minimum_balance: Cents,
-    pub reserved_total: Cents,
+    pub opening_balance: Money,
+    pub minimum_balance: Money,
+    pub reserved_total: Money,
     pub flows: Vec<Flow>,
-    /// End-of-day balance per day, `horizon_days` long.
-    pub balance: Vec<Cents>,
-    /// `suffix_min[d] = min over t >= d of balance[t] - minimum_balance`.
-    pub suffix_min: Vec<Cents>,
+    /// Balance on day t after that day's debits, before its credits (RULES S2.3:
+    /// debits apply before credits within a day). `horizon_days` long.
+    pub low: Vec<Money>,
+    /// End-of-day balance per day.
+    pub balance: Vec<Money>,
+    /// `suffix_low[d] = min over t >= d of low[t]`.
+    pub suffix_low: Vec<Money>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SafetyReport {
     pub safe: bool,
     /// First day the plan takes the balance below the minimum.
-    pub first_breach: Option<(NaiveDate, Cents)>,
+    pub first_breach: Option<(NaiveDate, Money)>,
     /// Lowest balance with the plan applied, and its first date.
-    pub trough_balance: Cents,
+    pub trough_balance: Money,
     pub trough_date: NaiveDate,
 }
 
 pub struct ForecastInputs<'a> {
     pub ledger: &'a Ledger,
     pub streams: &'a Streams,
-    pub opening_balance: Cents,
-    pub minimum_balance: Cents,
+    pub opening_balance: Money,
+    pub minimum_balance: Money,
     pub start: NaiveDate,
     pub rates: &'a dyn RateProvider,
     pub rules: &'a Rules,
@@ -100,7 +103,7 @@ impl Forecast {
         let mut flows = Vec::new();
 
         // Reserved pending debits.
-        let mut reserved_total = Cents::ZERO;
+        let mut reserved_total = Money::ZERO;
         for e in inp.ledger.reserved() {
             let Some(a) = e.home_amount else { continue };
             let date = if rules.reserve_pending_on_request_date { start } else { e.cash_date.max(start) };
@@ -147,7 +150,7 @@ impl Forecast {
             for d in dates {
                 flows.push(Flow {
                     date: d,
-                    amount: Cents(stream.sign() * amount.0),
+                    amount: Money(stream.sign() * amount.0),
                     category: stream.category.clone(),
                     source: FlowSource::Stream { stream_id: stream.id.clone() },
                 });
@@ -161,33 +164,41 @@ impl Forecast {
 
     pub fn from_flows(
         start: NaiveDate,
-        opening_balance: Cents,
-        minimum_balance: Cents,
-        reserved_total: Cents,
+        opening_balance: Money,
+        minimum_balance: Money,
+        reserved_total: Money,
         flows: Vec<Flow>,
         horizon_days: i64,
     ) -> Forecast {
         let n = horizon_days as usize;
-        let mut delta = vec![Cents::ZERO; n];
+        let mut debits = vec![Money::ZERO; n];
+        let mut credits = vec![Money::ZERO; n];
         for f in &flows {
             let t = (f.date - start).num_days();
             if (0..horizon_days).contains(&t) {
-                delta[t as usize] += f.amount;
+                if f.amount < Money::ZERO {
+                    debits[t as usize] += f.amount;
+                } else {
+                    credits[t as usize] += f.amount;
+                }
             }
         }
+        let mut low = Vec::with_capacity(n);
         let mut balance = Vec::with_capacity(n);
         let mut running = opening_balance;
-        for d in delta {
-            running += d;
+        for t in 0..n {
+            running += debits[t];
+            low.push(running);
+            running += credits[t];
             balance.push(running);
         }
-        let mut suffix_min = vec![Cents::ZERO; n];
-        let mut m = Cents(i64::MAX);
+        let mut suffix_low = vec![Money::ZERO; n];
+        let mut m = Money(i64::MAX);
         for t in (0..n).rev() {
-            m = m.min(balance[t] - minimum_balance);
-            suffix_min[t] = m;
+            m = m.min(low[t]);
+            suffix_low[t] = m;
         }
-        Forecast { start, opening_balance, minimum_balance, reserved_total, flows, balance, suffix_min }
+        Forecast { start, opening_balance, minimum_balance, reserved_total, flows, low, balance, suffix_low }
     }
 
     pub fn horizon_end(&self) -> NaiveDate {
@@ -203,43 +214,38 @@ impl Forecast {
         self.start + Duration::days(t as i64)
     }
 
-    /// Unrounded closed-form safe amount for today, before capping at the request.
-    pub fn raw_safe_amount(&self) -> Cents {
-        self.suffix_min[0].max(Cents::ZERO)
+    /// Unrounded closed-form safe amount for today: `min_t low[t] - M`, floored at zero.
+    pub fn raw_safe_amount(&self) -> Money {
+        (self.suffix_low[0] - self.minimum_balance).max(Money::ZERO)
     }
 
-    pub fn safe_amount(&self, requested: Cents, rules: &Rules) -> Cents {
+    pub fn safe_amount(&self, requested: Money, rules: &Rules) -> Money {
         rules.round_safe_amount(self.raw_safe_amount()).min(requested)
     }
 
+    /// Headroom for a payment made on day d after that day's credits (RULES S2.3):
+    /// `min(balance[d], min_{t>d} low[t]) - M`.
+    pub fn headroom_from(&self, d: usize) -> Money {
+        let later = self.suffix_low.get(d + 1).copied().unwrap_or(Money(i64::MAX));
+        self.balance[d].min(later) - self.minimum_balance
+    }
+
     /// First date a single payment of `requested` keeps every later balance >= minimum.
-    pub fn earliest_full_date(&self, requested: Cents) -> Option<NaiveDate> {
-        self.suffix_min.iter().position(|&h| h >= requested).map(|t| self.date_of(t))
+    pub fn earliest_full_date(&self, requested: Money) -> Option<NaiveDate> {
+        (0..self.balance.len()).find(|&d| self.headroom_from(d) >= requested).map(|d| self.date_of(d))
     }
 
-    /// Lowest projected balance (no plan) and its first date.
-    pub fn trough(&self) -> (Cents, NaiveDate) {
-        self.trough_with(&[])
+    /// Lowest projected intraday balance (no plan) and its first date.
+    pub fn trough(&self) -> (Money, NaiveDate) {
+        self.check(&[], &Rules::default()).trough()
     }
 
-    fn trough_with(&self, cumulative: &[Cents]) -> (Cents, NaiveDate) {
-        let mut best = (Cents(i64::MAX), self.start);
-        for (t, b) in self.balance.iter().enumerate() {
-            let v = *b - cumulative.get(t).copied().unwrap_or(Cents::ZERO);
-            if v < best.0 {
-                best = (v, self.date_of(t));
-            }
-        }
-        best
-    }
-
-    /// Replay a payment schedule: subtract each payment from its date onward and require
-    /// every day of the horizon to stay >= minimum.
+    /// Replay a payment schedule. A payment on day d applies after d's credits, so it must
+    /// keep `balance[d]` and every later intraday low `low[t]` at or above the minimum.
     pub fn check(&self, payments: &[Payment], rules: &Rules) -> SafetyReport {
         let n = self.balance.len();
-        let mut cumulative = vec![Cents::ZERO; n];
-        let mut add = vec![Cents::ZERO; n];
-        let mut before_start = Cents::ZERO;
+        let mut add = vec![Money::ZERO; n];
+        let mut before_start = Money::ZERO;
         for p in payments {
             let t = (p.date - self.start).num_days();
             if t < 0 {
@@ -250,21 +256,35 @@ impl Forecast {
                 add[n - 1] += p.amount;
             }
         }
-        let mut run = before_start;
+        let m = self.minimum_balance;
+        let mut paid_before = before_start;
+        let mut first_breach = None;
+        let mut trough = (Money(i64::MAX), self.start);
         for t in 0..n {
-            run += add[t];
-            cumulative[t] = run;
+            let low = self.low[t] - paid_before;
+            let end = self.balance[t] - paid_before - add[t];
+            for v in [low, end] {
+                if v < trough.0 {
+                    trough = (v, self.date_of(t));
+                }
+                if v < m && first_breach.is_none() {
+                    first_breach = Some((self.date_of(t), v));
+                }
+            }
+            paid_before += add[t];
         }
-        let first_breach = (0..n)
-            .find(|&t| self.balance[t] - cumulative[t] < self.minimum_balance)
-            .map(|t| (self.date_of(t), self.balance[t] - cumulative[t]));
-        let (trough_balance, trough_date) = self.trough_with(&cumulative);
-        SafetyReport { safe: first_breach.is_none(), first_breach, trough_balance, trough_date }
+        SafetyReport { safe: first_breach.is_none(), first_breach, trough_balance: trough.0, trough_date: trough.1 }
+    }
+}
+
+impl SafetyReport {
+    pub fn trough(&self) -> (Money, NaiveDate) {
+        (self.trough_balance, self.trough_date)
     }
 }
 
 /// The per-occurrence amount of a stream after spending changes; `None` when stopped.
-fn changed_amount(stream: &Stream, changes: &[SpendingChange], rules: &Rules) -> Option<Cents> {
+fn changed_amount(stream: &Stream, changes: &[SpendingChange], rules: &Rules) -> Option<Money> {
     let hits: Vec<&SpendingChange> = changes
         .iter()
         .filter(|c| stream.occurrences.iter().any(|o| o.event_id == c.event_id()))
@@ -302,12 +322,12 @@ fn changed_amount(stream: &Stream, changes: &[SpendingChange], rules: &Rules) ->
 /// Forecast-level evidence: income changes, pay-date moves, new expenses, one-time flows.
 fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDate, end: NaiveDate) {
     let home = &inp.ledger.home_currency;
-    let convert = |amount: Cents, currency: &str, date: NaiveDate| {
+    let convert = |amount: Money, currency: &str, date: NaiveDate| {
         super::ledger::to_home(amount, currency, home, date, inp.rates)
     };
     let is_income_flow = |f: &Flow, category: &str| {
         f.category == category
-            && f.amount > Cents::ZERO
+            && f.amount > Money::ZERO
             && matches!(f.source, FlowSource::Stream { .. } | FlowSource::Scheduled { .. })
     };
     let mut adjustments: Vec<_> = inp.ledger.adjustments.iter().collect();
@@ -336,6 +356,29 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
             Fact::IncomeDateMoved { category, new_date } => {
                 if let Some(f) = flows.iter_mut().filter(|f| is_income_flow(f, category)).min_by_key(|f| f.date) {
                     f.date = *new_date;
+                }
+            }
+            Fact::ExpenseAmountChange { category, amount, percent, currency, effective } => {
+                let targets = flows.iter_mut().filter(|f| {
+                    f.category == *category
+                        && f.amount < Money::ZERO
+                        && f.date >= *effective
+                        && matches!(f.source, FlowSource::Stream { .. } | FlowSource::Scheduled { .. })
+                });
+                for f in targets {
+                    let new_mag = match (amount, percent) {
+                        (Some(a), _) => convert(*a, currency.as_deref().unwrap_or(home), f.date),
+                        (None, Some(p)) => {
+                            // (100 + p) / 100 as one exact decimal, one rounding.
+                            let pct = super::money::DecimalRate::from_f64(100.0 + *p);
+                            let factor = super::money::DecimalRate { mantissa: pct.mantissa, scale: pct.scale + 2 };
+                            Some((-f.amount).convert(&factor))
+                        }
+                        (None, None) => None,
+                    };
+                    if let Some(m) = new_mag {
+                        f.amount = -m;
+                    }
                 }
             }
             Fact::IncomeEnded { category, effective } => {
@@ -402,17 +445,17 @@ mod tests {
     fn closed_form_numbers() {
         let start = d("2024-09-04");
         let flows = vec![
-            Flow { date: d("2024-09-05"), amount: Cents::from_units(-500), category: "rent".into(), source: FlowSource::Stream { stream_id: "r".into() } },
-            Flow { date: d("2024-09-10"), amount: Cents::from_units(1000), category: "salary".into(), source: FlowSource::Stream { stream_id: "s".into() } },
+            Flow { date: d("2024-09-05"), amount: Money::from_units(-500), category: "rent".into(), source: FlowSource::Stream { stream_id: "r".into() } },
+            Flow { date: d("2024-09-10"), amount: Money::from_units(1000), category: "salary".into(), source: FlowSource::Stream { stream_id: "s".into() } },
         ];
-        let f = Forecast::from_flows(start, Cents::from_units(1000), Cents::from_units(200), Cents::ZERO, flows, 90);
+        let f = Forecast::from_flows(start, Money::from_units(1000), Money::from_units(200), Money::ZERO, flows, 90);
         let rules = Rules::default();
-        assert_eq!(f.safe_amount(Cents::from_units(900), &rules), Cents::from_units(300));
-        assert_eq!(f.earliest_full_date(Cents::from_units(900)), Some(d("2024-09-10")));
-        assert_eq!(f.trough(), (Cents::from_units(500), d("2024-09-05")));
-        let plan = [Payment { date: start, amount: Cents::from_units(300) }, Payment { date: d("2024-09-10"), amount: Cents::from_units(600) }];
+        assert_eq!(f.safe_amount(Money::from_units(900), &rules), Money::from_units(300));
+        assert_eq!(f.earliest_full_date(Money::from_units(900)), Some(d("2024-09-10")));
+        assert_eq!(f.trough(), (Money::from_units(500), d("2024-09-05")));
+        let plan = [Payment { date: start, amount: Money::from_units(300) }, Payment { date: d("2024-09-10"), amount: Money::from_units(600) }];
         assert!(f.check(&plan, &rules).safe);
-        let bad = [Payment { date: start, amount: Cents::from_units(301) }];
+        let bad = [Payment { date: start, amount: Money::from_units(301) }];
         assert_eq!(f.check(&bad, &rules).first_breach.map(|b| b.0), Some(d("2024-09-05")));
     }
 }
