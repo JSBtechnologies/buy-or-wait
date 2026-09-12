@@ -18,10 +18,13 @@ pub enum AmountEstimator {
     /// Mean of the last `n` occurrences.
     MeanOfLast(usize),
     /// Mean of every occurrence.
+    #[serde(alias = "mean_all")]
     MeanAll,
     /// Median of every occurrence (mean of the middle two when even).
+    #[serde(alias = "median_all")]
     MedianAll,
     /// (min + max) / 2 over every occurrence.
+    #[serde(alias = "mid_all")]
     MidAll,
 }
 
@@ -57,7 +60,9 @@ impl AmountEstimator {
 /// S0 `SAME_DAY_ORDER`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DayOrder {
+    #[serde(alias = "debits_first")]
     DebitsFirst,
+    #[serde(alias = "credits_first")]
     CreditsFirst,
 }
 
@@ -65,8 +70,10 @@ pub enum DayOrder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaymentTiming {
     /// After all of day d's rows (so after its credits).
+    #[serde(alias = "after_day_rows")]
     AfterDayRows,
     /// As a debit, before day d's credits.
+    #[serde(alias = "before_credits")]
     BeforeCredits,
 }
 
@@ -74,22 +81,28 @@ pub enum PaymentTiming {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InstallmentLimit {
     /// number_of_payments <= max_installment_months.
+    #[serde(alias = "n_payments")]
     NPayments,
     /// ceil(number_of_payments * frequency_days / 30) <= max_installment_months.
+    #[serde(alias = "ceil_months")]
     CeilMonths,
 }
 
 /// S0 `NOT_REC_TEMPLATE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NotRecommendedTemplate {
+    #[serde(alias = "B_iff_partial_only")]
     BIffPartialOnly,
+    #[serde(alias = "always_A")]
     AlwaysA,
 }
 
 /// S0 `AFFORDABLE_NOW_TEMPLATE`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AffordableNowTemplate {
+    #[serde(alias = "leaves_at_least")]
     LeavesAtLeast,
+    #[serde(alias = "keeps_minimum")]
     KeepsMinimum,
 }
 
@@ -117,9 +130,11 @@ impl Horizon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangePreference {
     /// Fewer stop/reduce actions first, then the smaller cut (RULES S1.3).
+    #[serde(alias = "fewest_changes")]
     FewestChanges,
     /// Smallest total cut to projected spending first, then fewer actions. Indistinguishable
     /// from `FewestChanges` on tuning rows 01–18.
+    #[serde(alias = "smallest_cut")]
     SmallestCut,
 }
 
@@ -130,13 +145,17 @@ pub enum ChangePreference {
 pub struct Rules {
     /// [HORIZON] S3.1 [FIT, strong]: through the end of month(rd) + 2. `fixed_90` (rd..=rd+90)
     /// is `Days(91)`; `fixed_86` is `Days(87)`.
+    #[serde(alias = "HORIZON")]
     pub horizon: Horizon,
     /// [VAR_HORIZON] Horizon for Interval (variable-spend) projections only; `None` = same as
     /// `horizon`, `Some(Days(91))` = rd_plus_90. The forecast itself still ends at `horizon`.
+    #[serde(alias = "VAR_HORIZON")]
     pub variable_horizon: Option<Horizon>,
     /// [SAME_DAY_ORDER] S2.3: debits before credits.
+    #[serde(alias = "SAME_DAY_ORDER")]
     pub same_day_order: DayOrder,
     /// [PAYMENT_TIMING] S3.5 (fixed 52b4184): plan payments apply after the day's rows.
+    #[serde(alias = "PAYMENT_TIMING")]
     pub payment_timing: PaymentTiming,
 
     // ---- ledger (S2) --------------------------------------------------------------------
@@ -152,8 +171,10 @@ pub struct Rules {
     /// Inclusive day-gap range that counts as monthly (S3.2: 28..=31).
     pub monthly_gap_days: (i64, i64),
     /// Monthly bills whose amounts vary (S3.3: mean of last 3).
+    #[serde(alias = "BILL_ESTIMATOR")]
     pub bill_estimator: AmountEstimator,
     /// Interval (variable spending) streams (S3.3: mean of all).
+    #[serde(alias = "VAR_ESTIMATOR")]
     pub variable_estimator: AmountEstimator,
     /// Income streams (S3.4: last settled amount).
     pub income_estimator: AmountEstimator,
@@ -163,6 +184,7 @@ pub struct Rules {
     pub income_end_keywords: Vec<String>,
     /// Settled rows whose amount came from an image are left out of stream detection (S5:
     /// image_03 bulk grocery purchase excluded from the groceries estimator).
+    #[serde(alias = "EXCLUDE_IMAGE_BULK_ONEOFF")]
     pub exclude_evidence_amounts_from_streams: bool,
     /// A "next salary is X" fact sets every later projected occurrence, not only the next
     /// one (S3.4 table: user_06 1,037.52 and user_08 1,422.85 monthly). [FIT]
@@ -172,14 +194,18 @@ pub struct Rules {
     /// [SCHEDULED_REPLACES_CYCLE] S3.4(c): a scheduled row replaces a monthly stream's
     /// projected occurrence of the same category/direction within the window, and a scheduled
     /// salary re-anchors the stream's day of month.
+    #[serde(alias = "SCHEDULED_REPLACES_CYCLE")]
     pub scheduled_replaces_cycle: bool,
     pub scheduled_replacement_window_days: i64,
     /// [SEEDED_SALARY_STREAM] S3.4(b): a scheduled salary seeds/continues a monthly stream.
+    #[serde(alias = "SEEDED_SALARY_STREAM")]
     pub seeded_salary_stream: bool,
     /// [FINAL_PAYROLL_STOPS_INCOME] S3.4(a).
+    #[serde(alias = "FINAL_PAYROLL_STOPS_INCOME")]
     pub final_payroll_stops_income: bool,
     /// Interval-stream occurrences earlier than rd + this many days are skipped (S3.2: 2,
     /// i.e. rd and rd+1).
+    #[serde(alias = "IV_SKIP_DAYS")]
     pub variable_skip_days: i64,
 
     // ---- plans (S1) ---------------------------------------------------------------------
@@ -190,12 +216,16 @@ pub struct Rules {
     /// Maximum spending-change actions in one plan (problem statement: up to three).
     pub max_spending_changes: usize,
     /// [CHANGE_PREFERENCE] How change plans are ordered after "no changes". S1.3: fewest.
+    #[serde(alias = "CHANGE_PREFERENCE")]
     pub change_preference: ChangePreference,
     /// [INSTALLMENT_LIMIT] S1.1 [FIT].
+    #[serde(alias = "INSTALLMENT_LIMIT")]
     pub installment_limit: InstallmentLimit,
     /// [NOT_REC_TEMPLATE] S1.6.
+    #[serde(alias = "NOT_REC_TEMPLATE")]
     pub not_recommended_template: NotRecommendedTemplate,
     /// [AFFORDABLE_NOW_TEMPLATE] S1.6.
+    #[serde(alias = "AFFORDABLE_NOW_TEMPLATE")]
     pub affordable_now_template: AffordableNowTemplate,
 }
 
@@ -285,6 +315,24 @@ fn contains_any(text: &str, keywords: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_patch_accepts_rules_s0_names() {
+        let patch = r#"{"HORIZON":{"Days":91},"VAR_HORIZON":{"Days":91},"IV_SKIP_DAYS":0,
+            "VAR_ESTIMATOR":{"MaxOfLast":4},"BILL_ESTIMATOR":"mid_all","SAME_DAY_ORDER":"credits_first",
+            "PAYMENT_TIMING":"before_credits","SEEDED_SALARY_STREAM":false,"INSTALLMENT_LIMIT":"ceil_months",
+            "CHANGE_PREFERENCE":"smallest_cut","NOT_REC_TEMPLATE":"always_A","AFFORDABLE_NOW_TEMPLATE":"keeps_minimum"}"#;
+        let r: Rules = serde_json::from_str(patch).unwrap();
+        assert_eq!(r.horizon, Horizon::Days(91));
+        assert_eq!(r.variable_skip_days, 0);
+        assert_eq!(r.bill_estimator, AmountEstimator::MidAll);
+        assert_eq!(r.change_preference, ChangePreference::SmallestCut);
+        assert!(!r.seeded_salary_stream);
+        // Unpatched fields keep their defaults.
+        assert_eq!(r.scheduled_replacement_window_days, 15);
+        let empty: Rules = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, Rules::default());
+    }
 
     #[test]
     fn horizon_end_of_month_plus_two() {

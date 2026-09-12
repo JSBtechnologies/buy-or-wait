@@ -11,6 +11,14 @@ mod tests {
     use crate::engine::{session::Session, types::*, Rules};
     use crate::model;
 
+    /// Evidence handoff (board decision.evidence_handoff): `$EVIDENCE_DIR/<user_id>.json`
+    /// (default `store/evidence`, relative to `code/`). `None` when the file is absent.
+    fn load_evidence(user_id: &str) -> Option<Vec<crate::engine::ledger::EvidenceRecord>> {
+        let dir = std::env::var("EVIDENCE_DIR").unwrap_or_else(|_| "store/evidence".into());
+        let text = std::fs::read_to_string(Path::new(&dir).join(format!("{user_id}.json"))).ok()?;
+        Some(serde_json::from_str(&text).unwrap_or_else(|e| panic!("{dir}/{user_id}.json: {e}")))
+    }
+
     #[test]
     #[ignore]
     fn sample_report() {
@@ -28,7 +36,10 @@ mod tests {
             if only.as_deref().is_some_and(|o| o != s.request_id) { continue; }
             let mut session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
             let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == s.user_id && m.sent_at.date_naive() <= s.request_date).collect();
-            let ev = crate::extract::messages::deterministic_evidence(&msgs, &session.profile().home_currency.clone());
+            let ev = match load_evidence(&s.user_id) {
+                Some(ev) => ev,
+                None => crate::extract::messages::deterministic_evidence(&msgs, &session.profile().home_currency.clone()),
+            };
             if only.is_some() { for e in &ev { println!("  evidence {} {:?}", e.record_id, e.fact); } }
             session.apply_evidence(ev);
             let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == s.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
