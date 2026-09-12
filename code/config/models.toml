@@ -258,3 +258,33 @@ context_length = 1048576
 pricing_usd_per_m_tokens = { input = 1.20, output = 4.00 }
 supports_structured_output = true
 notes = "Text-only frontier alternative, different lineage from DeepSeek (diversifies the fallback away from a single vendor's outage risk). novita/together/baseten also live, structured-output present on novita/baseten/deepinfra."
+
+# ---------------------------------------------------------------------------
+# USER DECISION (board decision.vlm_setup, 2026-09-12): VLM picked, LLM still
+# undecided (msg_86 only in production — see docs/bakeoff.md "LLM candidates").
+#
+# NOT MERGE-ANNOUNCED YET: committed on ml-engineer's branch only. Setting
+# `[selected]` activates live model calls (extract/model_config.rs resolves
+# these into real HfClient calls the moment this file is merged/read by the
+# pipeline) — hold the bus "done" announcement until extraction's
+# `vlm_mode = "agreement"` handling lands. Today's extract/model_config.rs
+# only implements primary -> escalation-on-reconciliation-failure ->
+# fallback-on-error; it has no cross-model agreement/voting code path yet
+# and does not even parse a `vlm_mode` key (present here as a forward
+# declaration, currently inert/ignored by extraction's Selected struct).
+#
+# KNOWN SCHEMA GAP: vlm_primary and vlm_escalation were bake-off-screened at
+# DIFFERENT resolutions (1024px and 768px respectively — see docs/bakeoff.md),
+# but extract/model_config.rs's `Selected` only has one global
+# `image_max_dim_px`, not a per-role value. Set below to vlm_primary's
+# resolution (1024px); vlm_escalation would run at 1024px too until
+# extraction adds a per-role field, not its own screened 768px. Flagging
+# for extraction, not deciding this myself.
+# ---------------------------------------------------------------------------
+
+[selected]
+vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
+vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px (see schema-gap note above)
+vlm_fallback = "moonshotai/Kimi-K3"                  # from [[fallback.candidates]]
+vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
+image_max_dim_px = 1024
