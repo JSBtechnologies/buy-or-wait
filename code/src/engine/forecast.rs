@@ -403,7 +403,8 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                 let targets = flows.iter_mut().filter(|f| {
                     f.category == *category
                         && f.amount < Money::ZERO
-                        && f.date >= *effective
+                        // None: from the next occurrence after the message (lead, blocker #32).
+                        && f.date >= effective.unwrap_or(rec.observed_at.date())
                         && matches!(f.source, FlowSource::Stream { .. } | FlowSource::Scheduled { .. })
                 });
                 for f in targets {

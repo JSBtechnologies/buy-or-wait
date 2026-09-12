@@ -82,9 +82,8 @@ pub enum Fact {
         amount: Option<Money>,
         percent: Option<f64>,
         currency: Option<String>,
-        /// First date the change applies; with no stated date, extraction passes the message's
-        /// sent date, i.e. from the stream's next occurrence.
-        effective: NaiveDate,
+        /// `None`: from the stream's next occurrence after the evidence was sent.
+        effective: Option<NaiveDate>,
     },
     /// A confirmed one-time cash flow (e.g. arrears payment, one-off bill).
     OneTimeFlow { direction: Direction, category: String, amount: Money, currency: String, date: NaiveDate },
