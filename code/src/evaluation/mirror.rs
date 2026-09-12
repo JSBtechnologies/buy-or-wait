@@ -30,6 +30,8 @@ pub struct Inputs {
     pub options: Vec<model::RequestPaymentOption>,
     pub messages: Vec<model::Message>,
     pub images: Vec<model::Image>,
+    /// `<dataset>/../code`: where the shipped run persisted `store/processed/evidence`.
+    pub code_dir: std::path::PathBuf,
 }
 
 impl Inputs {
@@ -42,6 +44,7 @@ impl Inputs {
             options: model::load_request_payment_options(d.join("request_payment_options.csv"))?,
             messages: model::load_messages(d.join("messages.csv"))?,
             images: model::load_images(d.join("images.csv"))?,
+            code_dir: d.parent().map(|p| p.join("code")).unwrap_or_else(|| Path::new(".").to_path_buf()),
         })
     }
 }
@@ -57,7 +60,7 @@ pub fn evidence_for(inp: &Inputs, user: &str, request_date: NaiveDate) -> Vec<Ev
 /// includes model-path records the verifier cannot regenerate); otherwise the live parse.
 /// evidence_consistency checks the snapshot against the live parse and grounds its model records.
 pub fn applied_or_live(inp: &Inputs, r: &model::Request) -> Vec<EvidenceRecord> {
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("store/processed/evidence").join(format!("{}.json", r.request_id));
+    let p = inp.code_dir.join("store/processed/evidence").join(format!("{}.json", r.request_id));
     if let Ok(text) = std::fs::read_to_string(&p) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Ok(recs) = serde_json::from_value::<Vec<EvidenceRecord>>(v.get("value").cloned().unwrap_or(v)) {
