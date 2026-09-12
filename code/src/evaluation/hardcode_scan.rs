@@ -71,10 +71,63 @@ pub fn forbidden_figures(dataset_dir: &Path, gold: Option<&Path>) -> Result<BTre
         }
         walk(&v, &mut set);
     }
-    // Figures the verifier read from images for VLM validation (bus extract#130): gold only.
-    set.extend([7_967_926, 365_000]);
     set.retain(|c| *c >= 1000_00);
     Ok(set)
+}
+
+/// Hand-read image figures (RULES.md S5 table, analyst 9b123f6; verifier readings on bus
+/// extract#130). Audit gold only: they must never appear in the prediction path. Pinned here and
+/// unioned with whatever the current RULES.md table says, so edits to the table are covered.
+pub const IMAGE_GOLD_CENTS: [Cents; 17] = [
+    4_365_000_00, // image_01 net pay
+    100_000_00,   // image_02 balance due
+    41_272_00,    // image_03 cash paid
+    2_854_00,     // image_04 item bill
+    822_05,       // image_05 amount due after due date
+    1_995_00,     // image_06 invoice total
+    8_528_00,     // image_07 grand total
+    8_528_10,     // image_07 alt total
+    15_339_00,    // image_08 total received
+    723_00,       // image_09 total received
+    79_679_26,    // image_10 balance due
+    3_650_00,     // image_11 amount payable
+    33_50,        // image_12 total (USD)
+    2_298_00,     // image_13 total paid
+    4_543_00,     // image_14 total
+    9_968_00,     // image_15 grand total
+    393_22,       // image_16 total
+];
+
+/// Bold `**figure**` of each `| NN | event_… |` row in RULES.md's image table.
+pub fn image_gold_from_rules(rules_md: &str) -> Vec<Cents> {
+    let mut out = Vec::new();
+    for line in rules_md.lines() {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        let is_image_row = cells.len() > 3
+            && cells[1].len() == 2
+            && cells[1].bytes().all(|b| b.is_ascii_digit())
+            && cells[2].starts_with("event_");
+        if !is_image_row {
+            continue;
+        }
+        let Some(start) = cells[3].find("**") else { continue };
+        let rest = &cells[3][start + 2..];
+        let Some(end) = rest.find("**") else { continue };
+        let figure: String = rest[..end].chars().take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.').filter(|c| *c != ',').collect();
+        if let Ok(c) = parse_cents(&figure) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Image gold set: pinned figures plus the current RULES.md table (no size threshold).
+pub fn image_gold(repo_root: Option<&Path>) -> BTreeSet<Cents> {
+    let mut set: BTreeSet<Cents> = IMAGE_GOLD_CENTS.into_iter().collect();
+    if let Some(text) = repo_root.and_then(|r| std::fs::read_to_string(r.join("RULES.md")).ok()) {
+        set.extend(image_gold_from_rules(&text));
+    }
+    set
 }
 
 /// Numeric literals in code as cents under each plausible scale (units, cents, 1e4 Money).
@@ -113,6 +166,7 @@ fn literal_values(code: &str) -> Vec<(usize, Vec<Cents>, String)> {
 
 pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<Vec<Finding>> {
     let figures = forbidden_figures(dataset_dir, gold)?;
+    let images = image_gold(code_dir.parent());
     let mut files = Vec::new();
     for sub in ["src/engine", "src/extract"] {
         rust_files(&code_dir.join(sub), &mut files);
@@ -152,6 +206,8 @@ pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<
         for (line, vals, tok) in literal_values(&comment_free) {
             if let Some(hit) = vals.iter().find(|v| figures.contains(v)) {
                 push(line, "H2_label_or_gold_figure", format!("literal {tok} equals label/gold figure {}", super::data::fmt_cents_2dp(*hit)));
+            } else if let Some(hit) = vals.iter().find(|v| images.contains(v)) {
+                push(line, "H4_image_gold_figure", format!("literal {tok} equals hand-read image figure {} (audit gold only)", super::data::fmt_cents_2dp(*hit)));
             }
         }
     }
@@ -161,6 +217,24 @@ pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_rules_image_table() {
+        let md = "| image | event | expected |
+|---|---|---|
+| 01 | event_253 salary | **4,365,000** net pay | x |
+| 05 | event_1786 utilities | **822.05** amount due | y |
+| 12 | event_7307 transport | **33.50 USD** total | z |
+";
+        assert_eq!(image_gold_from_rules(md), vec![4_365_000_00, 822_05, 33_50]);
+        // The analyst's table on its branch must parse to the pinned 16 expected figures.
+        let out = std::process::Command::new("git").args(["show", "9b123f6:RULES.md"]).current_dir(env!("CARGO_MANIFEST_DIR")).output();
+        if let Some(o) = out.ok().filter(|o| o.status.success()) {
+            let parsed: BTreeSet<Cents> = image_gold_from_rules(&String::from_utf8_lossy(&o.stdout)).into_iter().collect();
+            assert_eq!(parsed.len(), 16, "{parsed:?}");
+            assert!(parsed.iter().all(|c| IMAGE_GOLD_CENTS.contains(c)), "{parsed:?}");
+        }
+    }
 
     #[test]
     fn detects_ids_figures_and_label_files_but_not_tests_or_comments() {
@@ -184,8 +258,25 @@ mod tests {
         assert!(codes.contains(&("src/engine/plans.rs:2", "H1_record_id_literal")), "{f:?}");
         assert!(codes.contains(&("src/engine/plans.rs:2", "H2_label_or_gold_figure")), "{f:?}");
         assert!(codes.contains(&("src/engine/plans.rs:4", "H3_label_file_reference")), "{f:?}");
-        // comment (line 1), a small constant (5), cfg(test) code (6) and test files are ignored
-        assert_eq!(f.len(), 3, "{f:?}");
+        // line 3 is image_01's net pay in cents (4,365,000): image gold. Comment (1), small constant
+        // (5), cfg(test) code (6) and test files are ignored.
+        assert!(codes.contains(&("src/engine/plans.rs:3", "H4_image_gold_figure")), "{f:?}");
+        assert_eq!(f.len(), 4, "{f:?}");
+
+        // Image gold, including figures under 1000, in units, cents and Money(1e4) forms.
+        std::fs::write(
+            eng.join("plans.rs"),
+            "const BILL: f64 = 3650.0;
+const DUE: f64 = 822.05;
+const FARE_CENTS: i64 = 3350;
+const INVOICE_MONEY: i64 = 796_792_600;
+const OK: f64 = 1.5;
+",
+        )
+        .unwrap();
+        let f = scan(&root, &dir, None).unwrap();
+        let lines: Vec<&str> = f.iter().filter(|x| x.code == "H4_image_gold_figure").map(|x| x.request_id.as_str()).collect();
+        assert_eq!(lines, vec!["src/engine/plans.rs:1", "src/engine/plans.rs:2", "src/engine/plans.rs:3", "src/engine/plans.rs:4"], "{f:?}");
         assert!(!codes.iter().any(|(l, _)| l.contains("scenario_tests") || l.ends_with(":1") || l.ends_with(":5") || l.ends_with(":6")));
         std::fs::remove_dir_all(&root).ok();
     }
