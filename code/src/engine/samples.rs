@@ -8,7 +8,8 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::engine::{session::Session, types::*, Rules};
+    use super::patched_rules;
+    use crate::engine::{session::Session, types::*};
     use crate::model;
 
     /// Evidence handoff (board decision.evidence_handoff): `$EVIDENCE_DIR/<user_id>.json`
@@ -31,10 +32,11 @@ mod tests {
         let messages = model::load_messages(ds.join("messages.csv")).unwrap();
         let only: Option<String> = std::env::var("ONLY").ok();
         let mut hits: HashMap<&str, usize> = HashMap::new();
+        let (mut uncapped, mut within1, mut abs_err) = (0usize, 0usize, 0f64);
         let n = samples.len().min(18);
         for s in samples.iter().take(18) {
             if only.as_deref().is_some_and(|o| o != s.request_id) { continue; }
-            let mut session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
+            let mut session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), patched_rules()).unwrap();
             let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == s.user_id && m.sent_at.date_naive() <= s.request_date).collect();
             let ev = match load_evidence(&s.user_id) {
                 Some(ev) => ev,
@@ -56,6 +58,12 @@ mod tests {
                 ("changes", r.spending_changes_needed == s.spending_changes_needed),
             ];
             for (k, ok) in checks { if ok { *hits.entry(k).or_default() += 1; } }
+            let label = crate::engine::money::Money::from_f64(s.amount_safe_to_pay);
+            if label != spec.amount && label.0 > 0 {
+                let outflow = d.facts.starting_balance - d.facts.minimum_balance - label;
+                let err = (d.facts.raw_safe_amount - label).0.abs() as f64 / outflow.0.max(1) as f64;
+                uncapped += 1; abs_err += err; if err <= 0.01 { within1 += 1; }
+            }
             let bad: Vec<&str> = checks.iter().filter(|c| !c.1).map(|c| c.0).collect();
             println!("{} {} | safe {} vs {} | {} {} vs {} {} | earliest {} vs {} | plan {} vs {} | chg {} vs {} | trough {} @{}",
                 s.request_id, if bad.is_empty() { "OK".to_string() } else { format!("MISS{bad:?}") },
@@ -71,6 +79,7 @@ mod tests {
             }
         }
         println!("scores over {n}: {hits:?}");
+        println!("uncapped {uncapped}: outflow err within 1% {within1}, mean abs outflow err {:.2}%", abs_err / uncapped.max(1) as f64 * 100.0);
     }
 
     /// Runs every evaluation request (no evidence) and reports errors and distributions.
@@ -88,7 +97,7 @@ mod tests {
         let mut issues = 0;
         let started = std::time::Instant::now();
         for r in &requests {
-            let session = Session::from_model(&r.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
+            let session = Session::from_model(&r.user_id, &profiles, &events, rates.clone(), patched_rules()).unwrap();
             let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == r.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
             match session.decide(&r.request_id, r.request_date, &RequestSpec::from_model(r), &opts) {
                 Ok(d) => {
@@ -108,4 +117,61 @@ mod tests {
         println!("{} requests in {:?}; rows with ledger issues: {issues}", requests.len(), started.elapsed());
         for (k, v) in dist { println!("  {k}: {v}"); }
     }
+}
+
+#[cfg(test)]
+mod residuals {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::engine::money::Money;
+    use super::patched_rules;
+    use crate::engine::{session::Session, types::*};
+    use crate::model;
+
+    /// Safe-amount residual analysis on tuning rows: label - engine, the flows before the
+    /// binding trough, and which single flow (if any) the residual matches.
+    /// `cargo test --lib engine::samples::residuals -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn safe_residuals() {
+        let ds = Path::new("../dataset");
+        let profiles = model::load_financial_profiles(ds.join("financial_profiles.csv")).unwrap();
+        let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
+        let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
+        let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
+        let messages = model::load_messages(ds.join("messages.csv")).unwrap();
+        for s in model::load_sample_requests(ds.join("sample_requests.csv")).unwrap().iter().take(18) {
+            let label = Money::from_f64(s.amount_safe_to_pay);
+            let req = Money::from_f64(s.requested_amount);
+            if label == req || label == Money::ZERO { continue; }
+            let mut session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), patched_rules()).unwrap();
+            let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == s.user_id && m.sent_at.date_naive() <= s.request_date).collect();
+            let home = session.profile().home_currency.clone();
+            session.apply_evidence(crate::extract::messages::deterministic_evidence(&msgs, &home));
+            let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == s.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
+            let spec = RequestSpec { amount: req, deadline: s.desired_completion_date, request_type: s.request_type.clone(), allows_partial_payment: s.allows_partial_payment };
+            let d = session.decide(&s.request_id, s.request_date, &spec, &opts).unwrap();
+            let f = &d.baseline;
+            let ours = f.raw_safe_amount();
+            let diff = label - ours;
+            let outflow_label = f.opening_balance - f.minimum_balance - label;
+            let (trough, tdate) = f.trough();
+            let pct = diff.0 as f64 / outflow_label.0.max(1) as f64 * 100.0;
+            println!("{} {} label {} ours {} diff {} ({:+.2}% of outflow {}) trough {} horizon_end {}",
+                s.request_id, home, label, ours.fmt_plan(), diff.fmt_plan(), pct, outflow_label, tdate, f.horizon_end());
+            let _ = trough;
+            let before: Vec<_> = f.flows.iter().filter(|x| x.date <= tdate).collect();
+            for x in &before {
+                let tag = if (x.amount.abs() - diff.abs()).0.abs() <= Money::from_f64(0.01).0.max((diff.abs().0) / 50) { "  <== ~diff" } else { "" };
+                println!("    {} {:>14} {:<16} {:?}{}", x.date, x.amount.fmt_plan(), x.category, x.source, tag);
+            }
+        }
+    }
+}
+
+/// Harness-only: `RULES_PATCH='{json}'` applied over `Rules::default()` (serde default).
+#[cfg(test)]
+fn patched_rules() -> crate::engine::Rules {
+    serde_json::from_str(&std::env::var("RULES_PATCH").unwrap_or_else(|_| "{}".into())).expect("RULES_PATCH json")
 }
