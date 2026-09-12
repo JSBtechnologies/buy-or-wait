@@ -57,13 +57,23 @@ Linked-chain rule: walk `linked_event_id` to the root; the chain is one transact
 horizon_end = last calendar day of month(rd) + 2        # e.g. rd 2025-02-07 → 2025-04-30
 days = rd ..= horizon_end
 ```
-Not `rd+90`. Evidence (tightest bounds from tuning labels, each bound = the first projected rent that must be excluded):
-- request_08 E=2025-04-15 requires the 2025-05-01 rent to be outside → end ≤ rd+82 = 2025-04-30 = eom+2.
-- request_12 safe capped at 65,164 requires the 2026-07-01 rent outside → end ≤ rd+86 = 2026-06-30 = eom+2.
-- request_05 outflow requires the 2026-02-02 rent outside → end ≤ 2026-02-01; eom+2 = 2026-01-31.
-- request_13 E=2024-05-15 requires the 2024-06-02 rent outside; request_03 E=2019-11-15 requires end ≥ rd+74.
-- Fixed H=90: E exact 13/18. eom+2: E exact 15/18 and safe within 1% on 9/18 (vs 11/18 within 5% at H=90 but only 2 exact-cap).
+Not `rd+90`. Evidence: in each flipping sample, the first bill of the third following month (a rent on day 1–4) has to fall outside the horizon. See the evidence table below.
 - The explanation text still says "90 days" (template constant).
+
+**Evidence table (lead request), current S3 estimators, rd+90 vs eom+2:**
+
+| req | rd+90 | eom+2 | what flips |
+|---|---|---|---|
+| 05 | safe 0 (−100%) | +44.8% (label 737) | 2026-02-02 rent (rd+88) inside rd+90 wipes the headroom |
+| 08 | E None ✗ | E 2025-04-15 ✓ | 2025-05-01 rent (rd+83) |
+| 10 | safe 0 (−100%) | +176% (label 12,700) | 2025-03-03 rent (rd+87) |
+| 12 | safe −8.2%, E None ✗ | safe = cap 65,164 ✓, E 2026-04-05 ✓ | 2026-07-01 rent (rd+87) |
+| 13 | E None ✗ | E 2024-05-15 ✓ | 2024-06-02 rent (rd+87) |
+| others | same | same | — |
+
+Totals: rd+90 E 12/18, safe <1% 8/18; eom+2 E 15/18, safe <1% 9/18.
+- **eom+2 is always < 90 days on the tuning set** (80–89 days; 91 only for request_17, rd 2026-03-01, where nothing flips). Over all 275 requests eom+2 spans 62–91 days (only 2 reach ≥ 90).
+- **Caveat:** a fixed `rd+84` or `rd+86` gives identical results to eom+2 on 01–18 (all tuning rd fall on day 1–12; the first bill of month rd+3 is what gets cut). Eval rd days: 3–8 for 244/250; only 3 late-month requests (rd day 20, 25, 30) would change a lot (eom+2 ≈ 62–71 days vs 84–86). Held-out 19–25 are all rd day 3–7, so they cannot decide it either. Engine: keep the horizon rule in one function; eom+2 stays the default.
 
 ### S3.2 Stream detection [FIT]
 
@@ -106,7 +116,21 @@ project it at its LAST settled amount on its day-of-month, unless:
   - the description marks an end ("Final employer payroll")      # user_05 → no income
   - the stream missed its expected occurrence before rd            # user_12 (last 2026-01-15, rd 2026-04-05), user_13 "Second household income" (no 2024-02-20) → stop
 never project: bonus, commission, arrears, prize, reimbursement, gig/platform payouts with irregular gaps (user_09, user_10)
+           → a salary-category description containing commission|bonus|arrears|incentive|payout|earnings|reimburse is never a stream, even if it recurs monthly (verify.doublecount request_192; user_11 commissions on the 24th)
 ```
+
+**Confirmed rules (lead / verifier #39, board verify.miss.req05_req01):**
+- (a) **Final payroll ends income.** A settled salary row whose description contains "final" (e.g. user_05 event_390 "Final employer payroll" 2025-10-15) stops every salary stream of that user: nothing is projected after it. 7/275 users have this shape (05, 75, 111, 165, 174, 246, 255). Tuning: request_05 is only reachable with no income.
+- (b) **Scheduled next salary seeds a stream.** A `scheduled` salary credit ("Next confirmed salary") counts on its date AND starts/continues a monthly stream at its amount on its day-of-month, even when history has only one prior salary row (user_01: "Prorated first salary" 2024-02-15 + scheduled 23,320 on 2024-03-15 → 04-15, 05-15 at 23,320; without them safe = 3,973 vs label 25,256 cap). user_01 is the only user in all 275 with this exact 1-row shape; 46 other users have a scheduled salary plus ≥2 history rows — same rule, their stream simply continues at the scheduled amount (tuning 13, 17 consistent).
+- (c) **Scheduled row replaces its cycle's occurrence** (verify#45, board risk.double_count):
+  ```
+  for each scheduled row S (debit or credit):
+      find the Monthly stream of the same category (and direction) with a projected occurrence P where |S.settlement_date − P| <= 15 days
+      if found: drop P (S is that cycle's occurrence). If S is salary, re-anchor later projections to S's day-of-month.
+      else: S is an extra one-off (user_04 event_357 school fee — user_04 has no education stream)
+  pending debits never replace a stream occurrence (distinct purchases; verifier 20 cases), unless an evidence fact marks them duplicate (decision.dup_charges)
+  ```
+  Cases: request_86 scheduled salary 2025-08-23 replaces the 08-15 projection and later months move to the 23rd (same shape as tuning user_07, whose 09-23 move gives label E 2024-10-23). requests 44/104/164/224: scheduled utility debit settling 02-11 replaces the 02-05 utilities projection. Tuning 01/13/17: scheduled salary on the stream day (15th) — consistent.
 Salary schedules that reproduce the tuning labels (engine test vectors):
 
 | user | projected salary |
@@ -135,8 +159,12 @@ items = pending debits (§S2) + scheduled rows + projected streams (§S3.2–3.4
 per day: apply debits, record intraday_low; then credits, record end_of_day
 safe  = clamp(min_t intraday_low(t) − M, 0, req)
 E     = first d with min(end_of_day(d), min_{t>d} intraday_low(t)) − M >= req, else None
-plan_is_safe(pays): same simulation with each payment as a debit on its date; require intraday_low − M >= 0 every day
+plan_is_safe(pays): payments are applied AFTER all of that day's rows (debits and credits) — engine#53, consistent with E.
+    for every day t: require (end_of_day(t) − paid_through(t)) − M >= 0 and (intraday_low(t) − paid_before(t)) − M >= 0
+    where paid_through(t) = sum of plan payments dated <= t, paid_before(t) = sum dated < t
 ```
+Evidence for payments-after-credits: every tuning wait row pays on a salary day (03 2019-11-15, 04 2024-06-15, 08 2025-04-15, 13 2024-05-15, 18 2026-09-15). In each, the headroom just before that day's salary is below req (otherwise E would be earlier), so treating the payment as a pre-credit debit would reject the labelled plan. [EXACT]
+Unification: `safe = headroom_from(rd)` with the same formula as E. No tuning row has a credit on rd, so this equals `min_t intraday_low(t) − M` on all samples.
 
 ### S3.6 Scoreboard for this spec (request_01–18; relative error of safe, E match)
 
@@ -160,6 +188,41 @@ plan_is_safe(pays): same simulation with each payment as a debit on its date; re
 | 16 | 0 (cap) | ✓ | |
 | 17 | −0.3% | ✗ (04-15 vs 03-15) | |
 | 18 | −1.6% | ✓ | |
+
+---
+
+## S4. request_text [EXACT, all 275 requests checked — inputs only]
+
+- Every currency amount in `request_text` equals `requested_amount` (request_43 uses Indonesian `43.339.000` separators — same value). Every date in the text equals `desired_completion_date`; 137 texts have no date. No text contains instruction-like content.
+- Phrases like "split the payment", "use installments", "pay now or wait" are template filler and do **not** correlate with `allows_partial_payment` or the user's methods (request_140: "split the payment" with allows_partial=false, methods=installments).
+- **Conclusion: request_text carries no information the columns lack. Batch mode sends it to no model (0 tokens).**
+
+## S5. Facts the engine needs from extraction
+
+Only facts that change a forecast item. Everything else in a message is ignored. Each fact below is exercised by a tuning label (§S3.4 table shows the resulting schedule).
+
+| fact type | fields | tuning example → engine effect |
+|---|---|---|
+| SalaryAmountChange | new_amount, effective_date | message_01 (user_02) 42,750,000 from 2025-08-15 → projected salary from that date; message_04 (user_06) temporary 1,037.52 "continues for the next payroll"; message_06 (user_08) next salary 1,422.85 |
+| SalaryDateChange | new_date (then monthly on that day) | message_05 (user_07) 2024-09-23 → salary on 23rd, E 2024-10-23 |
+| IncomeEnded | stream/employer, (date) | message_09 (user_12) seasonal contract ended → no income |
+| SalaryResumes / FirstSalary | amount, date | message_10 (user_14) 2,717 from 2025-08-15; message_11 (user_15) 1,661 on 2026-01-15 |
+| UnconfirmedIncome (bonus, commission, payout pending) | kind | message_03 (user_04) quarterly bonus pending; message_08 (user_11) commissions not approved (base 23,256,000 stays the projected salary — see note); message_07 (user_10) gig payout pending → **never count** |
+| RecurringExpenseChange | category/stream, percent or amount, effective (next occurrence) | message_12 (user_16) rent +12% from next payment: 57,100 → 63,952 on 2023-09-01 |
+| NewRecurringExpense | category, amount (required), first_date | message_10 (user_14) childcare "begins in the same month" **with no amount → cannot be counted** (do not invent) |
+| OwnAccountTransfer | the matching debit/credit pair | message_13 (user_18): pair is excluded from spend history; no forecast effect in tuning |
+| PayslipComposition | regular vs one-time | message_02 (user_03): payslip shows regular pay and one-time adjustment separately → the one-time part is not a salary stream |
+
+Note on message_08 (user_11): "confirmed base salary IDR 38,760,000" conflicts with five settled 23,256,000 base-salary rows. Using 23,256,000 gives safe within 0.9% of the label; 38,760,000 only changes E-side numbers after 2025-05-15. Keep settled history as the amount unless the message states an effective date (conflict rule 3 "settled over estimate"). [FIT]
+
+Images (blank-amount events). Selector by linked event:
+| image | event | figure to use | effect |
+|---|---|---|---|
+| image_01 | user_03 event_253 "August 2019 net salary" (settled, history) | Net Pay 4,365,000 (equals the regular salary; not Total Earnings 4,780,800) | confirms salary stream amount; B0 already includes it |
+| image_02 | user_16 event_1442 "Outstanding rent balance" (scheduled 2023-08-16) | **Balance Due 100,000** (not Total 2,00,000, not Amount Received 1,00,000) | −100,000 on 2023-08-16; request_16 stays affordable_now |
+| image_03 | user_17 event_1545 "Bulk groceries and pantry purchase" (settled, history) | Cash Paid 41,272 | history only; **exclude this one-off bulk row from the groceries estimator** (including it moves request_17 safe from −0.3% to −1.3%) |
+
+Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
 
 ---
 
@@ -252,6 +315,8 @@ Consequences: full-now beats everything; partial (starts today, total=req) beats
 - `amount_safe_to_pay`: always the no-change `safe` (capped at req), on every row including not_recommended.
 
 ### S1.5 Number and date formatting [EXACT]
+
+Rounding rule (lead priority 3): there is **no** magnitude rounding (no floor to 100/1000). Round-looking labels (873,000; 8,401,800; 462) are round because the label generator's outflow totals are round (§S3.3), not because of an output rounding step — e.g. 17,229,139.2 and 284.57 keep B0's cents. Compute in full precision (or integer cents), round half-up to 2 dp only when writing. Partial second payment = `round2(req − safe)`; installment amounts are copied verbatim from the option row.
 
 - `amount_safe_to_pay` column: shortest decimal repr of the value rounded to 2 dp, no trailing zeros: `17229139.2`, `603.3`, `873000`, `284.57`.
 - `payment_plan` amounts and `reduce_to` amounts: integer values without decimals (`25256`, `665950`), otherwise exactly 2 dp (`620.40`, `996.60`, `15952906.67`).
