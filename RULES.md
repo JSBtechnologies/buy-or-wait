@@ -221,6 +221,36 @@ Includes the §S3.2 rd/rd+1 variable-occurrence skip. "outflow err" = (safe − 
 | 17 | 243,001.82 | 243,849.58 | −0.3% | −0.6% | 2026-04-15 | 2026-03-15 | ✗ |
 | 18 | 454.67 | 462 | −1.6% | −1.2% | 2026-09-15 | 2026-09-15 | ✓ |
 
+### S3.7 Label arithmetic audit of the safe-amount residuals (lead: 1% rows 02/07/08/11/17)
+
+Method: at each row's trough day, take the label's implied spending `need = B0 + (fixed items and pending/scheduled up to the trough) − M − label_safe`. That leaves only the variable-estimate occurrences (Monthly variable bills + Interval streams), with occurrence counts from S3.2.
+
+| req | cur | variable occurrences before trough | label need | S3.3 estimate | diff | diff % |
+|---|---|---|---|---|---|---|
+| 02 | IDR | util, groc, health, trans, ent ×1 | 7,803,300 | 7,927,591.17 | −124,291.17 | −1.6% |
+| 03 | IDR | util, groc, shop, dining ×1 | 894,900 | 790,959.44 | +103,940.56 | +13.1% |
+| 04 | IDR | util, groc×2, trans, dining, ent | 9,676,700 | 8,941,626.53 | +735,073.47 | +8.2% |
+| 05 | ZAR | util×3, health×3, groc×12, trans×6, shop×3 | 16,929 | 16,598.95 | +330.05 | +2.0% |
+| 06 | EUR | util, groc, trans×2, dining, shop, ent | 235 | 275.82 | −40.82 | −14.8% |
+| 07 | INR | util, groc, dining, trans ×1 | 22,120 | 22,823.32 | −703.32 | −3.1% |
+| 08 | EUR | groc, trans, dining ×1 | 148 | 147.37 | +0.63 | +0.4% |
+| 10 | INR | util×3, groc×12, trans×12, dining×6, ent×3 | 345,190 | 316,840.72 | +28,349.28 | +8.9% |
+| 11 | IDR | util, groc, trans, health, dining ×1 | 9,332,800 | 9,445,945.33 | −113,145.33 | −1.2% |
+| 13 | EUR | groc×10, trans×10, dining×5, ent×3, util×2 | 2,165 | 2,139.30 | +25.70 | +1.2% |
+| 14 | EUR | util, groc, health, trans, shop ×1 | 544 | 524.40 | +19.60 | +3.7% |
+| 15 | EUR | util, dining, groc, trans ×1 | 206 | 220.01 | −14.01 | −6.4% |
+| 17 | INR | util, groc×2, trans×2, dining | 43,240 | 44,087.76 | −847.76 | −1.9% |
+| 18 | EUR | util, health, groc, trans, dining ×1 | 488 | 495.33 | −7.33 | −1.5% |
+
+**Systematic finding (exact, 14/14 uncapped rows):** the label's variable spending is always a whole multiple of a per-currency unit: **IDR 100, INR 10, EUR/ZAR 1**. None of the 14 has cents, although every history amount does. By chance alone that would be about 1/100 per EUR row. So the generator projects each variable occurrence as a **whole-unit base amount**, not a statistic of the noisy history.
+
+**No recoverable offset:**
+- Every uniform (Interval estimator × Monthly estimator × {round, ceil, floor, none} to the unit) over {mean, median, midrange, last, max, min, mean/max/median of last 3–13} was tried. The best reproduces 2/14 rows exactly (13, 14, with no pattern); nothing else gets above 1/14.
+- Diff signs are balanced: 7 negative (02, 06, 07, 11, 15, 17, 18), 7 positive. So there is no bias to correct by a multiplier.
+- For the 5 rows asked about, the gaps are 0.4–3.1% of variable spend. That is the size of mean-of-history noise (±2–3%, §S0). Rounding our estimates to the unit moves each row by at most unit × count (≤ IDR 500, INR 60, EUR 12), which does not close any gap.
+
+**Rule change: none to the numbers.** Optional, harmless toggle `EST_ROUND_UNIT` (default off): round each variable occurrence estimate half-up to IDR 100 / INR 10 / EUR, ZAR, USD 1. It makes engine outflows integer in the same units as the labels, but exact matches stay at 0 extra on 01–18. The 4 exact `amount_safe_to_pay` rows (01, 09, 12, 16) are all caps; exact uncapped safe amounts are not achievable from the data.
+
 E exact 16/18; every outflow within ±8%, 12/14 uncapped within ±5%. Status of the lead's open list: **05** closed (structure right: final payroll + horizon; 1% estimator residual), **10** closed structurally (no gig income: message_07 payout pending; counting any payout moves it further from the label; 5.5% estimator residual), **15** closed (rd/rd+1 skip: −17% → −2.9% outflow), **06** mostly (−21% → −7.6% outflow; E now ✓). Remaining misses (03, 04 ~+5%, 11/17 E) are estimator noise against hidden base amounts.
 
 ---
