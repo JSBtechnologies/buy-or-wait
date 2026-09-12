@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
-use crate::engine::money::Cents;
+use crate::engine::money::Money;
 use crate::engine::types::Direction;
 use crate::extract::{parse_json_reply, ModelClient};
 use crate::model::Message;
@@ -140,9 +140,9 @@ pub fn extract_batch(
 }
 
 /// Convert one validated record into the engine's evidence contract. Returns `None` when
-/// the record carries no ledger-relevant fact (informational, rejected instruction) or when
-/// the fact it describes has no matching `Fact` variant yet (never guessed into the wrong
-/// shape — see the `RecurringExpenseChange` arm).
+/// the record carries no ledger-relevant fact (informational, rejected instruction), when
+/// the event-level fact gate rejects its target event id (`event_fact_gate`, verifier #38),
+/// or when a required field for its `Fact` shape is missing (never guessed).
 pub fn to_evidence(
     message: &Message,
     idx: usize,
@@ -170,13 +170,13 @@ pub fn to_evidence(
             match (record.amount, record.date.as_deref()) {
                 (Some(a), Some(d)) => Fact::IncomeAmountChange {
                     category: category("salary"),
-                    amount: Cents::from_f64(a),
+                    amount: Money::from_f64(a),
                     currency: currency(),
                     effective: parse_date(d)?,
                 },
                 (Some(a), None) => Fact::NextIncomeAmount {
                     category: category("salary"),
-                    amount: Cents::from_f64(a),
+                    amount: Money::from_f64(a),
                     currency: currency(),
                     date: None,
                 },
@@ -203,7 +203,7 @@ pub fn to_evidence(
                 // full-dataset run surfaces a debit case (PLAN.md §2.4).
                 direction: Direction::Credit,
                 category: category("salary"),
-                amount: Cents::from_f64(amount),
+                amount: Money::from_f64(amount),
                 currency: currency(),
                 date: record
                     .date
@@ -214,7 +214,7 @@ pub fn to_evidence(
         }
         RecordType::PendingUnconfirmedCredit => Fact::Unconfirmed {
             category: category("windfall"),
-            amount: record.amount.map(Cents::from_f64),
+            amount: record.amount.map(Money::from_f64),
             currency: record.currency.clone(),
         },
         RecordType::EventAmendment => {
@@ -226,23 +226,41 @@ pub fn to_evidence(
                     Some(StatusHint::Cancelled) => Fact::EventCancelled { event_id },
                     Some(StatusHint::Settled) => Fact::EventSettled {
                         event_id,
-                        amount: record.amount.map(Cents::from_f64),
+                        amount: record.amount.map(Money::from_f64),
                         date: record.date.as_deref().and_then(parse_date),
                     },
                     _ => Fact::EventAmended {
                         event_id,
-                        amount: record.amount.map(Cents::from_f64),
+                        amount: record.amount.map(Money::from_f64),
                         date: record.date.as_deref().and_then(parse_date),
                     },
                 }
             }
         }
         RecordType::RecurringExpenseChange => {
-            // No `Fact` variant expresses "an EXISTING recurring expense changes by amount
-            // or percent" yet (only `NewRecurringExpense`, which requires a concrete amount
-            // + first_date). Raised on bus topic `blocker` (owner: engine). Never guess a
-            // Fact for this record type until a variant lands.
-            return None;
+            // engine#32/dd2402e: Fact::ExpenseAmountChange takes exactly one of amount/
+            // percent, never a guessed category. amount wins if a model somehow sends
+            // both (an absolute figure is more precise than a percent of an unknown base).
+            let category = record.category_hint.clone()?;
+            let (amount, percent) = match (record.amount, record.percent) {
+                (Some(a), _) => (Some(Money::from_f64(a)), None),
+                (None, Some(p)) => (None, Some(p)),
+                (None, None) => return None,
+            };
+            Fact::ExpenseAmountChange {
+                category,
+                amount,
+                percent,
+                currency: record.currency.clone(),
+                // No explicit effective date (e.g. "the next rent payment"): anchor on the
+                // message's own sent_at date and let the recurrence detector find the next
+                // stream occurrence on/after it, rather than guessing a calendar date here.
+                effective: record
+                    .date
+                    .as_deref()
+                    .and_then(parse_date)
+                    .unwrap_or_else(|| observed_at.date()),
+            }
         }
         RecordType::InvestmentUnrealizedChange => {
             // `Status::Unrealized` rows are already `Excluded(NonCash)` by the base cash
@@ -265,6 +283,82 @@ pub fn to_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rent +12% renewal messages (12/51/175, lead: engine#32/dd2402e) map to
+    /// `Fact::ExpenseAmountChange` with `percent` set and `amount` left `None` — the model
+    /// only ever states a percentage for this template, never an absolute new rent figure.
+    #[test]
+    fn recurring_expense_change_maps_to_expense_amount_change_by_percent() {
+        let message = Message {
+            message_id: "message_12".to_string(),
+            user_id: "user_16".to_string(),
+            request_id: Some("request_16".to_string()),
+            related_event_id: None,
+            sent_at: "2023-08-01T09:30:00Z".parse().unwrap(),
+            source_type: "service_provider".to_string(),
+            message_text: "StayLedger wanted to let you know about a change on your account. The renewed lease increases monthly rent by 12%. The new amount will be used for the next rent payment. Case ref SER-0012.".to_string(),
+        };
+        let record = MessageRecord {
+            record_type: RecordType::RecurringExpenseChange,
+            amount: None,
+            currency: None,
+            percent: Some(12.0),
+            date: None,
+            related_event_id: None,
+            status_hint: Some(StatusHint::Confirmed),
+            direction: Some(RecordDirection::Increase),
+            scope: None,
+            is_duplicate_transfer: None,
+            category_hint: Some("rent".to_string()),
+            note: Some("rent_up_12pct_next_payment_apply_to_existing_stream_amount".to_string()),
+        };
+        let evidence = to_evidence(&message, 0, &record, "INR").expect("expected a fact");
+        match evidence.fact {
+            Fact::ExpenseAmountChange { category, amount, percent, currency, effective } => {
+                assert_eq!(category, "rent");
+                assert_eq!(amount, None);
+                assert_eq!(percent, Some(12.0));
+                assert_eq!(currency, None);
+                assert_eq!(effective, NaiveDate::from_ymd_opt(2023, 8, 1).unwrap());
+            }
+            other => panic!("expected ExpenseAmountChange, got {other:?}"),
+        }
+    }
+
+    /// A record with neither an absolute amount nor a percent, or no category, is dropped
+    /// rather than guessed.
+    #[test]
+    fn recurring_expense_change_without_amount_or_category_is_dropped() {
+        let message = Message {
+            message_id: "message_x".to_string(),
+            user_id: "user_1".to_string(),
+            request_id: None,
+            related_event_id: None,
+            sent_at: "2023-08-01T09:30:00Z".parse().unwrap(),
+            source_type: "service_provider".to_string(),
+            message_text: "irrelevant".to_string(),
+        };
+        let base = MessageRecord {
+            record_type: RecordType::RecurringExpenseChange,
+            amount: None,
+            currency: None,
+            percent: None,
+            date: None,
+            related_event_id: None,
+            status_hint: None,
+            direction: None,
+            scope: None,
+            is_duplicate_transfer: None,
+            category_hint: Some("rent".to_string()),
+            note: None,
+        };
+        assert!(to_evidence(&message, 0, &base, "INR").is_none()); // no amount/percent
+
+        let mut no_category = base.clone();
+        no_category.percent = Some(12.0);
+        no_category.category_hint = None;
+        assert!(to_evidence(&message, 0, &no_category, "INR").is_none()); // no category
+    }
 
     #[test]
     fn skeleton_masks_numbers_dates_and_org_names() {

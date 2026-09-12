@@ -11,7 +11,7 @@ use chrono::NaiveDate;
 use serde::Deserialize;
 
 use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
-use crate::engine::money::Cents;
+use crate::engine::money::Money;
 use crate::engine::types::{Event, EventType, Status};
 use crate::extract::{parse_json_reply, ModelClient};
 
@@ -139,7 +139,7 @@ pub fn to_evidence(image_id: &str, figures: &ImageFigures, event: &Event) -> Opt
         observed_at: event.event_date.and_hms_opt(0, 0, 0)?,
         fact: Fact::EventAmount {
             event_id: event.id.clone(),
-            amount: Cents::from_f64(amount),
+            amount: Money::from_f64(amount),
             currency: figures.currency.clone().unwrap_or_else(|| event.currency.clone()),
         },
     })

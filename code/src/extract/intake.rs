@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-use crate::engine::money::Cents;
+use crate::engine::money::Money;
 use crate::engine::types::RequestSpec;
 use crate::extract::{parse_json_reply, ModelClient};
 
@@ -42,7 +42,7 @@ pub fn parse_request_text(
         let deadline = chrono::NaiveDate::parse_from_str(fields.deadline.as_deref()?, "%Y-%m-%d").ok()?;
         let request_type = fields.request_type?;
         Some(RequestSpec {
-            amount: Cents::from_f64(amount),
+            amount: Money::from_f64(amount),
             deadline,
             request_type,
             allows_partial_payment: fields.allows_partial_payment.unwrap_or(false),
