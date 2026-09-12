@@ -19,6 +19,10 @@ pub enum AmountEstimator {
     MeanOfLast(usize),
     /// Mean of every occurrence.
     MeanAll,
+    /// Median of every occurrence (mean of the middle two when even).
+    MedianAll,
+    /// (min + max) / 2 over every occurrence.
+    MidAll,
 }
 
 impl AmountEstimator {
@@ -36,8 +40,57 @@ impl AmountEstimator {
             AmountEstimator::MaxOfLast(n) => tail(n).iter().copied().max().unwrap(),
             AmountEstimator::MeanOfLast(n) => mean(tail(n)),
             AmountEstimator::MeanAll => mean(amounts),
+            AmountEstimator::MedianAll => {
+                let mut v = amounts.to_vec();
+                v.sort();
+                let n = v.len();
+                if n % 2 == 1 { v[n / 2] } else { mean(&v[n / 2 - 1..=n / 2]) }
+            }
+            AmountEstimator::MidAll => {
+                let (lo, hi) = (*amounts.iter().min().unwrap(), *amounts.iter().max().unwrap());
+                mean(&[lo, hi])
+            }
         }
     }
+}
+
+/// S0 `SAME_DAY_ORDER`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DayOrder {
+    DebitsFirst,
+    CreditsFirst,
+}
+
+/// S0 `PAYMENT_TIMING`: when a plan payment on day d is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentTiming {
+    /// After all of day d's rows (so after its credits).
+    AfterDayRows,
+    /// As a debit, before day d's credits.
+    BeforeCredits,
+}
+
+/// S0 `INSTALLMENT_LIMIT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallmentLimit {
+    /// number_of_payments <= max_installment_months.
+    NPayments,
+    /// ceil(number_of_payments * frequency_days / 30) <= max_installment_months.
+    CeilMonths,
+}
+
+/// S0 `NOT_REC_TEMPLATE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotRecommendedTemplate {
+    BIffPartialOnly,
+    AlwaysA,
+}
+
+/// S0 `AFFORDABLE_NOW_TEMPLATE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AffordableNowTemplate {
+    LeavesAtLeast,
+    KeepsMinimum,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +123,21 @@ pub enum ChangePreference {
     SmallestCut,
 }
 
+/// All fields default per RULES.md; `#[serde(default)]` lets the verifier A/B any subset as a
+/// JSON patch over `Rules::default()`. RULES S0 toggle names are given in brackets.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Rules {
-    /// RULES S3.1 [FIT, strong]: through the end of month(rd) + 2.
+    /// [HORIZON] S3.1 [FIT, strong]: through the end of month(rd) + 2. `fixed_90` (rd..=rd+90)
+    /// is `Days(91)`; `fixed_86` is `Days(87)`.
     pub horizon: Horizon,
+    /// [VAR_HORIZON] Horizon for Interval (variable-spend) projections only; `None` = same as
+    /// `horizon`, `Some(Days(91))` = rd_plus_90. The forecast itself still ends at `horizon`.
+    pub variable_horizon: Option<Horizon>,
+    /// [SAME_DAY_ORDER] S2.3: debits before credits.
+    pub same_day_order: DayOrder,
+    /// [PAYMENT_TIMING] S3.5 (fixed 52b4184): plan payments apply after the day's rows.
+    pub payment_timing: PaymentTiming,
 
     // ---- ledger (S2) --------------------------------------------------------------------
     /// Pending debits reserved on rd if true, else on max(rd, settlement_date) (S2.1; both
@@ -105,9 +169,15 @@ pub struct Rules {
     pub next_income_amount_persists: bool,
     /// An income stream whose next expected occurrence fell before rd has stopped (S3.4).
     pub stop_income_after_missed_occurrence: bool,
-    /// A scheduled row replaces a monthly stream's projected occurrence of the same category
-    /// and direction within this many days (S3.4(c): 15).
+    /// [SCHEDULED_REPLACES_CYCLE] S3.4(c): a scheduled row replaces a monthly stream's
+    /// projected occurrence of the same category/direction within the window, and a scheduled
+    /// salary re-anchors the stream's day of month.
+    pub scheduled_replaces_cycle: bool,
     pub scheduled_replacement_window_days: i64,
+    /// [SEEDED_SALARY_STREAM] S3.4(b): a scheduled salary seeds/continues a monthly stream.
+    pub seeded_salary_stream: bool,
+    /// [FINAL_PAYROLL_STOPS_INCOME] S3.4(a).
+    pub final_payroll_stops_income: bool,
     /// Interval-stream occurrences earlier than rd + this many days are skipped (S3.2: 2,
     /// i.e. rd and rd+1).
     pub variable_skip_days: i64,
@@ -119,8 +189,14 @@ pub struct Rules {
     pub ignore_payments_after_horizon: bool,
     /// Maximum spending-change actions in one plan (problem statement: up to three).
     pub max_spending_changes: usize,
-    /// How change plans are ordered after "no changes". S1.3: fewest changes.
+    /// [CHANGE_PREFERENCE] How change plans are ordered after "no changes". S1.3: fewest.
     pub change_preference: ChangePreference,
+    /// [INSTALLMENT_LIMIT] S1.1 [FIT].
+    pub installment_limit: InstallmentLimit,
+    /// [NOT_REC_TEMPLATE] S1.6.
+    pub not_recommended_template: NotRecommendedTemplate,
+    /// [AFFORDABLE_NOW_TEMPLATE] S1.6.
+    pub affordable_now_template: AffordableNowTemplate,
 }
 
 fn strings(xs: &[&str]) -> Vec<String> {
@@ -131,6 +207,9 @@ impl Default for Rules {
     fn default() -> Self {
         Rules {
             horizon: Horizon::EndOfMonthPlus(2),
+            variable_horizon: None,
+            same_day_order: DayOrder::DebitsFirst,
+            payment_timing: PaymentTiming::AfterDayRows,
             reserve_pending_on_request_date: false,
             ignore_scheduled_before_request_date: true,
             min_stream_occurrences: 3,
@@ -146,12 +225,18 @@ impl Default for Rules {
             exclude_evidence_amounts_from_streams: true,
             next_income_amount_persists: true,
             stop_income_after_missed_occurrence: true,
+            scheduled_replaces_cycle: true,
             scheduled_replacement_window_days: 15,
+            seeded_salary_stream: true,
+            final_payroll_stops_income: true,
             variable_skip_days: 2,
             drop_late_plans: true,
             ignore_payments_after_horizon: true,
             max_spending_changes: 3,
             change_preference: ChangePreference::FewestChanges,
+            installment_limit: InstallmentLimit::NPayments,
+            not_recommended_template: NotRecommendedTemplate::BIffPartialOnly,
+            affordable_now_template: AffordableNowTemplate::LeavesAtLeast,
         }
     }
 }
@@ -168,9 +253,14 @@ impl Rules {
     }
 
     /// Months an installment option spans, compared with `max_installment_months`.
-    /// S1.1 [FIT]: the number of payments.
     pub fn installment_months(&self, option: &PaymentOption) -> u32 {
-        option.number_of_payments
+        match self.installment_limit {
+            InstallmentLimit::NPayments => option.number_of_payments,
+            InstallmentLimit::CeilMonths => {
+                let days = option.number_of_payments * option.payment_frequency_days.unwrap_or(30);
+                days.div_ceil(30)
+            }
+        }
     }
 
     /// The amount a reduce_to target is lowered to. S1.2 [EXACT]: minimum_allowed_amount.

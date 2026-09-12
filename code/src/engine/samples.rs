@@ -20,12 +20,17 @@ mod tests {
         let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
         let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
         let samples = model::load_sample_requests(ds.join("sample_requests.csv")).unwrap();
+        let messages = model::load_messages(ds.join("messages.csv")).unwrap();
         let only: Option<String> = std::env::var("ONLY").ok();
         let mut hits: HashMap<&str, usize> = HashMap::new();
         let n = samples.len().min(18);
         for s in samples.iter().take(18) {
             if only.as_deref().is_some_and(|o| o != s.request_id) { continue; }
-            let session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
+            let mut session = Session::from_model(&s.user_id, &profiles, &events, rates.clone(), Rules::default()).unwrap();
+            let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == s.user_id && m.sent_at.date_naive() <= s.request_date).collect();
+            let ev = crate::extract::messages::deterministic_evidence(&msgs, &session.profile().home_currency.clone());
+            if only.is_some() { for e in &ev { println!("  evidence {} {:?}", e.record_id, e.fact); } }
+            session.apply_evidence(ev);
             let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == s.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
             let spec = RequestSpec { amount: crate::engine::money::Money::from_f64(s.requested_amount), deadline: s.desired_completion_date, request_type: s.request_type.clone(), allows_partial_payment: s.allows_partial_payment };
             let d = match session.decide(&s.request_id, s.request_date, &spec, &opts) { Ok(d) => d, Err(e) => { println!("{} ERROR {e}", s.request_id); continue; } };

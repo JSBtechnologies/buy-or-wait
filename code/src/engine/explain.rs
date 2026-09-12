@@ -5,17 +5,23 @@ use chrono::{Datelike, NaiveDate};
 
 use super::facts::DecisionFacts;
 use super::money::Money;
+use super::rules::{AffordableNowTemplate, NotRecommendedTemplate, Rules};
 use super::types::PaymentMethod;
 
-pub fn render(f: &DecisionFacts) -> String {
+pub fn render(f: &DecisionFacts, rules: &Rules) -> String {
     let cur = &f.currency;
     let money = |c: Money| format!("{cur} {}", c.fmt_grouped());
     let min = money(f.minimum_balance);
     let req = money(f.requested_amount);
     match f.method {
-        PaymentMethod::FullPayment if f.changes.is_empty() => {
-            format!("Pay {req} today. This leaves at least {min} available over the next 90 days.")
-        }
+        PaymentMethod::FullPayment if f.changes.is_empty() => match rules.affordable_now_template {
+            AffordableNowTemplate::LeavesAtLeast => {
+                format!("Pay {req} today. This leaves at least {min} available over the next 90 days.")
+            }
+            AffordableNowTemplate::KeepsMinimum => {
+                format!("Pay {req} today. This keeps the {min} minimum available over the next 90 days.")
+            }
+        },
         PaymentMethod::FullPayment => {
             format!("{}, then pay {req} today. This leaves at least {min} available.", changes_clause(f))
         }
@@ -48,7 +54,8 @@ pub fn render(f: &DecisionFacts) -> String {
         }
         PaymentMethod::NotRecommended => {
             // Variant B iff methods == {partial_payment}, partial allowed, safe > 0, no E [FIT].
-            let only_partial = f.accepted_methods == [PaymentMethod::PartialPayment];
+            let only_partial = f.accepted_methods == [PaymentMethod::PartialPayment]
+                && rules.not_recommended_template == NotRecommendedTemplate::BIffPartialOnly;
             if only_partial && f.allows_partial_payment && f.safe_amount > Money::ZERO && f.earliest_full_date.is_none() {
                 format!(
                     "Do not proceed with the {req} request. Although {} is available today, the full amount cannot be completed safely within 90 days.",
