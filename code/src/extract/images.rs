@@ -169,53 +169,94 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
 /// while the labeled Total/Balance (which already reconcile against each other, 0 + 3,650 =
 /// 3,650) say 3,650. Re-summing an arbitrary itemized breakup is not as reliable as the
 /// document's own labeled totals, so it never overrides them.
+/// Every distinct identity a document can print (subtotal+tax=total, gross-deductions=net,
+/// amount_paid[+balance_due]=total) is checked independently; a figure is reconciled if
+/// ANY identity that has enough data to run actually passes, not only if every identity
+/// that happens to have data all agree. Analyst audit board:verify.image_audit #194: a
+/// document can print an unrelated subtotal/tax breakdown (for a different section of the
+/// bill) that doesn't sum to the overall total, while amount_paid + balance_due = total
+/// independently confirms the figure that matters — the first identity's mismatch must not
+/// veto the second's pass. Only rejects outright when at least one identity had the data to
+/// run and every identity that ran failed.
 pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
-    let mut checked_labeled_fields = false;
+    let mut any_ran = false;
+    let mut any_passed = false;
 
     if let (Some(sub), Some(tax), Some(total)) = (figures.subtotal, figures.tax, figures.total) {
-        if !close(sub + tax, total, ROUNDING_TOLERANCE_2TERM) {
-            return false;
+        any_ran = true;
+        if close(sub + tax, total, ROUNDING_TOLERANCE_2TERM) {
+            any_passed = true;
         }
-        checked_labeled_fields = true;
     }
     if let (Some(gross), Some(ded), Some(net)) = (figures.gross_pay, figures.deductions, figures.net_pay)
     {
-        if !close(gross - ded, net, ROUNDING_TOLERANCE_2TERM) {
-            return false;
+        any_ran = true;
+        if close(gross - ded, net, ROUNDING_TOLERANCE_2TERM) {
+            any_passed = true;
         }
-        checked_labeled_fields = true;
     }
-    // analyst audit board:verify.image_audit (image_12): cash tendered can legitimately
-    // exceed the total when change is given (40.00 tendered against a 33.50 total) -- that
-    // is consistent by construction, not a mismatch, regardless of what balance_due says.
-    // Only fall through to the paid+balance_due=total identity when paid is actually less
-    // than total (a real partial payment / balance-owed scenario).
+    // analyst audit #184 (image_12): cash tendered can legitimately exceed the total when
+    // change is given (40.00 tendered against a 33.50 total) -- that is consistent by
+    // construction, not a mismatch, regardless of what balance_due says. Only fall through
+    // to the paid+balance_due=total identity when paid is actually less than total (a real
+    // partial payment / balance-owed scenario).
     if let (Some(paid), Some(total)) = (figures.amount_paid, figures.total) {
+        any_ran = true;
         if paid + ROUNDING_TOLERANCE_2TERM >= total {
-            checked_labeled_fields = true;
+            any_passed = true;
         } else if let Some(bal) = figures.balance_due {
-            if !close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
-                return false;
+            if close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
+                any_passed = true;
             }
-            checked_labeled_fields = true;
         }
-        // else: paid < total and no balance_due stated -- not enough to confirm or reject.
+        // else: paid < total and no balance_due stated -- this identity had enough data to
+        // attempt (paid, total) but not enough to confirm or reject the gap; left un-passed,
+        // same as a failed attempt, so it cannot by itself validate the figure.
     }
-    if !checked_labeled_fields {
+    if !any_passed {
         if let (Some(sum), Some(target)) =
             (figures.line_items_sum_check, figures.subtotal.or(figures.total))
         {
-            if !close(sum, target, ROUNDING_TOLERANCE_2TERM) {
-                return false;
+            any_ran = true;
+            if close(sum, target, ROUNDING_TOLERANCE_2TERM) {
+                any_passed = true;
             }
         }
     }
+    if any_ran && !any_passed {
+        return false;
+    }
     if let Some(cur) = &figures.currency {
-        if cur != &event.currency {
+        if !currency_matches(cur, &event.currency) {
             return false;
         }
     }
     true
+}
+
+/// Currency-code match, tolerant of the symbols/names a VLM prints instead of the ISO code
+/// (analyst audit #194: exact-string comparison was rejecting reads that had the right
+/// currency in a different spelling). Limited to the dataset's five currencies (PLAN.md:
+/// INR, ZAR, IDR, USD, EUR); anything else falls back to a cleaned exact-string comparison
+/// rather than guessing a mapping.
+fn currency_matches(claimed: &str, expected: &str) -> bool {
+    normalize_currency(claimed) == normalize_currency(expected)
+}
+
+fn normalize_currency(raw: &str) -> String {
+    let cleaned = raw.trim().trim_end_matches('.').to_uppercase();
+    match cleaned.as_str() {
+        "INR" | "RS" | "RUPEES" | "RUPEE" | "INDIAN RUPEE" | "INDIAN RUPEES" | "\u{20B9}" => {
+            "INR".to_string()
+        }
+        "USD" | "US$" | "$" | "US DOLLAR" | "US DOLLARS" | "DOLLAR" | "DOLLARS" => {
+            "USD".to_string()
+        }
+        "EUR" | "\u{20AC}" | "EURO" | "EUROS" => "EUR".to_string(),
+        "IDR" | "RP" | "RUPIAH" | "INDONESIAN RUPIAH" => "IDR".to_string(),
+        "ZAR" | "R" | "RAND" | "SOUTH AFRICAN RAND" => "ZAR".to_string(),
+        _ => cleaned,
+    }
 }
 
 /// Select, reconcile, and convert one image's transcription into a `Fact::EventAmount`.
@@ -469,6 +510,43 @@ mod tests {
         let value = serde_json::json!({"doc_type": "TAX INVOICE", "total": 100.0});
         let figures: ImageFigures = serde_json::from_value(value).expect("should not reject on doc_type");
         assert_eq!(figures.doc_type, Some(DocType::Invoice));
+    }
+
+    /// analyst audit #194: a VLM's currency field is often a symbol/name, not the ISO
+    /// code -- exact-string comparison against the event's "INR"/"USD"/etc. was rejecting
+    /// otherwise-correct reads.
+    #[test]
+    fn currency_matches_symbols_and_names() {
+        assert!(currency_matches("Rs", "INR"));
+        assert!(currency_matches("\u{20B9}", "INR"));
+        assert!(currency_matches("Indian Rupees", "INR"));
+        assert!(currency_matches("$", "USD"));
+        assert!(currency_matches("US$", "USD"));
+        assert!(currency_matches("Rp", "IDR"));
+        assert!(currency_matches("R", "ZAR"));
+        assert!(currency_matches("\u{20AC}", "EUR"));
+        assert!(!currency_matches("USD", "INR"));
+    }
+
+    /// analyst audit #194: a document can print an unrelated subtotal/tax breakdown that
+    /// doesn't sum to the overall total, while amount_paid + balance_due = total
+    /// independently confirms the figure — the first identity's mismatch must not veto the
+    /// second's pass.
+    #[test]
+    fn unrelated_subtotal_tax_mismatch_does_not_veto_a_passing_paid_balance_check() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Invoice),
+            currency: Some("INR".into()),
+            subtotal: Some(1000.0), // describes a different section; doesn't sum to total
+            tax: Some(50.0),
+            total: Some(3650.0),
+            amount_paid: Some(0.0),
+            balance_due: Some(3650.0),
+            ..Default::default()
+        };
+        let event = expense_event("event_6859", "healthcare", "INR", Status::Scheduled);
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(3650.0));
     }
 
     #[test]
