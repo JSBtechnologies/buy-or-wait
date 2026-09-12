@@ -272,7 +272,7 @@ impl Session {
             payment_plan: render_plan(&plan),
             earliest_date_for_full_payment: earliest.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
             spending_changes_needed: render_changes(&changes),
-            decision_explanation: explain::render(&facts),
+            decision_explanation: explain::render(&facts, rules),
         };
         self_check(&facts, &row)?;
         Ok(Decision { row, facts, streams, baseline, with_changes })
