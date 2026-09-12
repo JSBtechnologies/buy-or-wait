@@ -151,10 +151,17 @@ pub fn to_evidence(
 ) -> Option<EvidenceRecord> {
     let record_id = format!("{}#{idx}", message.message_id);
     let observed_at = message.sent_at.naive_utc();
-    let event_id = record
-        .related_event_id
-        .clone()
-        .or_else(|| message.related_event_id.clone());
+    // board decision `event_fact_gate` (verifier #38, endorsed by lead): an event-level fact
+    // may only target the event `messages.csv` itself links via `related_event_id`. A
+    // model's own `related_event_id` claim is never sufficient on its own, and one that
+    // contradicts the CSV link is treated as a hallucination — the whole record is dropped
+    // rather than guessing which event it meant. This is why messages like 13/23/41/135/
+    // 202/213 (own-account-transfer, no CSV link) must yield zero ledger facts.
+    let event_id = match (&message.related_event_id, &record.related_event_id) {
+        (Some(csv_id), None) => Some(csv_id.clone()),
+        (Some(csv_id), Some(claimed)) if claimed == csv_id => Some(csv_id.clone()),
+        _ => None,
+    };
     let currency = || record.currency.clone().unwrap_or_else(|| home_currency.to_string());
     let category = |default: &str| record.category_hint.clone().unwrap_or_else(|| default.to_string());
 
@@ -264,5 +271,107 @@ mod tests {
         let a = skeleton("Hi, Northstar Labs payroll here. Your monthly salary has increased to USD 2988. The change applies from 2026-07-15.");
         let b = skeleton("Hi, Greenfield Foods payroll here. Your monthly salary has increased to USD 1500. The change applies from 2025-03-01.");
         assert_eq!(a, b);
+    }
+
+    fn own_account_transfer_message(message_id: &str, text: &str) -> Message {
+        Message {
+            message_id: message_id.to_string(),
+            user_id: "user_18".to_string(),
+            request_id: Some("request_18".to_string()),
+            related_event_id: None, // messages.csv leaves this blank for all 6 cases
+            sent_at: "2026-07-01T09:30:00Z".parse().unwrap(),
+            source_type: "bank".to_string(),
+            message_text: text.to_string(),
+        }
+    }
+
+    /// board decision `event_fact_gate` (verifier #38): own-account-transfer messages
+    /// 13/23/41/135/202/213 have no `related_event_id` in messages.csv. Even if the model
+    /// still claims `is_duplicate_transfer: true` (and, worse, hallucinates an event id),
+    /// no event-level fact may be emitted — never guess which event it meant.
+    #[test]
+    fn own_account_transfer_without_csv_event_link_yields_no_fact() {
+        let cases = [
+            ("message_13", "There\u{2019}s an update from Summit Bank on your recent account activity. The matching debit and credit came from a transfer between your two accounts. Both accounts are registered under the same account holder. Both entries will remain visible in your transaction history. Txn ref BAN-0013."),
+            ("message_23", "Cedar Bank has reviewed the transaction on your account. The matching debit and credit came from a transfer between your two accounts. Both entries will remain visible in your transaction history. Txn ref BAN-0023."),
+            ("message_41", "Here\u{2019}s the latest transaction update from Summit Bank. The matching debit and credit came from a transfer between your two accounts. Both accounts are registered under the same account holder. Both entries will remain visible in your transaction history. Txn ref BAN-0041."),
+            ("message_135", "Cedar Bank has new information about one of your transactions. The matching debit and credit came from a transfer between your two accounts. Both accounts are registered under the same account holder. Both entries will remain visible in your transaction history. Txn ref BAN-0135."),
+            ("message_202", "Hi, Summit Bank here. The matching debit and credit came from a transfer between your two accounts. Both accounts are registered under the same account holder. Both entries will remain visible in your transaction history. Txn ref BAN-0202."),
+            ("message_213", "Harbor Bank telah meninjau transaksi pada rekening Anda. Debit dan kredit dengan jumlah yang sama berasal dari transfer antara dua rekening Anda. Kedua rekening terdaftar atas nama pemilik yang sama. Kedua transaksi akan tetap terlihat dalam riwayat rekening Anda. Ref transaksi BAN-0213."),
+        ];
+        for (message_id, text) in cases {
+            let message = own_account_transfer_message(message_id, text);
+            // No claimed event id at all: gate drops it.
+            let honest = MessageRecord {
+                record_type: RecordType::EventAmendment,
+                amount: None,
+                currency: None,
+                percent: None,
+                date: None,
+                related_event_id: None,
+                status_hint: None,
+                direction: None,
+                scope: None,
+                is_duplicate_transfer: Some(true),
+                category_hint: None,
+                note: Some("own_account_transfer_exclude_one_leg_from_cash_flow".into()),
+            };
+            assert!(
+                to_evidence(&message, 0, &honest, "INR").is_none(),
+                "{message_id}: no CSV related_event_id must yield zero facts"
+            );
+
+            // Model hallucinates an event id despite no CSV link: still must be dropped.
+            let mut hallucinated = honest.clone();
+            hallucinated.related_event_id = Some("event_9999".into());
+            assert!(
+                to_evidence(&message, 0, &hallucinated, "INR").is_none(),
+                "{message_id}: a model-claimed event id must never substitute for the CSV link"
+            );
+        }
+    }
+
+    /// A model-claimed event id that CONTRADICTS the CSV link is also dropped, not trusted.
+    #[test]
+    fn contradicting_claimed_event_id_is_rejected() {
+        let mut message = own_account_transfer_message("message_106", "dispute text");
+        message.related_event_id = Some("event_12709".into());
+        let record = MessageRecord {
+            record_type: RecordType::EventAmendment,
+            amount: None,
+            currency: None,
+            percent: None,
+            date: None,
+            related_event_id: Some("event_0001".into()), // does not match the CSV link
+            status_hint: Some(StatusHint::Pending),
+            direction: None,
+            scope: None,
+            is_duplicate_transfer: None,
+            category_hint: None,
+            note: None,
+        };
+        assert!(to_evidence(&message, 0, &record, "EUR").is_none());
+    }
+
+    /// The matching, non-contradicting case still works (sanity check for the gate).
+    #[test]
+    fn matching_claimed_event_id_is_accepted() {
+        let mut message = own_account_transfer_message("message_106", "dispute text");
+        message.related_event_id = Some("event_12709".into());
+        let record = MessageRecord {
+            record_type: RecordType::EventAmendment,
+            amount: None,
+            currency: None,
+            percent: None,
+            date: None,
+            related_event_id: Some("event_12709".into()),
+            status_hint: Some(StatusHint::Pending),
+            direction: None,
+            scope: None,
+            is_duplicate_transfer: None,
+            category_hint: None,
+            note: None,
+        };
+        assert!(to_evidence(&message, 0, &record, "EUR").is_some());
     }
 }
