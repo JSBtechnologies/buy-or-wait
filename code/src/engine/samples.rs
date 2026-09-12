@@ -93,9 +93,13 @@ mod tests {
             match session.decide(&r.request_id, r.request_date, &RequestSpec::from_model(r), &opts) {
                 Ok(d) => {
                     *dist.entry(format!("{}/{}", d.row.affordability_status, d.row.recommended_payment_method)).or_default() += 1;
-                    if !d.facts.ledger_issues.is_empty() {
+                    if !d.facts.missing_amounts.is_empty() {
                         issues += 1;
-                        println!("{} issues {:?}", r.request_id, d.facts.ledger_issues);
+                        let rows: Vec<String> = d.facts.missing_amounts.iter().map(|id| {
+                            let e = session.ledger().get(id).unwrap();
+                            format!("{} {} {:?} {} {}", id, e.event.description, e.event.status, e.cash_date, if e.cash_date >= r.request_date { "future" } else { "history" })
+                        }).collect();
+                        println!("{} missing_amounts {:?}", r.request_id, rows);
                     }
                 }
                 Err(e) => println!("{} ERROR {e:#}", r.request_id),

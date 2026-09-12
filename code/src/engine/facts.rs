@@ -77,6 +77,9 @@ pub struct DecisionFacts {
     pub plan_trough: Option<(Money, NaiveDate)>,
 
     // ---- data quality ------------------------------------------------------------------
+    /// Blank-amount rows with no accepted image figure (baseline v0): never zero, excluded
+    /// from cash and stream estimators, listed here by event id.
+    pub missing_amounts: Vec<String>,
     pub ledger_issues: Vec<String>,
     pub rejected_evidence: Vec<String>,
     pub applied_evidence: Vec<String>,
