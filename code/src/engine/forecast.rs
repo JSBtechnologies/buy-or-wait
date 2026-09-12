@@ -6,7 +6,7 @@
 //! - suffix minimum from d = min over t >= d of H(t), computed once
 //! - earliest full date = first d with suffix[d] >= requested
 
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use super::ledger::{Fact, Ledger, LedgerEntry};
@@ -14,6 +14,10 @@ use super::money::Money;
 use super::recurrence::{Cadence, Stream, StreamKind, Streams};
 use super::rules::Rules;
 use super::types::{Direction, Payment, RateProvider};
+
+/// Half a cent: plan amounts are written rounded to cents (RULES S1.5), so a plan built from
+/// the rounded safe amount may exceed the exact headroom by at most this much.
+pub const SAFETY_TOLERANCE: Money = Money(super::money::SCALE / 200);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlowSource {
@@ -99,7 +103,8 @@ impl Forecast {
     pub fn build(inp: &ForecastInputs, changes: &[SpendingChange]) -> Forecast {
         let rules = inp.rules;
         let start = inp.start;
-        let end = start + Duration::days(rules.horizon_days - 1);
+        let end = rules.horizon_end(start);
+        let horizon_days = (end - start).num_days() + 1;
         let mut flows = Vec::new();
 
         // Reserved pending debits.
@@ -139,14 +144,17 @@ impl Forecast {
         for stream in &inp.streams.streams {
             let Some(amount) = changed_amount(stream, changes, rules) else { continue };
             let mut dates = stream.dates_between(start, end);
-            // A scheduled row of the same category/direction replaces the matching occurrence.
-            dates.retain(|d| {
-                !scheduled.iter().any(|e| {
-                    e.event.category == stream.category
-                        && e.event.direction == stream.direction
-                        && (e.cash_date - *d).num_days().abs() <= rules.scheduled_match_window_days
-                })
-            });
+            // A scheduled row replaces its calendar month's occurrence of a monthly stream with
+            // the same category and direction, even on a shifted day (verifier#45).
+            if rules.scheduled_replaces_month_occurrence && matches!(stream.cadence, Cadence::Monthly { .. }) {
+                dates.retain(|d| {
+                    !scheduled.iter().any(|e| {
+                        e.event.category == stream.category
+                            && e.event.direction == stream.direction
+                            && (e.cash_date.year(), e.cash_date.month()) == (d.year(), d.month())
+                    })
+                });
+            }
             for d in dates {
                 flows.push(Flow {
                     date: d,
@@ -159,7 +167,7 @@ impl Forecast {
         apply_adjustments(&mut flows, inp, start, end);
 
         flows.sort_by(|a, b| (a.date, &a.category).cmp(&(b.date, &b.category)));
-        Forecast::from_flows(start, inp.opening_balance, inp.minimum_balance, reserved_total, flows, rules.horizon_days)
+        Forecast::from_flows(start, inp.opening_balance, inp.minimum_balance, reserved_total, flows, horizon_days)
     }
 
     pub fn from_flows(
@@ -267,7 +275,7 @@ impl Forecast {
                 if v < trough.0 {
                     trough = (v, self.date_of(t));
                 }
-                if v < m && first_breach.is_none() {
+                if v < m - SAFETY_TOLERANCE && first_breach.is_none() {
                     first_breach = Some((self.date_of(t), v));
                 }
             }
@@ -284,38 +292,45 @@ impl SafetyReport {
 }
 
 /// The per-occurrence amount of a stream after spending changes; `None` when stopped.
-fn changed_amount(stream: &Stream, changes: &[SpendingChange], rules: &Rules) -> Option<Money> {
-    let hits: Vec<&SpendingChange> = changes
-        .iter()
-        .filter(|c| stream.occurrences.iter().any(|o| o.event_id == c.event_id()))
-        .collect();
-    if hits.is_empty() {
-        return Some(stream.projected_amount);
+/// RULES S1.2: stop removes the stream's future occurrences; reduce_to sets every future
+/// occurrence to the new amount (for pooled variable spend too, e.g. request_11 dining).
+fn changed_amount(stream: &Stream, changes: &[SpendingChange], _rules: &Rules) -> Option<Money> {
+    let mut amount = stream.projected_amount;
+    for c in changes.iter().filter(|c| stream.occurrences.iter().any(|o| o.event_id == c.event_id())) {
+        match c {
+            SpendingChange::Stop { .. } => return None,
+            SpendingChange::ReduceTo { amount: a, .. } => amount = amount.min(*a),
+        }
     }
-    match stream.kind {
-        StreamKind::Recurring => {
-            let mut amount = stream.projected_amount;
-            for c in hits {
-                match c {
-                    SpendingChange::Stop { .. } => return None,
-                    SpendingChange::ReduceTo { amount: a, .. } => amount = amount.min(*a),
-                }
-            }
-            Some(amount)
+    Some(amount)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_monthly_income(
+    flows: &mut Vec<Flow>,
+    category: &str,
+    amount: Money,
+    currency: &str,
+    first: NaiveDate,
+    start: NaiveDate,
+    end: NaiveDate,
+    src: &FlowSource,
+    convert: &dyn Fn(Money, &str, NaiveDate) -> Option<Money>,
+) {
+    let mut k = 0;
+    loop {
+        let m0 = first.month0() + k;
+        let (y, m) = (first.year() + (m0 / 12) as i32, m0 % 12 + 1);
+        let day = (1..=first.day()).rev().find_map(|dd| NaiveDate::from_ymd_opt(y, m, dd)).expect("valid day");
+        if day > end {
+            break;
         }
-        StreamKind::VariableSpend => {
-            // The change rewrites the targeted row inside the pool, then the rate is
-            // re-estimated from the edited history.
-            let mut amounts = Vec::new();
-            for o in &stream.occurrences {
-                match hits.iter().find(|c| c.event_id() == o.event_id) {
-                    Some(SpendingChange::Stop { .. }) => {}
-                    Some(SpendingChange::ReduceTo { amount, .. }) => amounts.push((*amount).min(o.amount)),
-                    None => amounts.push(o.amount),
-                }
+        if day >= start {
+            if let Some(a) = convert(amount, currency, day) {
+                flows.push(Flow { date: day, amount: a, category: category.to_string(), source: src.clone() });
             }
-            Some(rules.variable_estimator.estimate(&amounts))
         }
+        k += 1;
     }
 }
 
@@ -336,11 +351,22 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
         let src = FlowSource::Evidence { record_id: rec.record_id.clone() };
         match &rec.fact {
             Fact::IncomeAmountChange { category, amount, currency, effective } => {
+                let mut changed = false;
                 for f in flows.iter_mut().filter(|f| is_income_flow(f, category) && f.date >= *effective) {
                     if let Some(a) = convert(*amount, currency, f.date) {
                         f.amount = a;
+                        changed = true;
                     }
                 }
+                // No projected income to change (stream paused or never seen): the change is
+                // the income from its effective date, monthly.
+                if !changed {
+                    seed_monthly_income(flows, category, *amount, currency, *effective, start, end, &src, &convert);
+                }
+            }
+            Fact::IncomeStarts { category, amount, currency, first_date } => {
+                flows.retain(|f| !(is_income_flow(f, category) && f.date >= *first_date));
+                seed_monthly_income(flows, category, *amount, currency, *first_date, start, end, &src, &convert);
             }
             Fact::NextIncomeAmount { category, amount, currency, date } => {
                 if let Some(f) = flows
@@ -354,15 +380,27 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                 }
             }
             Fact::IncomeDateMoved { category, new_date } => {
-                if let Some(f) = flows.iter_mut().filter(|f| is_income_flow(f, category)).min_by_key(|f| f.date) {
-                    f.date = *new_date;
+                // The next income occurrence moves to new_date and later months follow the new
+                // day of month (RULES S3.4 user_07: 09-23 then monthly 23rd).
+                let mut income: Vec<&mut Flow> = flows.iter_mut().filter(|f| is_income_flow(f, category)).collect();
+                income.sort_by_key(|f| f.date);
+                for (i, f) in income.into_iter().enumerate() {
+                    f.date = if i == 0 {
+                        *new_date
+                    } else {
+                        let (y, m) = (f.date.year(), f.date.month());
+                        NaiveDate::from_ymd_opt(y, m, new_date.day())
+                            .unwrap_or_else(|| NaiveDate::from_ymd_opt(y, m, 28).unwrap())
+                            .max(*new_date + Duration::days(1))
+                    };
                 }
             }
             Fact::ExpenseAmountChange { category, amount, percent, currency, effective } => {
                 let targets = flows.iter_mut().filter(|f| {
                     f.category == *category
                         && f.amount < Money::ZERO
-                        && f.date >= *effective
+                        // None: from the next occurrence after the message (lead, blocker #32).
+                        && f.date >= effective.unwrap_or(rec.observed_at.date())
                         && matches!(f.source, FlowSource::Stream { .. } | FlowSource::Scheduled { .. })
                 });
                 for f in targets {

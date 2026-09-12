@@ -20,3 +20,5 @@ pub mod explain;
 pub use rules::Rules;
 
 mod samples;
+#[cfg(test)]
+mod scenario_tests;
