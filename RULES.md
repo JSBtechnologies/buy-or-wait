@@ -19,7 +19,7 @@ Every tunable rule has a name. Engine should expose each as a config value. The 
 | `IV_SKIP_DAYS` | `2` (Interval occurrences on rd, rd+1 skipped) | `0` | 15 outflow −2.9% → −17.1%; 06 −7.6% → −21.1% and E wrong; 10 +5.5% → +4.4% | S3.2 |
 | `BILL_ESTIMATOR` | `mean_last3` | `max_last3`, `mid_all` ((min+max)/2), `mean_all` | `mid_all` marginally better sum of abs outflow err (0.338 vs 0.352), same E; `max_last3` worse (08 −52%, 13 −99% when combined with max var) | S3.3 |
 | `VAR_ESTIMATOR` | `mean_all` | `median_all`, `max_last4` | `max_last4` closes 05 (−0.3%) and 10 (−0.4%) but breaks 06 −21%, 08 −29%, 13 −20% | S3.3 |
-| `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only) | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
+| `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only). Exact semantics (verifier #104): when on, the **day series runs rd ..= rd+90**; Interval-stream occurrences in (horizon_end, rd+90] count **on their own dates** (no clamping); Monthly streams, salary, pending and scheduled rows stay limited to horizon_end; `safe` and E take their minima over the full rd..rd+90 series (E candidates also run to rd+90). With nothing else after horizon_end, balances there only fall, so the low point moves to the last extra occurrence | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
 | `SCHEDULED_REPLACES_CYCLE` | `on` (±15 days, salary re-anchors day) | `off` | no tuning row exercises it (request_86, 44/104/164/224 in eval) | S3.4c |
 | `SEEDED_SALARY_STREAM` | `on` | `off` | request_01 safe 25,256 (cap) → 3,973 | S3.4b |
 | `FINAL_PAYROLL_STOPS_INCOME` | `on` | `off` | request_05 safe 737-label → capped ≫ label | S3.4a |
