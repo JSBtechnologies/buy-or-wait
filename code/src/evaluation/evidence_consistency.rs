@@ -90,6 +90,10 @@ fn canonical_json(v: &Value) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
+fn rid_num(rid: &str) -> u32 {
+    rid.rsplit('_').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+}
+
 fn err(id: &str, code: &'static str, detail: String) -> Finding {
     Finding { request_id: id.to_string(), severity: Severity::Error, code, detail }
 }
@@ -134,28 +138,55 @@ pub fn check(dataset_dir: &Path, code_dir: &Path) -> Result<Vec<Finding>> {
     let inp = Inputs::load(dataset_dir)?;
     let mut out = Vec::new();
     let mut emitted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let msgs = super::evidence_audit::load_messages(dataset_dir)?;
+    let ds_eval = super::data::Dataset::load(dataset_dir, &dataset_dir.join("requests.csv"))?;
+    let ds_samp = super::data::Dataset::load(dataset_dir, &dataset_dir.join("sample_requests.csv"))?;
     for (rid, uid, rd) in all_requests(dataset_dir)? {
         let live = evidence_for(&inp, &uid, rd);
         for r in &live {
             emitted.entry(r.record_id.split('#').next().unwrap_or("").to_string()).or_default().insert(kind(r));
         }
         let live_c = canonical(&live);
+        let ds = if rid_num(&rid) >= 26 { &ds_eval } else { &ds_samp };
         for (label, path) in [
             ("applied", code_dir.join("store/processed/evidence").join(format!("{rid}.json"))),
             ("gen_evidence", code_dir.join("store/evidence").join(format!("{uid}.json"))),
         ] {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let snap = match serde_json::from_str::<Value>(&text) {
-                Ok(v) => canonical_json(v.get("value").unwrap_or(&v)),
+            let raw = match serde_json::from_str::<Value>(&text) {
+                Ok(v) => v.get("value").cloned().unwrap_or(v),
                 Err(e) => {
                     out.push(err(&rid, "EC0_snapshot_unreadable", format!("{}: {e}", path.display())));
                     continue;
                 }
             };
-            let missing: Vec<&String> = snap.difference(&live_c).collect();
-            let extra: Vec<&String> = live_c.difference(&snap).collect();
-            if !missing.is_empty() || !extra.is_empty() {
-                out.push(err(&rid, "EC1_evidence_drift", format!("{label} snapshot vs live parse: only in snapshot {missing:?}; only in live {extra:?}")));
+            let snap = canonical_json(&raw);
+            let missing_live: Vec<&String> = live_c.difference(&snap).collect();
+            let extra: Vec<&String> = snap.difference(&live_c).collect();
+            if label == "gen_evidence" {
+                if !missing_live.is_empty() || !extra.is_empty() {
+                    out.push(err(&rid, "EC1_evidence_drift", format!("gen_evidence snapshot vs live parse: only in snapshot {extra:?}; only in live {missing_live:?}")));
+                }
+                continue;
+            }
+            // Applied evidence = deterministic parse + model records. Every deterministic record
+            // must have been applied; every extra (model) record must pass the grounding audit.
+            if !missing_live.is_empty() {
+                out.push(err(&rid, "EC1_applied_missing_deterministic", format!("live parse records not applied by the shipped run: {missing_live:?}")));
+            }
+            if !extra.is_empty() {
+                let extra_json: Vec<Value> = raw
+                    .as_array()
+                    .map(|a| a.iter().filter(|r| {
+                        let key = format!("{} {}", r.get("record_id").and_then(Value::as_str).unwrap_or(""), r.get("fact").map(|f| f.to_string()).unwrap_or_default());
+                        extra.contains(&&key)
+                    }).cloned().collect())
+                    .unwrap_or_default();
+                for f in super::evidence_audit::audit_records(ds, &msgs, &uid, &Value::Array(extra_json), crate::engine::money::SCALE) {
+                    if f.severity == Severity::Error {
+                        out.push(err(&rid, "EC5_model_record_ungrounded", f.to_string()));
+                    }
+                }
             }
         }
     }

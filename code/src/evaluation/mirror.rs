@@ -53,9 +53,24 @@ pub fn evidence_for(inp: &Inputs, user: &str, request_date: NaiveDate) -> Vec<Ev
     crate::extract::messages::deterministic_evidence(&ev.messages, &home)
 }
 
+/// Evidence the shipped run applied, when it persisted it (store/processed/evidence/<request>.json,
+/// includes model-path records the verifier cannot regenerate); otherwise the live parse.
+/// evidence_consistency checks the snapshot against the live parse and grounds its model records.
+pub fn applied_or_live(inp: &Inputs, r: &model::Request) -> Vec<EvidenceRecord> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("store/processed/evidence").join(format!("{}.json", r.request_id));
+    if let Ok(text) = std::fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Ok(recs) = serde_json::from_value::<Vec<EvidenceRecord>>(v.get("value").cloned().unwrap_or(v)) {
+                return recs;
+            }
+        }
+    }
+    evidence_for(inp, &r.user_id, r.request_date)
+}
+
 pub fn decide(inp: &Inputs, r: &model::Request, rules: Rules) -> Result<(Decision, Session)> {
     let mut session = Session::from_model(&r.user_id, &inp.profiles, &inp.events, inp.rates.clone(), rules)?;
-    let facts = evidence_for(inp, &r.user_id, r.request_date);
+    let facts = applied_or_live(inp, r);
     if !facts.is_empty() {
         session.apply_evidence(facts);
     }
