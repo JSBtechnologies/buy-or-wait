@@ -12,7 +12,7 @@ use super::data::{cents_to_f64, parse_cents, Dataset};
 
 pub const HELDOUT_FROM: u32 = 19;
 
-pub const FIELDS: [&str; 10] = [
+pub const FIELDS: [&str; 11] = [
     "amount_safe_to_pay",
     "affordability_status",
     "recommended_payment_method",
@@ -23,6 +23,7 @@ pub const FIELDS: [&str; 10] = [
     "spending_changes_needed(unordered)",
     "decision_explanation(facts)",
     "all_scored_fields",
+    "amount_safe_to_pay(within_1%)",
 ];
 
 pub fn is_heldout(request_id: &str) -> bool {
@@ -118,6 +119,9 @@ fn compare(label: &OutputRow, got: &OutputRow, split: &mut SplitScore) {
             split.amount_rel_err.push(rel);
             hit(split, FIELDS[0], l == g, &label.amount_safe_to_pay, &got.amount_safe_to_pay,
                 format!("abs {abs:.2}, rel {:.4}%", rel * 100.0), true);
+            if rel <= 0.01 {
+                *split.matched.entry(FIELDS[10]).or_default() += 1;
+            }
         }
         _ => {
             split.amount_abs_err.push(f64::INFINITY);

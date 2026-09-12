@@ -28,6 +28,16 @@ pub const STATUSES: [&str; 4] =
 pub const METHODS: [&str; 5] =
     ["full_payment", "partial_payment", "installments", "wait", "not_recommended"];
 pub const HORIZON_DAYS: i64 = 90;
+
+/// Latest date a forecast may reach: the spec's 90 days or RULES.md S3.1's last day of
+/// month(rd)+2 (up to 91 days), whichever is later.
+pub fn horizon_end(rd: NaiveDate) -> NaiveDate {
+    use chrono::Datelike;
+    let months = rd.year() * 12 + rd.month0() as i32 + 3;
+    let first_after = NaiveDate::from_ymd_opt(months.div_euclid(12), months.rem_euclid(12) as u32 + 1, 1)
+        .expect("valid month");
+    (first_after - Duration::days(1)).max(rd + Duration::days(HORIZON_DAYS))
+}
 pub const MAX_CHANGES: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,7 +243,7 @@ pub fn check_row(ds: &Dataset, row: &OutputRow) -> Vec<Finding> {
     } else {
         match parse_date(&row.earliest_date_for_full_payment) {
             Ok(d) => {
-                let horizon = req.request_date + Duration::days(HORIZON_DAYS);
+                let horizon = horizon_end(req.request_date);
                 if d < req.request_date || d > horizon {
                     s.err("B4_earliest_window", format!("earliest {d} outside [{}, {horizon}]", req.request_date));
                 }

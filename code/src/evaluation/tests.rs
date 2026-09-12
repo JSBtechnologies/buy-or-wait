@@ -63,6 +63,16 @@ fn heldout_detail_hidden_by_default() {
 }
 
 #[test]
+fn horizon_end_covers_month_end_rule() {
+    use super::contract::horizon_end;
+    let d = |s: &str| super::data::parse_date(s).unwrap();
+    assert_eq!(horizon_end(d("2025-02-07")), d("2025-05-08")); // rd+90 later than 2025-04-30
+    assert_eq!(horizon_end(d("2026-03-01")), d("2026-05-31")); // month end later (91 days)
+    assert_eq!(horizon_end(d("2025-11-06")), d("2026-02-04")); // year wrap
+    assert_eq!(horizon_end(d("2024-12-01")), d("2025-03-01"));
+}
+
+#[test]
 fn scalar_rules() {
     let ds = samples();
     expect(&ds, "request_01", "B1_amount_range", |r| r.amount_safe_to_pay = "25256.01".into());
