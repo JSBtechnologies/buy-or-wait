@@ -236,6 +236,16 @@ mod tests {
                 let (x, y) = (sa.matched.get(f).copied().unwrap_or(0), sb.matched.get(f).copied().unwrap_or(0));
                 println!("DELTA {name:<8} {f:<38} {x:>2} -> {y:>2} ({:+})", y as i64 - x as i64);
             }
+            let stats = |v: &[f64]| {
+                let mut e: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+                e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mean = if e.is_empty() { f64::NAN } else { e.iter().sum::<f64>() / e.len() as f64 };
+                let median = e.get(e.len() / 2).copied().unwrap_or(f64::NAN);
+                let within5 = e.iter().filter(|x| **x <= 0.05).count();
+                (mean * 100.0, median * 100.0, within5)
+            };
+            let ((ma, da, wa), (mb, db, wb)) = (stats(&sa.amount_rel_err), stats(&sb.amount_rel_err));
+            println!("DELTA {name:<8} amount rel err mean {ma:.2}% -> {mb:.2}%, median {da:.2}% -> {db:.2}%, within5% {wa} -> {wb}");
         }
     }
 
