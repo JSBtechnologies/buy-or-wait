@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<ExitCode> {
             &invariants,
             dataset_dir,
             &model_ctx,
+            &processed_store,
         ) {
             Ok((row, Ok(warnings))) => {
                 for w in warnings {
@@ -232,6 +233,7 @@ fn decide_one(
     invariants: &Invariants,
     dataset_dir: &Path,
     model_ctx: &ModelContext,
+    processed_store: &ProcessedStore,
 ) -> anyhow::Result<(model::OutputRow, Result<Vec<Finding>, InvariantViolation>)> {
     let mut session = Session::from_model(&request.user_id, profiles, events, rates, Rules::default())?;
 
@@ -266,6 +268,7 @@ fn decide_one(
                 &image.image_id,
                 vlm_primary,
                 vlm_escalation,
+                model_ctx.config.vlm_fallback(),
                 &typed_event,
             ) {
                 Ok(Some(record)) => facts.push(record),
@@ -284,6 +287,7 @@ fn decide_one(
             prompt,
             &model_ctx.config.decoding,
             llm_primary,
+            model_ctx.config.llm_fallback(),
             &evidence.messages,
             &home_currency,
         ) {
@@ -292,6 +296,10 @@ fn decide_one(
         }
     }
 
+    // Blocker #177 (verifier): persist exactly what gets applied -- deterministic plus
+    // model-path records, after grounding -- so signoff can diff it against an independent
+    // regeneration. Runtime store only (code/store/, gitignored), never shipped.
+    processed_store.save("evidence", &request.request_id, &facts)?;
     session.apply_evidence(facts);
 
     let spec = RequestSpec::from_model(request);
