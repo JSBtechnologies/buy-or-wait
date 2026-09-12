@@ -56,6 +56,7 @@ mod tests {
                 ("plan", r.payment_plan == s.payment_plan),
                 ("earliest", r.earliest_date_for_full_payment == exp_earliest),
                 ("changes", r.spending_changes_needed == s.spending_changes_needed),
+                ("explanation", r.decision_explanation == s.decision_explanation),
             ];
             for (k, ok) in checks { if ok { *hits.entry(k).or_default() += 1; } }
             let label = crate::engine::money::Money::from_f64(s.amount_safe_to_pay);

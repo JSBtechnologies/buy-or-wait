@@ -111,6 +111,10 @@ fn upper_first(s: &str) -> String {
 }
 
 fn lower_first(s: &str) -> String {
+    // Keep acronyms intact ("EV charging plan" stays "EV charging plan").
+    if s.chars().take(2).all(|ch| ch.is_uppercase()) {
+        return s.to_string();
+    }
     let mut c = s.chars();
     match c.next() {
         Some(first) => first.to_lowercase().collect::<String>() + c.as_str(),
