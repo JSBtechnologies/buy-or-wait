@@ -158,6 +158,12 @@ struct Args {
     /// VLM candidate. For a top-up run of already-screened finalists at
     /// their already-chosen resolution (no need to re-derive it).
     fixed_resolution: Option<u32>,
+    /// `--rescore-from-cache true`: read VLM image-call responses from the
+    /// existing disk cache instead of calling the router — zero new calls.
+    /// For re-running select()/reconciles() (e.g. after extraction ships a
+    /// selector fix) against already-obtained model outputs. Requires the
+    /// same `--cache-dir` used for the original run.
+    rescore_from_cache: bool,
 }
 
 fn parse_args() -> Args {
@@ -180,6 +186,7 @@ fn parse_args() -> Args {
         cache_dir: PathBuf::from(get("cache-dir", "store/bakeoff_cache")),
         runs: get("runs", "5").parse().unwrap_or(5),
         fixed_resolution: map.get("fixed-resolution").and_then(|v| v.parse().ok()),
+        rescore_from_cache: get("rescore-from-cache", "false") == "true",
     }
 }
 
@@ -550,6 +557,7 @@ fn image_call(
     cfg: &DecodingConfig,
     prompt: &PromptSet,
     image_b64: &str,
+    rescore_from_cache: bool,
 ) -> Result<(Option<Value>, Usage)> {
     let call = ModelCall {
         model_id: candidate.id.clone(),
@@ -569,7 +577,14 @@ fn image_call(
         max_tokens: cfg.max_tokens_vlm,
         json_response: candidate.supports_structured_output,
     };
-    let resp = client.chat_completion_cold(&call)?;
+    // Rescore mode (--rescore-from-cache): read the existing cache, never
+    // call the router. Used to re-run select()/reconciles() against
+    // already-obtained model outputs after a selector fix, at zero cost.
+    let resp = if rescore_from_cache {
+        client.chat_completion(&call)?
+    } else {
+        client.chat_completion_cold(&call)?
+    };
     let parsed = parse_json_loose(&resp.raw_text);
     Ok((parsed, resp.usage))
 }
@@ -580,6 +595,12 @@ fn image_call(
 /// block the run).
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
+/// Images where the analyst found a selector bug extraction is actively
+/// fixing (image_12 cash vs total, image_11 reconcile-on-the-breakup,
+/// image_07 rounding tolerance) — selected-figure/reconciliation verdicts on
+/// these may be pessimistic for every candidate until the fix ships.
+const KNOWN_SELECTOR_BUG_IMAGES: &[&str] = &["image_07", "image_11", "image_12"];
+
 fn run_vlm_candidate(
     client: &HfClient,
     candidate: &CandidateConfig,
@@ -589,6 +610,7 @@ fn run_vlm_candidate(
     prompt: &PromptSet,
     runs: u32,
     fixed_resolution: Option<u32>,
+    rescore_from_cache: bool,
 ) -> Result<(VlmCandidateReport, HashMap<String, Vec<(String, Option<Value>)>>)> {
     let labeled: Vec<&GoldImage> = gold.images.iter().filter(|i| i.labeled).collect();
     let mut unlabeled_first_run: HashMap<String, Vec<(String, Option<Value>)>> = HashMap::new();
@@ -610,7 +632,7 @@ fn run_vlm_candidate(
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, max_dim)?;
-            let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
+            let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
             let parsed = match outcome {
                 Ok((parsed, _usage)) => {
                     consecutive_failures = 0;
@@ -659,9 +681,10 @@ fn run_vlm_candidate(
         consecutive_failures = 0;
         'runs: for run_idx in 0..runs {
             for img in &gold.images {
+                eprintln!("  [{}] run {}/{runs}: calling {} ...", candidate.id, run_idx + 1, img.image_id);
                 let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
                 let b64 = downscale_and_encode(&path, chosen_max_dim)?;
-                let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
+                let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
                 let parsed = match outcome {
                     Ok((parsed, usage)) => {
                         consecutive_failures = 0;
@@ -1012,6 +1035,10 @@ fn render_vlm_section(
     s.push_str(
         "**Selected-figure metrics** (lead directive #2: the one amount the engine's deterministic selector would hand the engine matters more than raw all-field JSON identity, and instability in fields the selector never reads doesn't matter). Computed using **production's own selector code**, `buyorwait::extract::images::{select, reconciles}` — not a bake-off reimplementation — fed gold's `event_context` per image:\n\n",
     );
+    s.push_str(&format!(
+        "\n**Caveat (lead, {}):** extraction is currently fixing 3 selector bugs the analyst found (image_12 cash vs total, image_11 reconcile-on-the-breakup, image_07 rounding tolerance). The selected-figure numbers below may be pessimistic on those 3 images **for every candidate** — a wrong `correct`/`reconciles` verdict on those rows reflects the selector, not necessarily the VLM's transcription. Flagged with ⚠ below. Once extraction publishes the fix, rescore with `--rescore-from-cache true` against the same `--cache-dir` (zero new router calls) rather than re-running.\n\n",
+        KNOWN_SELECTOR_BUG_IMAGES.join(", ")
+    ));
     s.push_str("| Model | Selected-figure accuracy | Selected-figure stability (same amount every run) | Reconciliation pass rate |\n");
     s.push_str("|---|---|---|---|\n");
     for r in vlm {
@@ -1049,8 +1076,13 @@ fn render_vlm_section(
                 .iter()
                 .map(|v| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "null".to_string()))
                 .collect();
+            let flag = if KNOWN_SELECTOR_BUG_IMAGES.contains(&pr.image_id.as_str()) {
+                " ⚠ known selector bug, being fixed"
+            } else {
+                ""
+            };
             s.push_str(&format!(
-                "| {} | {} | {:.2} | {} | {} | {} | {:.0}% |\n",
+                "| {}{flag} | {} | {:.2} | {} | {} | {} | {:.0}% |\n",
                 pr.image_id,
                 pr.expected_field,
                 pr.expected_amount,
@@ -1233,7 +1265,17 @@ fn main() -> Result<()> {
                 .map(|candidate| {
                     scope.spawn(|| {
                         eprintln!("=== VLM candidate: {} ({}) ===", candidate.id, candidate.provider);
-                        run_vlm_candidate(&client, candidate, &cfg, &gold, &args.dataset_dir, &image_prompt, args.runs, args.fixed_resolution)
+                        run_vlm_candidate(
+                            &client,
+                            candidate,
+                            &cfg,
+                            &gold,
+                            &args.dataset_dir,
+                            &image_prompt,
+                            args.runs,
+                            args.fixed_resolution,
+                            args.rescore_from_cache,
+                        )
                     })
                 })
                 .collect();

@@ -131,6 +131,13 @@ impl HfClient {
             // instead (`is_timeout()`, handled in `call_once`).
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(90))
+            // Observed multi-minute hangs with near-zero CPU (i.e. blocked
+            // on I/O, past the configured timeout) during bake-off runs —
+            // consistent with a pooled keep-alive connection that went
+            // stale server-side without the client detecting it. Disabling
+            // idle-connection reuse forces a fresh connection per request,
+            // which the connect/request timeouts above do reliably bound.
+            .pool_max_idle_per_host(0)
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
@@ -161,6 +168,7 @@ impl HfClient {
         self.http = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs((secs / 4).max(5)))
             .timeout(Duration::from_secs(secs))
+            .pool_max_idle_per_host(0)
             .build()
             .context("failed to rebuild HTTP client with custom timeout")?;
         Ok(self)
