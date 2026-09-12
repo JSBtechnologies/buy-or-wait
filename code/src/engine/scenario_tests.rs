@@ -43,6 +43,11 @@ fn fx_one_conversion_per_pair() {
     // Home currency passes through; a missing pair is not guessed.
     assert_eq!(conv(10.0, "INR", "INR"), Money::from_units(10));
     assert_eq!(to_home(Money::from_units(1), "ZAR", "IDR", day, &r), None);
+    // A projected date without a row uses the latest earlier row for the pair; no earlier row
+    // means no conversion.
+    let later = d("2024-10-15");
+    assert_eq!(to_home(Money::from_units(10), "EUR", "ZAR", later, &r), Some(Money::from_units(200)));
+    assert_eq!(to_home(Money::from_units(10), "EUR", "ZAR", d("2024-09-14"), &r), None);
 }
 
 fn ev(id: u32, ty: EventType, desc: &str, cat: &str, dir: Direction, amt: f64, date: &str, status: Status) -> Event {
@@ -91,8 +96,21 @@ fn shifted_scheduled_salary_replaces_that_months_occurrence() {
     events.push(ev(9, EventType::Income, "Next confirmed salary", "salary", Credit, 124000.0, "2025-08-23", Status::Scheduled));
     let f = forecast_for(&events, "2025-08-05");
     let salary: Vec<NaiveDate> = f.flows.iter().filter(|x| x.category == "salary").map(|x| x.date).collect();
-    // August once (the scheduled row on the 23rd), then the stream continues monthly.
-    assert_eq!(salary, vec![d("2025-08-23"), d("2025-09-15"), d("2025-10-15")]);
+    // August once (the scheduled row on the 23rd); later months re-anchor to the 23rd (S3.4(c)).
+    assert_eq!(salary, vec![d("2025-08-23"), d("2025-09-23"), d("2025-10-23")]);
+}
+
+#[test]
+fn scheduled_bill_settling_days_off_replaces_the_stream_occurrence() {
+    use Direction::*;
+    // verifier#65 (requests 44/104/164/224): stream on the 5th, scheduled debit settles the 11th.
+    let mut events = history(EventType::Expense, "Municipal utilities", "utilities", Debit, 4830.0, 5, 1);
+    let mut s = ev(9, EventType::Expense, "Scheduled utility debit", "utilities", Debit, 4830.0, "2025-08-04", Status::Scheduled);
+    s.settlement_date = Some(d("2025-08-11"));
+    events.push(s);
+    let f = forecast_for(&events, "2025-08-04");
+    let util: Vec<NaiveDate> = f.flows.iter().filter(|x| x.category == "utilities").map(|x| x.date).collect();
+    assert_eq!(util, vec![d("2025-08-11"), d("2025-09-05"), d("2025-10-05")]);
 }
 
 #[test]

@@ -211,8 +211,15 @@ impl RateTable {
 }
 
 impl RateProvider for RateTable {
+    /// The row for `date` in the stated direction; for a date with no row (projected
+    /// occurrences), the latest row on or before it for the same pair (RULES S2.2).
     fn rate(&self, date: NaiveDate, from: &str, to: &str) -> Option<DecimalRate> {
-        self.rates.get(&(date, from.to_string(), to.to_string())).copied()
+        let pair_matches = |k: &(NaiveDate, String, String)| k.1 == from && k.2 == to;
+        self.rates
+            .range(..=(date, from.to_string(), to.to_string()))
+            .rev()
+            .find(|(k, _)| pair_matches(k))
+            .map(|(_, r)| *r)
     }
 }
 

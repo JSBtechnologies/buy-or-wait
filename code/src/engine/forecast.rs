@@ -144,16 +144,20 @@ impl Forecast {
         for stream in &inp.streams.streams {
             let Some(amount) = changed_amount(stream, changes, rules) else { continue };
             let mut dates = stream.dates_between(start, end);
-            // A scheduled row replaces its calendar month's occurrence of a monthly stream with
-            // the same category and direction, even on a shifted day (verifier#45).
-            if rules.scheduled_replaces_month_occurrence && matches!(stream.cadence, Cadence::Monthly { .. }) {
+            // RULES S3.4(c): a scheduled row replaces the projected occurrence of a monthly
+            // stream with the same category and direction within the window (verifier#45).
+            if matches!(stream.cadence, Cadence::Monthly { .. }) {
                 dates.retain(|d| {
                     !scheduled.iter().any(|e| {
                         e.event.category == stream.category
                             && e.event.direction == stream.direction
-                            && (e.cash_date.year(), e.cash_date.month()) == (d.year(), d.month())
+                            && (e.cash_date - *d).num_days().abs() <= rules.scheduled_replacement_window_days
                     })
                 });
+            }
+            // RULES S3.2: interval (variable-spend) occurrences on rd or rd+1 are skipped.
+            if stream.kind == StreamKind::VariableSpend {
+                dates.retain(|d| (*d - start).num_days() >= rules.variable_skip_days);
             }
             for d in dates {
                 flows.push(Flow {
