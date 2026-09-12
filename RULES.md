@@ -7,6 +7,35 @@ Notation: `rd` = request_date, `due` = desired_completion_date, `req` = requeste
 
 ---
 
+## S0. Named rule toggles (for verifier A/B on held-out 19–25)
+
+Every tunable rule has a name. Engine should expose each as a config value. The **default** is what the tuning set supports. "Tuning effect" = what request_01–18 show when the alternative is used instead (outflow err = error relative to forecast outflow, §S3.6).
+
+| toggle | default | alternatives | tuning effect of alternative | section |
+|---|---|---|---|---|
+| `HORIZON` | `eom_plus_2` (last day of month(rd)+2) | `fixed_90`, `fixed_86` | `fixed_90`: E 16→13/18 (08, 12, 13 lose E; 05, 10 safe → 0). `fixed_86`: identical to default on 01–18 | S3.1 |
+| `SAME_DAY_ORDER` | `debits_first` | `credits_first` | request_18 safe 462 → 546 (+18%) | S2.3 |
+| `PAYMENT_TIMING` | `after_day_rows` | `before_credits` | rejects all 5 salary-day wait plans (03, 04, 08, 13, 18) | S3.5 |
+| `IV_SKIP_DAYS` | `2` (Interval occurrences on rd, rd+1 skipped) | `0` | 15 outflow −2.9% → −17.1%; 06 −7.6% → −21.1% and E wrong; 10 +5.5% → +4.4% | S3.2 |
+| `BILL_ESTIMATOR` | `mean_last3` | `max_last3`, `mid_all` ((min+max)/2), `mean_all` | `mid_all` marginally better sum of abs outflow err (0.338 vs 0.352), same E; `max_last3` worse (08 −52%, 13 −99% when combined with max var) | S3.3 |
+| `VAR_ESTIMATOR` | `mean_all` | `median_all`, `max_last4` | `max_last4` closes 05 (−0.3%) and 10 (−0.4%) but breaks 06 −21%, 08 −29%, 13 −20% | S3.3 |
+| `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only) | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
+| `SCHEDULED_REPLACES_CYCLE` | `on` (±15 days, salary re-anchors day) | `off` | no tuning row exercises it (request_86, 44/104/164/224 in eval) | S3.4c |
+| `SEEDED_SALARY_STREAM` | `on` | `off` | request_01 safe 25,256 (cap) → 3,973 | S3.4b |
+| `FINAL_PAYROLL_STOPS_INCOME` | `on` | `off` | request_05 safe 737-label → capped ≫ label | S3.4a |
+| `COMMISSION_NEVER_STREAM` | `on` | `off` | request_11 E moves earlier (already 06-15 vs label 07-15) | S3.4 |
+| `MSG_SALARY_CONFLICT` | `settled_history` (user_11 keeps 23,256,000) | `message_amount` (38,760,000) | safe unchanged; E moves earlier, further from label | S5 |
+| `EXCLUDE_IMAGE_BULK_ONEOFF` | `on` (image_03 row out of groceries estimator) | `off` | request_17 −0.3% → −1.3% | S5 |
+| `INSTALLMENT_LIMIT` | `n_payments` (n ≤ max_installment_months) | `ceil_months` (ceil(n·freq/30) ≤ max) | identical on 01–18 | S1.1 |
+| `CHANGE_CANDIDATES` | `full_and_installments` (lead decision rules#24) | `all_methods` | identical on 01–18 (06, 11 are full-now) | S1.2 |
+| `CHANGE_PREFERENCE` | `fewest_changes` (lead rules#37) | `smallest_cut` | identical on 01–18 | S1.3 |
+| `NOT_REC_TEMPLATE` | `B_iff_partial_only` | `always_A` | request_14 text wrong under `always_A` | S1.6 |
+| `AFFORDABLE_NOW_TEMPLATE` | `leaves_at_least` | `keeps_minimum` | 01, 16 vs 09 (one variant each way; text-only) | S1.6 |
+
+**Estimator residuals 05 / 10 (lead request):** both are no-income users whose low point is the horizon end, so the residual is the whole-horizon spending estimate: 05 is +1.0% of outflow (engine spends 330 too little over 12 grocery + 6 transport + 9 bill occurrences), 10 is +5.5% (28,349 too little). A full grid over {mean, median, mid, p60, p75, max} × {last 3/4/6/8/10/13, all} for bills and variable spend separately: no setting cuts 05 and 10 without making other samples worse (best for 05+10 is `VAR_ESTIMATOR=max_last4`, which costs 06/08/13 20–29%). The per-stream spread of amounts is ~15%, so a 26-sample mean has ~3% standard error and a sum of ~6 streams ~2%. 05 is inside that noise; 10 is ~2–3σ. Verdict: **not closable from history without overfitting**; keep defaults. `VAR_HORIZON=rd_plus_90` is the only structural alternative that moves 10 toward the label (+3.4%) and it overshoots 05 (−2.3%); leave it as an A/B toggle. Also ruled out for 05: counting the failed 389.40 utility debit as a retry (spec says ignore failed rows; it would overshoot to −0.2% outflow, safe 677.65).
+
+---
+
 ## S2. Ledger: cash rules by status, linked chains, FX [EXACT unless tagged]
 
 `B0` (current_available_balance) already contains every **settled** row dated before `rd`. The forecast never re-applies history; history is used only to detect streams (§S3) and estimate amounts.
@@ -94,6 +123,7 @@ for each group:
 Worked: user_01 groceries 26 rows, 7 descriptions, gaps all 7 → Interval(7), last 2024-03-01 → 03-08, 03-15 …; user_03 rent "Landlord standing order" gaps 30/31 → Monthly(4) → 2019-09-04, 10-04, 11-04.
 - Minimum occurrences: 2, 3 or 4 give identical results on 01–18 (every real stream has ≥5 rows). Use 3.
 - Projected occurrences are included only if `rd <= date <= horizon_end`.
+- **Interval (variable-spend) streams skip occurrences dated `rd` or `rd+1`**: first counted occurrence is ≥ rd+2. Monthly bills are NOT skipped (a bill due on rd counts: user_18 utilities 2026-07-07; skipping monthly bills breaks 08 and 18 by ~+20%). [FIT] Evidence: user_15 (groceries on rd 2026-01-06, transport 01-07) outflow err −17.1% → −2.9%; user_06 (transport on rd 2026-01-03, dining 01-04) −21.1% → −7.6% and E becomes 2026-01-15 ✓; user_10 (transport on rd) +4.4% → +5.5%; no other tuning row has an Interval occurrence in that window. Skip windows of 2, 3 or 4 days give identical results; 5+ breaks 02/04/08/18.
 
 ### S3.3 Amount estimators [FIT]
 
@@ -168,26 +198,30 @@ Unification: `safe = headroom_from(rd)` with the same formula as E. No tuning ro
 
 ### S3.6 Scoreboard for this spec (request_01–18; relative error of safe, E match)
 
-| req | safe rel err | E | open issue |
-|---|---|---|---|
-| 01 | 0 (cap) | ✓ | |
-| 02 | −0.7% | ✓ | |
-| 03 | +11.9% | ✓ | max3 fits better here (−0.06%) |
-| 04 | +8.7% | ✓ | |
-| 05 | +44.8% | ✓ | no-income; outflow short |
-| 06 | −18.8% | ✗ (02-15 vs 01-15) | trough composition unresolved |
-| 07 | −0.8% | ✓ | |
-| 08 | +0.2% | ✓ | |
-| 09 | 0 (cap) | ✓ | |
-| 10 | +176% | ✓ | gig income handling unresolved |
-| 11 | −0.9% | ✗ (06-15 vs 07-15) | |
-| 12 | 0 (cap) | ✓ | |
-| 13 | +5.9% | ✓ | |
-| 14 | +3.3% | ✓ | childcare payment amount unknown (message_10) |
-| 15 | −100% | ✓ | trough composition unresolved |
-| 16 | 0 (cap) | ✓ | |
-| 17 | −0.3% | ✗ (04-15 vs 03-15) | |
-| 18 | −1.6% | ✓ | |
+Includes the §S3.2 rd/rd+1 variable-occurrence skip. "outflow err" = (safe − label) / (B0 − M − label), i.e. error relative to the forecast outflow up to the trough — the fair measure when the label is small.
+
+| req | engine safe | label | safe rel err | outflow err | E | label E | |
+|---|---|---|---|---|---|---|---|
+| 01 | 25,256 | 25,256 | 0 (cap) | – | 2024-03-03 | 2024-03-03 | ✓ |
+| 02 | 17,104,848.03 | 17,229,139.2 | −0.7% | −0.9% | 2025-09-15 | 2025-09-15 | ✓ |
+| 03 | 976,940.56 | 873,000 | +11.9% | +4.6% | 2019-11-15 | 2019-11-15 | ✓ |
+| 04 | 9,136,873.47 | 8,401,800 | +8.7% | +5.6% | 2024-06-15 | 2024-06-15 | ✓ |
+| 05 | 1,067.05 | 737 | +44.8% | +1.0% | – | – | ✓ |
+| 06 | 562.48 | 603.3 | −6.8% | −7.6% | 2026-01-15 | 2026-01-15 | ✓ |
+| 07 | 86,467.24 | 87,170.56 | −0.8% | −1.8% | 2024-10-23 | 2024-10-23 | ✓ |
+| 08 | 285.20 | 284.57 | +0.2% | +0.1% | 2025-04-15 | 2025-04-15 | ✓ |
+| 09 | 166.61 | 166.61 | 0 (cap) | – | 2026-07-04 | 2026-07-04 | ✓ |
+| 10 | 41,049.28 | 12,700 | +223% | +5.5% | – | – | ✓ |
+| 11 | 12,397,499.67 | 12,510,645 | −0.9% | −0.7% | 2025-06-15 | 2025-07-15 | ✗ |
+| 12 | 65,164 | 65,164 | 0 (cap) | – | 2026-04-05 | 2026-04-05 | ✓ |
+| 13 | 459.10 | 433.40 | +5.9% | +2.4% | 2024-05-15 | 2024-05-15 | ✓ |
+| 14 | 617.34 | 597.74 | +3.3% | +1.7% | – | – | ✓ |
+| 15 | 69.04 | 83.05 | −16.9% | −2.9% | – | – | ✓ |
+| 16 | 122,500 | 122,500 | 0 (cap) | – | 2023-08-12 | 2023-08-12 | ✓ |
+| 17 | 243,001.82 | 243,849.58 | −0.3% | −0.6% | 2026-04-15 | 2026-03-15 | ✗ |
+| 18 | 454.67 | 462 | −1.6% | −1.2% | 2026-09-15 | 2026-09-15 | ✓ |
+
+E exact 16/18; every outflow within ±8%, 12/14 uncapped within ±5%. Status of the lead's open list: **05** closed (structure right: final payroll + horizon; 1% estimator residual), **10** closed structurally (no gig income: message_07 payout pending; counting any payout moves it further from the label; 5.5% estimator residual), **15** closed (rd/rd+1 skip: −17% → −2.9% outflow), **06** mostly (−21% → −7.6% outflow; E now ✓). Remaining misses (03, 04 ~+5%, 11/17 E) are estimator noise against hidden base amounts.
 
 ---
 
