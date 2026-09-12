@@ -31,6 +31,7 @@ mod tests {
         events: Vec<model::FinancialEvent>,
         rates: Arc<RateTable>,
         options: Vec<model::RequestPaymentOption>,
+        messages: Vec<model::Message>,
     }
 
     struct Req {
@@ -54,6 +55,7 @@ mod tests {
             events: model::load_financial_events(d.join("financial_events.csv")).unwrap(),
             rates: Arc::new(RateTable::from_model(&model::load_exchange_rates(d.join("exchange_rates.csv")).unwrap())),
             options: model::load_request_payment_options(d.join("request_payment_options.csv")).unwrap(),
+            messages: model::load_messages(d.join("messages.csv")).unwrap(),
         }
     }
 
@@ -123,9 +125,25 @@ mod tests {
         session_with(inp, user, Rules::default())
     }
 
+    /// The batch pipeline's evidence for one request (main.rs decide_one): retrieval by user and
+    /// request date, then the deterministic skeleton parser. Used unless VERIFIER_EVIDENCE=store.
+    fn pipeline_evidence(inp: &Inputs, user: &str, rd: NaiveDate) -> Vec<EvidenceRecord> {
+        let home = inp.profiles.iter().find(|p| p.user_id == user).map(|p| p.home_currency.clone()).unwrap_or_default();
+        let ev = crate::extract::retrieval::for_user(user, rd, &inp.messages, &[]);
+        crate::extract::messages::deterministic_evidence(&ev.messages, &home)
+    }
+
     fn session_with(inp: &Inputs, user: &str, rules: Rules) -> anyhow::Result<Session> {
+        session_for(inp, user, None, rules)
+    }
+
+    fn session_for(inp: &Inputs, user: &str, rd: Option<NaiveDate>, rules: Rules) -> anyhow::Result<Session> {
         let mut s = Session::from_model(user, &inp.profiles, &inp.events, inp.rates.clone(), rules)?;
-        let ev = evidence(user);
+        let use_store = std::env::var("VERIFIER_EVIDENCE").map(|v| v == "store").unwrap_or(false);
+        let ev = match rd {
+            Some(rd) if !use_store && std::env::var("VERIFIER_NO_EVIDENCE").is_err() => pipeline_evidence(inp, user, rd),
+            _ => evidence(user),
+        };
         if !ev.is_empty() {
             s.apply_evidence(ev);
         }
@@ -137,7 +155,7 @@ mod tests {
     }
 
     fn decide_with(inp: &Inputs, r: &Req, rules: Rules) -> anyhow::Result<Decision> {
-        let session = session_with(inp, &r.user, rules)?;
+        let session = session_for(inp, &r.user, Some(r.date), rules)?;
         let opts = inp
             .options
             .iter()
@@ -234,6 +252,11 @@ mod tests {
             };
             let (b, bl, wc, wl) = (d.baseline_series(), d.baseline_low_series(), d.with_changes_series(), d.with_changes_low_series());
             let fc = ForecastSeries { start: r.date, minimum: d.minimum_f64(), baseline: &b, baseline_low: Some(&bl), with_changes: wc.as_deref(), with_changes_low: wl.as_deref() };
+            if std::env::var("VERIFIER_ONLY").map(|o| o == r.id).unwrap_or(false) {
+                let head = crate::evaluation::replay::headroom_from(&b, &bl, d.minimum_f64());
+                let trough = bl.iter().cloned().fold(f64::INFINITY, f64::min);
+                println!("DETAIL {} min_low_headroom={:.2} headroom_today={:.2} requested={}", r.id, trough - d.minimum_f64(), head[0], r.amount);
+            }
             match inv.assert_row(&d.row, &fc) {
                 Ok(w) => {
                     ok += 1;
@@ -316,11 +339,23 @@ mod tests {
         let root = std::env::var("VERIFIER_EVIDENCE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("store/evidence"));
-        if !root.exists() {
-            println!("no evidence dir at {}", root.display());
-            return;
+        std::fs::create_dir_all(&root).ok();
+        let mut findings = crate::evaluation::evidence_audit::audit_dir(&dir(), &root, crate::engine::money::SCALE).unwrap();
+        // Also audit every fact the batch pipeline applies, for all eval and sample requests.
+        let inp = inputs();
+        let ds_eval = Dataset::load(&dir(), &dir().join("requests.csv")).unwrap();
+        let ds_samp = Dataset::load(&dir(), &dir().join("sample_requests.csv")).unwrap();
+        let msgs = crate::evaluation::evidence_audit::load_messages(&dir()).unwrap();
+        let mut applied = 0;
+        for r in eval_requests().into_iter().chain(samples()) {
+            let recs = pipeline_evidence(&inp, &r.user, r.date);
+            applied += recs.len();
+            let json = serde_json::to_value(&recs).unwrap();
+            let n: u32 = r.id.rsplit('_').next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let ds = if n >= 26 { &ds_eval } else { &ds_samp };
+            findings.extend(crate::evaluation::evidence_audit::audit_records(ds, &msgs, &r.user, &json, crate::engine::money::SCALE));
         }
-        let findings = crate::evaluation::evidence_audit::audit_dir(&dir(), &root, crate::engine::money::SCALE).unwrap();
+        println!("pipeline evidence records audited: {applied}");
         for f in &findings {
             println!("EVIDENCE {f}");
         }
