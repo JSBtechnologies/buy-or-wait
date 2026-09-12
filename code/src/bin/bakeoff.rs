@@ -1,7 +1,7 @@
 //! Model bake-off harness (owner: ml-engineer). PLAN.md §3 / Phase 2d.
 //!
-//! Runs every VLM candidate against `docs/gold_subset.json` images (5 labeled
-//! + 11 unlabeled), sweeping image resolution to find the smallest size that
+//! Runs every VLM candidate against `docs/gold_subset.json` images (labeled +
+//! unlabeled counts come from the file itself), sweeping image resolution to find the smallest size that
 //! keeps gold accuracy, then runs the chosen resolution 5x for a stability
 //! rate. Runs every LLM candidate against the gold messages (all labeled)
 //! 5x. Reports valid-JSON rate, field accuracy vs gold, cross-model
@@ -767,7 +767,7 @@ fn render_intro(runs: u32) -> String {
     let mut s = String::new();
     s.push_str("## Step 3 — Bake-off run (results)\n\n");
     s.push_str(&format!(
-        "Each candidate run {runs}x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as corrected in `3df3082` (message_10 -> `salary_first_confirmed`). Nothing here is a pick — the user chooses.\n\n"
+        "Each candidate run {runs}x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as of `3f1c26a` (message_10 corrected to `salary_first_confirmed` in `3df3082`; image_10/image_11 gold added in `3f1c26a`, 7 labeled + 9 unlabeled images). Nothing here is a pick — the user chooses.\n\n"
     ));
     s.push_str(
         "**Production weight note (from the lead):** extraction's deterministic parser now covers 214/215 messages; the LLM is called for exactly 1 message (`msg_86`) in production, while the VLM is called for all 16 images. Weight the VLM table far more heavily than the LLM table when choosing — the VLM choice is the one that matters at scale.\n\n",
@@ -775,10 +775,16 @@ fn render_intro(runs: u32) -> String {
     s
 }
 
-fn render_vlm_section(vlm: &[VlmCandidateReport], agreement: f64, runs: u32) -> String {
+fn render_vlm_section(
+    vlm: &[VlmCandidateReport],
+    agreement: f64,
+    runs: u32,
+    labeled_count: usize,
+    unlabeled_count: usize,
+) -> String {
     let mut s = String::new();
     s.push_str("### VLM candidates (image -> typed figure schema)\n\n");
-    s.push_str(&format!("| Model | Provider | Chosen res. (px) | Field accuracy vs gold (5 labeled) | Valid-JSON rate | Stability ({runs} runs, 16 images) | Cross-model agreement (11 unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run (16 images) |\n"));
+    s.push_str(&format!("| Model | Provider | Chosen res. (px) | Field accuracy vs gold ({labeled_count} labeled) | Valid-JSON rate | Stability ({runs} runs, {} images) | Cross-model agreement ({unlabeled_count} unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run ({} images) |\n", labeled_count + unlabeled_count, FULL_RUN_IMAGES));
     s.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for r in vlm {
         if r.unavailable {
@@ -999,7 +1005,9 @@ fn main() -> Result<()> {
     let agreement = cross_model_agreement(&unlabeled_first_run);
 
     let section_intro = render_intro(args.runs);
-    let vlm_section = render_vlm_section(&vlm_reports, agreement, args.runs);
+    let labeled_count = gold.images.iter().filter(|i| i.labeled).count();
+    let unlabeled_count = gold.images.iter().filter(|i| !i.labeled).count();
+    let vlm_section = render_vlm_section(&vlm_reports, agreement, args.runs, labeled_count, unlabeled_count);
     splice_into_bakeoff_md(&args.out, &format!("{section_intro}{vlm_section}"))?;
     eprintln!("bake-off: VLM table written into {} (LLM section running next)", args.out.display());
 
