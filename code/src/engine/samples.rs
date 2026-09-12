@@ -175,3 +175,42 @@ mod residuals {
 fn patched_rules() -> crate::engine::Rules {
     serde_json::from_str(&std::env::var("RULES_PATCH").unwrap_or_else(|_| "{}".into())).expect("RULES_PATCH json")
 }
+
+#[cfg(test)]
+mod explanations {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::patched_rules;
+    use crate::engine::{session::Session, types::*};
+    use crate::model;
+
+    /// Dump every evaluation explanation with its row fields to `$EXPLAIN_OUT` (TSV).
+    #[test]
+    #[ignore]
+    fn dump_explanations() {
+        let ds = Path::new("../dataset");
+        let profiles = model::load_financial_profiles(ds.join("financial_profiles.csv")).unwrap();
+        let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
+        let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
+        let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
+        let messages = model::load_messages(ds.join("messages.csv")).unwrap();
+        let mut out = String::new();
+        for r in model::load_requests(ds.join("requests.csv")).unwrap() {
+            let mut session = Session::from_model(&r.user_id, &profiles, &events, rates.clone(), patched_rules()).unwrap();
+            let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == r.user_id && m.sent_at.date_naive() <= r.request_date).collect();
+            let home = session.profile().home_currency.clone();
+            session.apply_evidence(crate::extract::messages::deterministic_evidence(&msgs, &home));
+            let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == r.request_id).map(|o| PaymentOption::from_model(o).unwrap()).collect();
+            let d = session.decide(&r.request_id, r.request_date, &RequestSpec::from_model(&r), &opts).unwrap();
+            let f = &d.facts;
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\tdue={}\tmethods={:?}\tpartial={}\t{}\n",
+                r.request_id, d.row.affordability_status, d.row.recommended_payment_method, d.row.amount_safe_to_pay,
+                d.row.earliest_date_for_full_payment, f.desired_completion_date, f.accepted_methods, f.allows_partial_payment,
+                d.row.decision_explanation
+            ));
+        }
+        std::fs::write(std::env::var("EXPLAIN_OUT").unwrap_or_else(|_| "explanations.tsv".into()), out).unwrap();
+    }
+}
