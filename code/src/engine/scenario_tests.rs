@@ -43,6 +43,11 @@ fn fx_one_conversion_per_pair() {
     // Home currency passes through; a missing pair is not guessed.
     assert_eq!(conv(10.0, "INR", "INR"), Money::from_units(10));
     assert_eq!(to_home(Money::from_units(1), "ZAR", "IDR", day, &r), None);
+    // A projected date without a row uses the latest earlier row for the pair; no earlier row
+    // means no conversion.
+    let later = d("2024-10-15");
+    assert_eq!(to_home(Money::from_units(10), "EUR", "ZAR", later, &r), Some(Money::from_units(200)));
+    assert_eq!(to_home(Money::from_units(10), "EUR", "ZAR", d("2024-09-14"), &r), None);
 }
 
 fn ev(id: u32, ty: EventType, desc: &str, cat: &str, dir: Direction, amt: f64, date: &str, status: Status) -> Event {
