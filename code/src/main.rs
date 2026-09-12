@@ -5,11 +5,14 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use buyorwait::engine::session::Session;
-use buyorwait::engine::types::{PaymentOption, RateTable, RequestSpec};
+use buyorwait::engine::types::{Event, PaymentOption, RateTable, RequestSpec};
 use buyorwait::engine::Rules;
 use buyorwait::evaluation::{Finding, ForecastSeries, InvariantViolation, Invariants};
-use buyorwait::extract::{messages::deterministic_evidence, retrieval};
-use buyorwait::hf;
+use buyorwait::extract::messages::{deterministic_evidence, llm_evidence};
+use buyorwait::extract::model_config::ModelsConfig;
+use buyorwait::extract::prompts::{self, PromptSet};
+use buyorwait::extract::{images, retrieval};
+use buyorwait::hf::{self, HfClient};
 use buyorwait::model;
 use buyorwait::store::cache::DiskCache;
 use buyorwait::store::processed::ProcessedStore;
@@ -86,10 +89,53 @@ fn main() -> anyhow::Result<ExitCode> {
     };
     processed_store.save("_meta", "last_run", &serde_json::json!({ "cold": cold }))?;
 
-    // TODO(extraction/ml-engineer): once the bake-off picks a VLM/LLM, run image and
-    // free-text message extraction through `model_cache` here too. For now every request
-    // is decided from the ledger plus `extract::messages::deterministic_evidence` (the
-    // zero-token skeleton parser) only -- the baseline build has no model calls.
+    // Which models (if any) to call live this run. With `[selected]` absent from
+    // config/models.toml (the state before the user picks, PLAN.md Phase 2d),
+    // vlm_primary()/llm_primary() are both None and the whole model path below stays
+    // inactive -- this run is then behaviorally identical to the deterministic-evidence-only
+    // baseline (PLAN.md Phase 3: byte-identical output is required either way).
+    let models_config = ModelsConfig::load(Path::new("config/models.toml"))?;
+    let use_models = models_config.vlm_primary().is_some() || models_config.llm_primary().is_some();
+
+    // ml-engineer's HfClient owns the actual HF router calls and their own on-disk cache
+    // (PLAN.md §2.11); `--cold` wipes it the same way as `store/cache` and `store/processed`
+    // above, so a cold run never reads a prior run's cached responses, and a later warm
+    // rerun reuses whatever this run writes (determinism + cache-hit-rate check, §3 Phase 3).
+    // Only constructed when a model is actually selected, so HF_TOKEN is never required to
+    // run the baseline.
+    let model_cache_dir = store_root.join("model_cache");
+    if cold && model_cache_dir.exists() {
+        std::fs::remove_dir_all(&model_cache_dir)?;
+    }
+    let hf_client: Option<HfClient> = if use_models {
+        match HfClient::with_cache_dir(&model_cache_dir) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                eprintln!("model selected in config/models.toml but no live calls this run ({e:#})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let image_prompt = if models_config.vlm_primary().is_some() && hf_client.is_some() {
+        Some(prompts::load(Path::new("prompts/image_transcription.v1.md"), "User prompt template")?)
+    } else {
+        None
+    };
+    let message_prompt = if models_config.llm_primary().is_some() && hf_client.is_some() {
+        Some(prompts::load(Path::new("prompts/message_extraction.v1.md"), "User prompt template")?)
+    } else {
+        None
+    };
+    let model_ctx = ModelContext {
+        config: &models_config,
+        client: hf_client.as_ref(),
+        cold,
+        image_prompt: image_prompt.as_ref(),
+        message_prompt: message_prompt.as_ref(),
+    };
+
     let rates = Arc::new(RateTable::from_model(&rates));
     let invariants = Invariants::load(dataset_dir, &requests_path)?;
 
@@ -102,9 +148,12 @@ fn main() -> anyhow::Result<ExitCode> {
             &profiles,
             &events,
             &messages,
+            &images,
             &payment_options,
             rates.clone(),
             &invariants,
+            dataset_dir,
+            &model_ctx,
         ) {
             Ok((row, Ok(warnings))) => {
                 for w in warnings {
@@ -138,11 +187,11 @@ fn main() -> anyhow::Result<ExitCode> {
     }
     writer.flush()?;
 
-    // No model calls in this baseline build (deterministic evidence only), so the usage
-    // records are empty; `write_usage_report` still renders every required section with
+    // Every call `hf_client` made this run (empty until extraction wires a live call site
+    // into `decide_one`); `write_usage_report` still renders every required section with
     // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
     let pricing = load_pricing(Path::new("config/models.toml"))?;
-    let usage_records: Vec<hf::Usage> = Vec::new();
+    let usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
     hf::write_usage_report(
         Path::new("evaluation/usage_report.md"),
         &usage_records,
@@ -155,23 +204,94 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The model path's shared, load-once state (PLAN.md §2.11: one client, one prompt load
+/// per file, reused across every request). Every field stays `None` when no model is
+/// selected in `config/models.toml`, which keeps the whole model path inactive.
+struct ModelContext<'a> {
+    config: &'a ModelsConfig,
+    client: Option<&'a HfClient>,
+    cold: bool,
+    image_prompt: Option<&'a PromptSet>,
+    message_prompt: Option<&'a PromptSet>,
+}
+
 /// One user's session, bound and decided for one request (PLAN.md §2.5: one session per
 /// user, evidence and `decide` never take a user id). Evidence is the deterministic,
-/// zero-token skeleton parser only -- no model calls in this baseline build.
+/// zero-token skeleton parser, plus (only when `model_ctx` has a selected model) a VLM
+/// read for each of this user's blank-amount events and an LLM read for messages the
+/// skeleton parser doesn't recognize.
+#[allow(clippy::too_many_arguments)]
 fn decide_one(
     request: &model::Request,
     profiles: &[model::FinancialProfile],
     events: &[model::FinancialEvent],
     messages: &[model::Message],
+    images: &[model::Image],
     payment_options: &[model::RequestPaymentOption],
     rates: Arc<RateTable>,
     invariants: &Invariants,
+    dataset_dir: &Path,
+    model_ctx: &ModelContext,
 ) -> anyhow::Result<(model::OutputRow, Result<Vec<Finding>, InvariantViolation>)> {
     let mut session = Session::from_model(&request.user_id, profiles, events, rates, Rules::default())?;
 
     let evidence = retrieval::for_user(&request.user_id, request.request_date, messages, &[]);
     let home_currency = session.profile().home_currency.clone();
-    let facts = deterministic_evidence(&evidence.messages, &home_currency);
+    let mut facts = deterministic_evidence(&evidence.messages, &home_currency);
+
+    if let (Some(client), Some(prompt), Some(vlm_primary)) =
+        (model_ctx.client, model_ctx.image_prompt, model_ctx.config.vlm_primary())
+    {
+        let vlm_escalation = model_ctx.config.vlm_escalation();
+        let image_max_dim_px = model_ctx.config.image_max_dim_px();
+        for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
+            let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
+                continue;
+            };
+            let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+            let typed_event = match Event::from_model(event) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("vlm: skipping {}: {e:#}", event.event_id);
+                    continue;
+                }
+            };
+            match images::resolve_blank_amount(
+                client,
+                model_ctx.cold,
+                prompt,
+                &model_ctx.config.decoding,
+                image_max_dim_px,
+                &image_path,
+                &image.image_id,
+                vlm_primary,
+                vlm_escalation,
+                &typed_event,
+            ) {
+                Ok(Some(record)) => facts.push(record),
+                Ok(None) => {}
+                Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
+            }
+        }
+    }
+
+    if let (Some(client), Some(prompt), Some(llm_primary)) =
+        (model_ctx.client, model_ctx.message_prompt, model_ctx.config.llm_primary())
+    {
+        match llm_evidence(
+            client,
+            model_ctx.cold,
+            prompt,
+            &model_ctx.config.decoding,
+            llm_primary,
+            &evidence.messages,
+            &home_currency,
+        ) {
+            Ok(records) => facts.extend(records),
+            Err(e) => eprintln!("llm: {} failed: {e:#}", request.user_id),
+        }
+    }
+
     session.apply_evidence(facts);
 
     let spec = RequestSpec::from_model(request);

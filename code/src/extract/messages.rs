@@ -12,7 +12,11 @@ use std::collections::HashMap;
 use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
 use crate::engine::money::Money;
 use crate::engine::types::Direction;
-use crate::extract::{parse_json_reply, ModelClient};
+use crate::extract::grounding::amount_grounded;
+use crate::extract::model_config::{CandidateConfig, DecodingConfig};
+use crate::extract::parse_json_reply;
+use crate::extract::prompts::PromptSet;
+use crate::hf::{ContentPart, HfClient, ModelCall};
 use crate::model::Message;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -634,28 +638,97 @@ pub fn deterministic_evidence(messages: &[&Message], home_currency: &str) -> Vec
 }
 
 /// Batch every message in `batch` (already filtered to relevant, unresolved-skeleton
-/// messages for one user) into a single model call, per
-/// `code/prompts/message_extraction.v1.md`.
+/// messages for one user — PLAN.md §3 batching lever: one call per user batch, never one
+/// call per message) into a single LLM call, per `code/prompts/message_extraction.v1.md`.
+/// Goes through `HfClient`'s own §2.11 disk cache (content hash + model id + revision +
+/// prompt version).
 pub fn extract_batch(
-    client: &dyn ModelClient,
-    system_prompt: &str,
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    candidate: &CandidateConfig,
     batch: &[&Message],
-) -> anyhow::Result<(HashMap<String, Vec<MessageRecord>>, u32, u32)> {
+) -> anyhow::Result<HashMap<String, Vec<MessageRecord>>> {
     let block: String = batch
         .iter()
         .map(|m| format!("[{}] {}\n", m.message_id, m.message_text))
         .collect();
-    let user_prompt = format!(
-        "Extract typed records from each of the following messages. Respond with the JSON array only.\n\n{block}"
-    );
-    let response = client.complete(system_prompt, &user_prompt, &[])?;
-    let value = parse_json_reply(&response.text)?;
+    let user_content = prompt.user_template.replace("{{MESSAGES_BLOCK}}", &block);
+    let call = ModelCall {
+        model_id: candidate.id.clone(),
+        provider: candidate.provider.clone(),
+        model_revision: candidate.model_revision.clone(),
+        prompt_version: prompt.version.clone(),
+        system_prompt: prompt.system_prompt.clone(),
+        user_content: vec![ContentPart::Text(user_content)],
+        temperature: decoding.temperature,
+        seed: decoding.seed,
+        max_tokens: decoding.max_tokens_llm,
+        json_response: candidate.supports_structured_output,
+    };
+    let response =
+        if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
+    let value = parse_json_reply(&response.raw_text)?;
     let replies: Vec<MessageRecordsReply> = serde_json::from_value(value)?;
-    let by_id = replies
-        .into_iter()
-        .map(|r| (r.message_id, r.records))
+    Ok(replies.into_iter().map(|r| (r.message_id, r.records)).collect())
+}
+
+/// Every message in `messages` whose skeleton `parse_known_skeleton` does not recognize
+/// (e.g. message_86), run through the LLM path in one batch call and converted to
+/// evidence. Rejects any record whose claimed amount is not literally present in its own
+/// message text (`grounding::amount_grounded`) — the LLM path is the one place a
+/// hallucinated number could otherwise slip through; the deterministic parser's captures
+/// are already grounded by construction. Returns an empty vec with zero calls when every
+/// message in `messages` is already deterministically covered.
+pub fn llm_evidence(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    candidate: &CandidateConfig,
+    // User-requested backup frontier model (board decision, PLAN.md Phase 2d): tried for
+    // this same batch when `candidate`'s call errors or its reply doesn't parse into valid
+    // records — a fresh call, not a retry of the failed one.
+    fallback: Option<&CandidateConfig>,
+    messages: &[&Message],
+    home_currency: &str,
+) -> anyhow::Result<Vec<EvidenceRecord>> {
+    let unresolved: Vec<&Message> = messages
+        .iter()
+        .copied()
+        .filter(|m| parse_known_skeleton(&m.message_text, m.sent_at.date_naive()).is_none())
         .collect();
-    Ok((by_id, response.prompt_tokens, response.completion_tokens))
+    if unresolved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let by_id = match extract_batch(client, cold, prompt, decoding, candidate, &unresolved) {
+        Ok(by_id) => by_id,
+        Err(e) => {
+            eprintln!("llm: batch via {} failed: {e:#}", candidate.id);
+            let Some(fallback) = fallback else { return Ok(Vec::new()) };
+            extract_batch(client, cold, prompt, decoding, fallback, &unresolved)?
+        }
+    };
+    let mut out = Vec::new();
+    for message in unresolved {
+        let Some(records) = by_id.get(&message.message_id) else { continue };
+        for (idx, record) in records.iter().enumerate() {
+            if let Some(amount) = record.amount {
+                if !amount_grounded(amount, &message.message_text) {
+                    eprintln!(
+                        "grounding: rejected {} record {idx}: claimed amount {amount} not found in source text",
+                        message.message_id
+                    );
+                    continue;
+                }
+            }
+            if let Some(evidence) = to_evidence(message, idx, record, home_currency) {
+                out.push(evidence);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Convert one validated record into the engine's evidence contract. Returns `None` when
