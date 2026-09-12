@@ -3,7 +3,7 @@
 //!
 //! Rules: PLAN.md §2.1 plus board `decision.dup_charges` — settled rows are terminal; a pending,
 //! failed or cancelled row is superseded by a same-direction successor that moves cash; a settled
-//! charge reversed by a settled refund stays in the balance history but not in spending history.
+//! every row of a linked chain (and the row it links to) is excluded from stream history (RULES.md S2.1).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -32,7 +32,7 @@ pub struct Expected {
     pub event_id: String,
     pub class: Class,
     pub reason: &'static str,
-    /// False for reversed/reimbursed charge pairs (both legs).
+    /// False for every member of a linked chain (RULES.md S2.1 linked-chain rule).
     pub spend_history: bool,
 }
 
@@ -84,7 +84,7 @@ pub fn expected_for_user(ds: &Dataset, user_id: &str) -> BTreeMap<String, Expect
                 }
             }
         }
-        if succ.event_type == "refund" && succ.status == "settled" && pred.status == "settled" {
+        {
             for id in [pred_id.as_str(), succ.event_id.as_str()] {
                 if let Some(x) = out.get_mut(id) {
                     x.spend_history = false;
@@ -168,9 +168,11 @@ mod tests {
     fn lifecycle_expectations_on_real_rows() {
         let ds = ds();
         let ex = |uid: &str, id: &str| expected_for_user(&ds, uid)[id].clone();
-        // cancelled authorization -> settled purchase
+        // cancelled authorization -> settled purchase; the chain is a one-off, not stream history
         assert_eq!(ex("user_01", "event_100").class, Class::Excluded);
         assert_eq!(ex("user_01", "event_101").class, Class::Settled);
+        assert!(!ex("user_01", "event_101").spend_history);
+        assert!(ex("user_01", "event_01").spend_history);
         // settled charge reversed by settled refund: both stay settled, neither is spending history
         let (c, r) = (ex("user_01", "event_98"), ex("user_01", "event_99"));
         assert_eq!((c.class, r.class), (Class::Settled, Class::Settled));
@@ -208,7 +210,7 @@ mod tests {
         let d = compare(&ds, "user_01", &m, &[]);
         assert!(d.iter().any(|x| x.expected.contains("only one of event_100/event_101")), "{d:?}");
 
-        // reversed charge left in spending history
+        // chain member left in spending history
         let mut m = as_engine("user_01");
         m.insert("event_98".into(), (Class::Settled, true));
         assert!(compare(&ds, "user_01", &m, &[]).iter().any(|d| d.expected == "spend_history=false"));
