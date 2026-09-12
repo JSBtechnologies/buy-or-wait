@@ -8,11 +8,11 @@
     },
     "observed_at": "2025-02-06T09:30:00",
     "fact": {
-      "NextIncomeAmount": {
+      "IncomeAmountChange": {
         "category": "salary",
         "amount": 14228500,
         "currency": "EUR",
-        "date": null
+        "effective": "2025-02-06"
       }
     }
   }

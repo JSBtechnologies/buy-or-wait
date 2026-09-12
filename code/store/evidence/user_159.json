@@ -1,0 +1,18 @@
+[
+  {
+    "record_id": "message_123#0",
+    "source": {
+      "Message": {
+        "source_type": "service_provider"
+      }
+    },
+    "observed_at": "2025-12-25T09:30:00",
+    "fact": {
+      "Unconfirmed": {
+        "category": "windfall",
+        "amount": null,
+        "currency": null
+      }
+    }
+  }
+]

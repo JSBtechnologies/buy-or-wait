@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_132#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2026-01-04T09:30:00",
+    "fact": {
+      "IncomeAmountChange": {
+        "category": "salary",
+        "amount": 1371500000,
+        "currency": "INR",
+        "effective": "2026-01-04"
+      }
+    }
+  }
+]

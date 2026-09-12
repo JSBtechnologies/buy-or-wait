@@ -1,0 +1,18 @@
+[
+  {
+    "record_id": "message_25#0",
+    "source": {
+      "Message": {
+        "source_type": "merchant"
+      }
+    },
+    "observed_at": "2025-10-20T09:30:00",
+    "fact": {
+      "Unconfirmed": {
+        "category": "windfall",
+        "amount": null,
+        "currency": null
+      }
+    }
+  }
+]
