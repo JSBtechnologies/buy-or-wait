@@ -16,7 +16,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use crate::engine::forecast::FlowSource;
-    use crate::engine::ledger::CashTreatment;
+    use crate::engine::ledger::{CashTreatment, EvidenceRecord};
     use crate::engine::money::Money;
     use crate::engine::session::{Decision, Session};
     use crate::engine::types::{PaymentOption, RateTable, RequestSpec};
@@ -89,8 +89,35 @@ mod tests {
             .collect()
     }
 
+    /// Extraction's handoff (board decision.evidence_handoff): `code/store/evidence/<user_id>.json`.
+    /// Applied when present so scores reflect messages and images. VERIFIER_EVIDENCE_DIR overrides the
+    /// directory (the store is gitignored, so point it at the tree that ran extraction);
+    /// VERIFIER_NO_EVIDENCE=1 skips it.
+    fn evidence(user: &str) -> Vec<EvidenceRecord> {
+        if std::env::var("VERIFIER_NO_EVIDENCE").is_ok() {
+            return Vec::new();
+        }
+        let root = std::env::var("VERIFIER_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("store/evidence"));
+        let p = root.join(format!("{user}.json"));
+        match std::fs::read_to_string(&p) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| panic!("bad evidence file {}: {e}", p.display())),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn session(inp: &Inputs, user: &str) -> anyhow::Result<Session> {
+        let mut s = Session::from_model(user, &inp.profiles, &inp.events, inp.rates.clone(), Rules::default())?;
+        let ev = evidence(user);
+        if !ev.is_empty() {
+            s.apply_evidence(ev);
+        }
+        Ok(s)
+    }
+
     fn decide(inp: &Inputs, r: &Req) -> anyhow::Result<Decision> {
-        let session = Session::from_model(&r.user, &inp.profiles, &inp.events, inp.rates.clone(), Rules::default())?;
+        let session = session(inp, &r.user)?;
         let opts = inp
             .options
             .iter()
@@ -165,13 +192,32 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn evidence_audit() {
+        let root = std::env::var("VERIFIER_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("store/evidence"));
+        if !root.exists() {
+            println!("no evidence dir at {}", root.display());
+            return;
+        }
+        let findings = crate::evaluation::evidence_audit::audit_dir(&dir(), &root, crate::engine::money::SCALE).unwrap();
+        for f in &findings {
+            println!("EVIDENCE {f}");
+        }
+        let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();
+        println!("evidence audit: {errors} errors, {} warnings", findings.len() - errors);
+    }
+
+    #[test]
+    #[ignore]
     fn ledger_gate() {
         let inp = inputs();
         let ds = Dataset::load(&dir(), &dir().join("requests.csv")).unwrap();
         let mut total = 0;
         for p in &inp.profiles {
-            let s = Session::from_model(&p.user_id, &inp.profiles, &inp.events, inp.rates.clone(), Rules::default()).unwrap();
+            let s = session(&inp, &p.user_id).unwrap();
             let mut got = HashMap::new();
+            let mut touched = Vec::new();
             for e in &s.ledger().entries {
                 let class = match e.treatment {
                     CashTreatment::Settled => Class::Settled,
@@ -180,8 +226,11 @@ mod tests {
                     CashTreatment::Excluded(_) => Class::Excluded,
                 };
                 got.insert(e.event.id.clone(), (class, e.chain_root.is_none()));
+                if !e.applied_evidence.is_empty() {
+                    touched.push(e.event.id.clone());
+                }
             }
-            for d in compare(&ds, &p.user_id, &got, &[]) {
+            for d in compare(&ds, &p.user_id, &got, &touched) {
                 total += 1;
                 println!("GATE {} {} expected={} got={}", p.user_id, d.event_id, d.expected, d.got);
             }

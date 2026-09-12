@@ -4,10 +4,12 @@
 pub mod contract;
 pub mod data;
 pub mod engine_run;
+pub mod evidence_audit;
 pub mod invariants;
 pub mod ledger_gate;
 pub mod replay;
 pub mod scorer;
+pub mod signoff;
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +22,9 @@ pub use replay::ForecastSeries;
 const USAGE: &str = "usage:
   validate --output FILE [--dataset DIR] [--requests FILE]   contract check (default requests: DIR/requests.csv)
   score    --output FILE [--dataset DIR] [--reveal-heldout]  contract check + field scores vs DIR/sample_requests.csv
-  selftest [--dataset DIR]                                   run the validator over the sample labels themselves";
+  selftest [--dataset DIR]                                   run the validator over the sample labels themselves
+  signoff  --output FILE --usage FILE [--rerun FILE] [--dataset DIR]
+                                                             ship gate: contract, usage report, secrets, injection text, byte-identical rerun";
 
 /// Entry point for a `verify` subcommand. Returns the process exit code (0 pass, 1 fail, 2 usage).
 pub fn cli(args: &[String]) -> Result<i32> {
@@ -29,6 +33,8 @@ pub fn cli(args: &[String]) -> Result<i32> {
     let mut dataset = PathBuf::from("../dataset");
     let mut requests = None;
     let mut reveal = false;
+    let mut usage = None;
+    let mut rerun = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -36,6 +42,8 @@ pub fn cli(args: &[String]) -> Result<i32> {
             "--dataset" => dataset = it.next().map(PathBuf::from).unwrap_or(dataset),
             "--requests" => requests = it.next().map(PathBuf::from),
             "--reveal-heldout" => reveal = true,
+            "--usage" => usage = it.next().map(PathBuf::from),
+            "--rerun" => rerun = it.next().map(PathBuf::from),
             c if cmd.is_none() && !c.starts_with("--") => cmd = Some(c.to_string()),
             other => bail!("unexpected argument {other:?}\n{USAGE}"),
         }
@@ -54,6 +62,13 @@ pub fn cli(args: &[String]) -> Result<i32> {
             let (code, text) = score_file(&dataset, &output, reveal)?;
             print!("{text}");
             Ok(code)
+        }
+        Some("signoff") => {
+            let (Some(output), Some(usage)) = (output, usage) else { bail!("signoff needs --output and --usage
+{USAGE}") };
+            let s = signoff::run(&dataset, &output, &usage, rerun.as_deref())?;
+            print!("{}", s.render());
+            Ok(if s.passed() { 0 } else { 1 })
         }
         Some("selftest") => {
             let rep = selftest(&dataset)?;
