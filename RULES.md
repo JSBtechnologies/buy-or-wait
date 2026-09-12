@@ -29,6 +29,8 @@ Notation: `rd` = request_date, `due` = desired_completion_date, `req` = requeste
 | blank `amount` | take the figure from the linked image (§S5); never 0 | user_03 event_253, user_16 event_1442, user_17 event_1545 |
 | `windfall`, bonus, commission, arrears (one-off income descriptions) | never projected | user_03 event_211, user_04 "Quarterly performance bonus", user_11 commissions, user_24 prize |
 
+Lead DECISION verify#13 (board `decision.dup_charges`): a settled row is terminal; a pending row flagged as an open-dispute duplicate of a settled charge **stays reserved**; charge + reversal pairs are excluded from spend history.
+
 Linked-chain rule: walk `linked_event_id` to the root; the chain is one transaction. Its cash effect = the terminal row's status per the table; every row in a chain is excluded from recurrence detection.
 
 ### S2.2 FX [EXACT on data coverage]
@@ -213,8 +215,9 @@ if no cand in cands:                           # nothing safe without changes
            | (flexibility in {reducible, reducible_or_stoppable} and category ∈ willing_to_reduce) → action reduce_to:minimum_allowed_amount )
     for k in 1..3, for each combination of k actions on distinct events (no stop+reduce on one event):
         re-run forecast with the stream's future occurrences removed (stop) or set to minimum_allowed_amount (reduce)
-        re-run (a)(b)(c)(d) with that forecast
-    pick by ranking S1.3 (fewest changes first among change plans — see below)
+        re-run ONLY (a) full-now and (b) installments with that forecast      # lead DECISION rules#24: partial/wait pay on the
+                                                                              # no-change E, so they cannot use a changed forecast
+    pick by ranking S1.3 (change_preference = fewest changes first, lead rules#37)
 ```
 - The event id written is the **latest settled occurrence of the stream** (request_06: streaming stream events 444,452,460,468,476 → `stop:event_476`; request_11: dining stream last row event_989 → `reduce_to:event_989:665950`).
 - `reduce_to` amount = the stream's `minimum_allowed_amount` exactly (665950). [EXACT]
@@ -275,3 +278,11 @@ Consequences: full-now beats everything; partial (starts today, total=req) beats
 - `{desc_lower}` = the stream's `description` with only the first character lower-cased.
 - A vs B [FIT]: B only on request_14 (methods = `partial_payment` only, allows_partial=true, safe>0, E=None). request_10 (methods partial|installments, allows_partial=true, safe>0, E=None) uses A. Rule that fits 01–18: **B iff methods == {partial_payment} and allows_partial and safe > 0 and E is None; else A.**
 - The `min` in "leaves at least …" is always M itself (not the trough), so explanations need no extra forecast numbers.
+
+### S1.7 Verifier sample surprises (rules#5), checked on 01–18 only
+
+1. "leaves at least X" quotes `minimum_balance_to_keep`, not the trough — **confirmed** (01 ZAR 18,000; 02 IDR 29,158,400; 06 EUR 800; 07 INR 93,000 …).
+2. plan / reduce_to amounts are 2 dp when fractional (`620.40`), `amount_safe_to_pay` shortest form (`603.3`) — **confirmed** (§S1.5).
+3. wait dates == due: **4 of 5** tuning wait rows (03, 08, 13, 18; request_04 waits to 2024-06-15 < due 2024-06-19). Earliest dates on the 15th: 02, 03, 04, 06, 08, 11, 13, 17, 18 — **confirmed**; this is just salary day (credits land before a same-day payment, §S2.3), not a rule. Engine must not special-case due or the 15th; request_07 E = 2024-10-23 (salary moved to the 23rd).
+4. full_payment + changes ⇒ affordable_with_plan even when E > due — **confirmed** (06: E 01-15 > due 01-14; 11: E 07-15 > due 06-12).
+5. req_11 reduce saving needs ≥ 2 occurrences before trough — **refuted in label terms**: label gap = 13,110,000 − 12,510,645 = 599,355; the one dining occurrence before the 2025-05-14 trough saves (estimate − 665,950) ≈ 1,350,023 − 665,950 = 684,073 ≥ 599,355 with the S3.3 estimator. With the engine's own (slightly lower) safe 12,397,500 the single saving falls 28k short — so the verifier will see (5) whenever the engine's safe estimate is below the label. The rule stays: count only occurrences on or before each binding trough.
