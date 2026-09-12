@@ -88,23 +88,74 @@ impl DocType {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ImageFigures {
     pub doc_type: Option<DocType>,
+    #[serde(default, deserialize_with = "lenient_string")]
     pub currency: Option<String>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub subtotal: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub tax: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub total: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_due: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_paid: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub balance_due: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub gross_pay: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub deductions: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub net_pay: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub previous_balance: Option<f64>,
+    // analyst audit board:verify.image05_shapes: cached reads for image_05 put a date
+    // string where a number was expected on this trio (or vice versa) roughly as often as
+    // not -- strict typing on any one of the three failed the WHOLE ImageFigures parse
+    // instead of leaving just that field unusable. `lenient_f64`/`lenient_string` accept
+    // whichever JSON type actually showed up and coerce it (or give up to `None`), never a
+    // hard error.
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_due_before_date: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_string")]
     pub amount_due_before_date_value: Option<String>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_due_after_date: Option<f64>,
+    #[serde(default, deserialize_with = "lenient_string")]
     pub document_date: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
     pub period_label: Option<String>,
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub line_items_sum_check: Option<f64>,
+}
+
+/// Accepts a JSON number or a numeric-looking string; anything else (including a date
+/// string landing in a numeric field) is `None` rather than a hard parse error.
+fn lenient_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().replace(',', "").parse::<f64>().ok(),
+        _ => None,
+    }))
+}
+
+/// Accepts a JSON string, or coerces a JSON number to its string form (e.g. a number
+/// landing in what should have been a date-string field); anything else is `None`.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }))
 }
 
 /// Rounding tolerance for reconciliation checks combining two printed terms (e.g.
@@ -142,19 +193,28 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
         // it's present, with amount_paid only as a fallback when no total is printed.
         (_, Status::Settled) => figures.total.or(figures.amount_paid),
         (_, Status::Pending | Status::Scheduled) => {
-            if let (Some(before), Some(before_val), Some(after)) = (
-                figures.amount_due_before_date,
-                figures
-                    .amount_due_before_date_value
-                    .as_deref()
-                    .and_then(parse_date),
-                figures.amount_due_after_date,
-            ) {
-                if event.cash_date() > before_val {
-                    return Some(after);
+            if let (Some(before), Some(after)) =
+                (figures.amount_due_before_date, figures.amount_due_after_date)
+            {
+                // analyst audit board:verify.image05_shapes: several cached reads never
+                // land a usable cutoff date in amount_due_before_date_value at all (it's
+                // absent, or a stray number landed there instead of a date string).
+                if let Some(cutoff) =
+                    figures.amount_due_before_date_value.as_deref().and_then(parse_date)
+                {
+                    return Some(if event.cash_date() > cutoff { after } else { before });
                 }
-                return Some(before);
+                // No reliable cutoff date to choose between them: the conservative choice
+                // is the larger figure, never the smaller -- under-reserving a pending debt
+                // risks a plan that later breaches the minimum balance; over-reserving only
+                // costs safety margin, never correctness.
+                return Some(before.max(after));
             }
+            // Only one of before/after is present with no date to resolve it (or neither
+            // is present at all): not safe to treat that lone value as authoritative on its
+            // own -- fall through to whatever else the page states. If nothing here
+            // resolves either, `select` returns `None` and the caller escalates rather than
+            // guessing (never accepts an unresolved lone due-date figure as-is).
             figures.balance_due.or(figures.amount_due)
         }
         _ => figures.total,
@@ -547,6 +607,114 @@ mod tests {
         let event = expense_event("event_6859", "healthcare", "INR", Status::Scheduled);
         assert!(reconciles(&figures, &event));
         assert_eq!(select(&figures, &event), Some(3650.0));
+    }
+
+    fn pending_utilities_event(settlement_date: NaiveDate) -> Event {
+        Event {
+            id: "event_1786".into(),
+            event_type: EventType::Expense,
+            description: "Outstanding telecom bill".into(),
+            category: "utilities".into(),
+            direction: Direction::Debit,
+            amount: None,
+            currency: "INR".into(),
+            event_date: NaiveDate::from_ymd_opt(2026, 2, 6).unwrap(),
+            settlement_date: Some(settlement_date),
+            status: Status::Pending,
+            linked_event_id: None,
+            flexibility: Flexibility::Fixed,
+            minimum_allowed_amount: None,
+        }
+    }
+
+    /// docs/gold_subset.json image_05: a valid cutoff date resolves before/after normally
+    /// -- the original intent this selector branch was built for, never actually covered
+    /// by a unit test until the board:verify.image05_shapes audit found it.
+    #[test]
+    fn image_05_well_formed_cutoff_date_selects_after_when_settlement_is_later() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            amount_due_before_date: Some(704.05),
+            amount_due_before_date_value: Some("2026-02-06".into()),
+            amount_due_after_date: Some(822.05),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(822.05));
+    }
+
+    /// analyst audit board:verify.image05_shapes "Shape A" (6 Qwen reads): before/after are
+    /// both present as plain numbers, but no cutoff date is present anywhere. Conservative
+    /// fallback: the larger figure, never under-reserve a pending debt.
+    #[test]
+    fn image_05_no_cutoff_date_falls_back_to_the_larger_figure() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            amount_due_before_date: Some(704.05),
+            amount_due_before_date_value: None,
+            amount_due_after_date: Some(822.05),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(822.05));
+    }
+
+    /// analyst audit "Shape B", the 4 gemma reads: only the before-cutoff figure (704.05)
+    /// is present anywhere on the page, with no after figure and no balance_due/amount_due
+    /// to fall back to. Not safe to treat the lone value as authoritative -- `select`
+    /// returns `None` so the caller escalates rather than guessing.
+    #[test]
+    fn image_05_only_one_candidate_present_does_not_guess() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            amount_due_before_date: Some(704.05),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert_eq!(select(&figures, &event), None);
+    }
+
+    /// analyst audit "Shape B", the other 2 reads: after-cutoff (822.05) landed in
+    /// balance_due instead of amount_due_after_date. The fallback still resolves it.
+    #[test]
+    fn image_05_after_value_in_balance_due_still_resolves() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            amount_due_before_date: Some(704.05),
+            balance_due: Some(822.05),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert_eq!(select(&figures, &event), Some(822.05));
+    }
+
+    /// analyst audit "Shape B": a date string landed in the numeric before/after fields
+    /// and a number landed in the date-string `_value` field -- a straight type mismatch
+    /// that must not fail the whole `ImageFigures` parse. `lenient_f64`/`lenient_string`
+    /// coerce what they can and give up to `None` on the rest, never a hard error.
+    #[test]
+    fn image_05_swapped_json_types_deserialize_without_error() {
+        let value = serde_json::json!({
+            "amount_due_before_date": "704.05",
+            "amount_due_before_date_value": 704.05,
+            "amount_due_after_date": 822.05,
+            "currency": "INR"
+        });
+        let figures: ImageFigures =
+            serde_json::from_value(value).expect("swapped types must not error the whole parse");
+        assert_eq!(figures.amount_due_before_date, Some(704.05));
+        assert_eq!(figures.amount_due_before_date_value, Some("704.05".to_string()));
+        assert_eq!(figures.amount_due_after_date, Some(822.05));
+
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        // "704.05" does not parse as a date, so no cutoff resolves -> conservative max().
+        assert_eq!(select(&figures, &event), Some(822.05));
     }
 
     #[test]
