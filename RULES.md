@@ -7,6 +7,35 @@ Notation: `rd` = request_date, `due` = desired_completion_date, `req` = requeste
 
 ---
 
+## S0. Named rule toggles (for verifier A/B on held-out 19–25)
+
+Every tunable rule has a name. Engine should expose each as a config value. The **default** is what the tuning set supports. "Tuning effect" = what request_01–18 show when the alternative is used instead (outflow err = error relative to forecast outflow, §S3.6).
+
+| toggle | default | alternatives | tuning effect of alternative | section |
+|---|---|---|---|---|
+| `HORIZON` | `eom_plus_2` (last day of month(rd)+2) | `fixed_90`, `fixed_86` | `fixed_90`: E 16→13/18 (08, 12, 13 lose E; 05, 10 safe → 0). `fixed_86`: identical to default on 01–18 | S3.1 |
+| `SAME_DAY_ORDER` | `debits_first` | `credits_first` | request_18 safe 462 → 546 (+18%) | S2.3 |
+| `PAYMENT_TIMING` | `after_day_rows` | `before_credits` | rejects all 5 salary-day wait plans (03, 04, 08, 13, 18) | S3.5 |
+| `IV_SKIP_DAYS` | `2` (Interval occurrences on rd, rd+1 skipped) | `0` | 15 outflow −2.9% → −17.1%; 06 −7.6% → −21.1% and E wrong; 10 +5.5% → +4.4% | S3.2 |
+| `BILL_ESTIMATOR` | `mean_last3` | `max_last3`, `mid_all` ((min+max)/2), `mean_all` | `mid_all` marginally better sum of abs outflow err (0.338 vs 0.352), same E; `max_last3` worse (08 −52%, 13 −99% when combined with max var) | S3.3 |
+| `VAR_ESTIMATOR` | `mean_all` | `median_all`, `max_last4` | `max_last4` closes 05 (−0.3%) and 10 (−0.4%) but breaks 06 −21%, 08 −29%, 13 −20% | S3.3 |
+| `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only) | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
+| `SCHEDULED_REPLACES_CYCLE` | `on` (±15 days, salary re-anchors day) | `off` | no tuning row exercises it (request_86, 44/104/164/224 in eval) | S3.4c |
+| `SEEDED_SALARY_STREAM` | `on` | `off` | request_01 safe 25,256 (cap) → 3,973 | S3.4b |
+| `FINAL_PAYROLL_STOPS_INCOME` | `on` | `off` | request_05 safe 737-label → capped ≫ label | S3.4a |
+| `COMMISSION_NEVER_STREAM` | `on` | `off` | request_11 E moves earlier (already 06-15 vs label 07-15) | S3.4 |
+| `MSG_SALARY_CONFLICT` | `settled_history` (user_11 keeps 23,256,000) | `message_amount` (38,760,000) | safe unchanged; E moves earlier, further from label | S5 |
+| `EXCLUDE_IMAGE_BULK_ONEOFF` | `on` (image_03 row out of groceries estimator) | `off` | request_17 −0.3% → −1.3% | S5 |
+| `INSTALLMENT_LIMIT` | `n_payments` (n ≤ max_installment_months) | `ceil_months` (ceil(n·freq/30) ≤ max) | identical on 01–18 | S1.1 |
+| `CHANGE_CANDIDATES` | `full_and_installments` (lead decision rules#24) | `all_methods` | identical on 01–18 (06, 11 are full-now) | S1.2 |
+| `CHANGE_PREFERENCE` | `fewest_changes` (lead rules#37) | `smallest_cut` | identical on 01–18 | S1.3 |
+| `NOT_REC_TEMPLATE` | `B_iff_partial_only` | `always_A` | request_14 text wrong under `always_A` | S1.6 |
+| `AFFORDABLE_NOW_TEMPLATE` | `leaves_at_least` | `keeps_minimum` | 01, 16 vs 09 (one variant each way; text-only) | S1.6 |
+
+**Estimator residuals 05 / 10 (lead request):** both are no-income users whose low point is the horizon end, so the residual is the whole-horizon spending estimate: 05 is +1.0% of outflow (engine spends 330 too little over 12 grocery + 6 transport + 9 bill occurrences), 10 is +5.5% (28,349 too little). A full grid over {mean, median, mid, p60, p75, max} × {last 3/4/6/8/10/13, all} for bills and variable spend separately: no setting cuts 05 and 10 without making other samples worse (best for 05+10 is `VAR_ESTIMATOR=max_last4`, which costs 06/08/13 20–29%). The per-stream spread of amounts is ~15%, so a 26-sample mean has ~3% standard error and a sum of ~6 streams ~2%. 05 is inside that noise; 10 is ~2–3σ. Verdict: **not closable from history without overfitting**; keep defaults. `VAR_HORIZON=rd_plus_90` is the only structural alternative that moves 10 toward the label (+3.4%) and it overshoots 05 (−2.3%); leave it as an A/B toggle. Also ruled out for 05: counting the failed 389.40 utility debit as a retry (spec says ignore failed rows; it would overshoot to −0.2% outflow, safe 677.65).
+
+---
+
 ## S2. Ledger: cash rules by status, linked chains, FX [EXACT unless tagged]
 
 `B0` (current_available_balance) already contains every **settled** row dated before `rd`. The forecast never re-applies history; history is used only to detect streams (§S3) and estimate amounts.
