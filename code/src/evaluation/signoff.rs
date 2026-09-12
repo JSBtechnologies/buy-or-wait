@@ -135,6 +135,16 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         }
     }
 
+    // Hardcoded answers in the prediction path (lead: flag at final sign-off). Paths resolve
+    // from the dataset dir's parent (repo root): code/src/{engine,extract}, docs/gold_subset.json.
+    let repo = dataset_dir.parent().unwrap_or(Path::new(".."));
+    let hard = super::hardcode_scan::scan(&repo.join("code"), dataset_dir, Some(&repo.join("docs/gold_subset.json")))?;
+    s.check(
+        "no hardcoded ids/label figures in engine+extract",
+        hard.is_empty(),
+        if hard.is_empty() { "none found".to_string() } else { hard.iter().take(12).map(|f| f.to_string()).collect::<Vec<_>>().join(" | ") },
+    );
+
     if let Some(rerun) = rerun {
         let a = std::fs::read(output)?;
         let b = std::fs::read(rerun).with_context(|| format!("read {}", rerun.display()))?;

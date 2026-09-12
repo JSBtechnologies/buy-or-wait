@@ -5,6 +5,7 @@ pub mod contract;
 pub mod data;
 pub mod engine_run;
 pub mod evidence_audit;
+pub mod hardcode_scan;
 pub mod invariants;
 pub mod ledger_gate;
 pub mod replay;
