@@ -19,7 +19,7 @@ Every tunable rule has a name. Engine should expose each as a config value. The 
 | `IV_SKIP_DAYS` | `2` (Interval occurrences on rd, rd+1 skipped) | `0` | 15 outflow −2.9% → −17.1%; 06 −7.6% → −21.1% and E wrong; 10 +5.5% → +4.4% | S3.2 |
 | `BILL_ESTIMATOR` | `mean_last3` | `max_last3`, `mid_all` ((min+max)/2), `mean_all` | `mid_all` marginally better sum of abs outflow err (0.338 vs 0.352), same E; `max_last3` worse (08 −52%, 13 −99% when combined with max var) | S3.3 |
 | `VAR_ESTIMATOR` | `mean_all` | `median_all`, `max_last4` | `max_last4` closes 05 (−0.3%) and 10 (−0.4%) but breaks 06 −21%, 08 −29%, 13 −20% | S3.3 |
-| `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only) | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
+| `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only). Exact semantics (verifier #104): when on, the **day series runs rd ..= rd+90**; Interval-stream occurrences in (horizon_end, rd+90] count **on their own dates** (no clamping); Monthly streams, salary, pending and scheduled rows stay limited to horizon_end; `safe` and E take their minima over the full rd..rd+90 series (E candidates also run to rd+90). With nothing else after horizon_end, balances there only fall, so the low point moves to the last extra occurrence | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
 | `SCHEDULED_REPLACES_CYCLE` | `on` (±15 days, salary re-anchors day) | `off` | no tuning row exercises it (request_86, 44/104/164/224 in eval) | S3.4c |
 | `SEEDED_SALARY_STREAM` | `on` | `off` | request_01 safe 25,256 (cap) → 3,973 | S3.4b |
 | `FINAL_PAYROLL_STOPS_INCOME` | `on` | `off` | request_05 safe 737-label → capped ≫ label | S3.4a |
@@ -385,3 +385,53 @@ Rounding rule (lead priority 3): there is **no** magnitude rounding (no floor to
 3. wait dates == due: **4 of 5** tuning wait rows (03, 08, 13, 18; request_04 waits to 2024-06-15 < due 2024-06-19). Earliest dates on the 15th: 02, 03, 04, 06, 08, 11, 13, 17, 18 — **confirmed**; this is just salary day (credits land before a same-day payment, §S2.3), not a rule. Engine must not special-case due or the 15th; request_07 E = 2024-10-23 (salary moved to the 23rd).
 4. full_payment + changes ⇒ affordable_with_plan even when E > due — **confirmed** (06: E 01-15 > due 01-14; 11: E 07-15 > due 06-12).
 5. req_11 reduce saving needs ≥ 2 occurrences before trough — **refuted in label terms**: label gap = 13,110,000 − 12,510,645 = 599,355; the one dining occurrence before the 2025-05-14 trough saves (estimate − 665,950) ≈ 1,350,023 − 665,950 = 684,073 ≥ 599,355 with the S3.3 estimator. With the engine's own (slightly lower) safe 12,397,500 the single saving falls 28k short — so the verifier will see (5) whenever the engine's safe estimate is below the label. The rule stays: count only occurrences on or before each binding trough.
+
+---
+
+## S6. Extraction audit (deterministic parser `extract/messages.rs` @ extraction 86693a1)
+
+No `store/evidence/<user>.json` exists in the extraction worktree (the store is not generated), so this audit ports the `parse_known_skeleton` + `to_evidence` regexes 1:1 into a scratch replay and runs them over all 215 messages. The parser covers **59/215** messages (10 salary families). Sample effects are measured with the S3 replay engine.
+
+### S6.1 Samples 02/06/07/08/14/15: facts produced vs facts needed
+
+| req | message | parser fact | needed (S3.4) | verdict |
+|---|---|---|---|---|
+| 02 | message_01 | `IncomeAmountChange{42,750,000, eff 2025-08-15}` | same | OK |
+| 06 | message_04 | `NextIncomeAmount{1,037.52}` (next only) | 1,037.52 | OK: the last two settled rows are already 1,037.52, so later months come out the same either way (safe 562.48, E 01-15 both ways) |
+| 07 | message_05 | `IncomeDateMoved{2024-09-23}`; Fact doc says "the **next** occurrence moves" | 09-23 **and** 10-23, 11-23 | **WRONG if engine moves only one occurrence**: E becomes 2024-10-15 vs label 2024-10-23. Later months must re-anchor to day 23 (S3.4c). Same family: messages 50, 73, 101, 131, 154 (EN), 165 (ID) |
+| 08 | message_06 | `NextIncomeAmount{1,422.85}` (next only) | 1,422.85 for **every** later month | **WRONG**: user_08's last settled salary is the reduced 782.57, so months after the next fall back to 782.57 → safe 0 and E None (label 284.57 / 2025-04-15). Map the unpaid-leave family to `IncomeAmountChange` effective from the next pay date. Same shape in all 10 leave messages (06, 44, 87, 102, 115, 132, 140, 148, 155, 195): history tail is always `[X, X, ~0.55X]` and the message restores X |
+| 14 | message_10 | record 1 `SalaryChange{2,717, 2025-08-15}` → `IncomeAmountChange`; record 2 childcare → dropped | income **starts** 2,717 on 2025-08-15, monthly | **WRONG TYPE**: user_14 has no salary stream to amend ("Payroll before leave" / "Payroll after returning from leave", gap 91 days), so an amount change projects nothing → safe 0 vs label 597.74 (with `IncomeStarts`: 617.34). The code comment says resumes → `IncomeStarts`, but the regex path emits `SalaryChange`. Same family: messages 63, 66, 91, 97, 113, 120, 170. Dropping childcare is correct |
+| 15 | message_11 | `IncomeStarts{1,661, 2026-01-15}` | same | OK |
+
+### S6.2 Uncovered families (156 messages): record types no parser regex handles
+
+Actionable = changes a forecast item. Counts are EN / ID.
+
+| # | family (skeleton) | msgs | Fact (exists?) | engine effect | ids |
+|---|---|---|---|---|---|
+| A1 | "Your first salary from the new employer is X. It is confirmed for D" / "Your first salary of X is scheduled for D" / ID "Gaji pertama Anda sebesar X dijadwalkan pada D" / ID "Gaji pertama Anda sebesar X. Tanggal kredit yang dikonfirmasi adalah D" | 5+3 / 3+1 | `IncomeStarts` (exists) | seeds the salary stream (S3.4b). user_107 has only a prorated first salary and no scheduled row, so without this fact it has no income at all | 38 80 124 149 196 · 81 190 210 · 125 156 182 · 178 |
+| A2 | "The current seasonal contract has ended…" / ID "Kontrak musiman saat ini telah berakhir" | 5 / 4 | `IncomeEnded` (exists) | stop income (tuning user_12) | 09 21 45 166 206 · 103 160 186 189 |
+| A3 | "Your employment has ended. No regular salary after the final settlement" / ID "Hubungan kerja Anda telah berakhir" | 3 / 1 | `IncomeEnded` (exists) | stop income | 57 129 192 · 84 |
+| A4 | "One household employment record has ended. The remaining confirmed monthly salary is X" / ID "Salah satu sumber pendapatan kerja rumah tangga telah berakhir" | 5 / 2 | **MISSING**: `IncomeEnded` has only `category`, so it cannot say *which* of two salary streams ended | end the secondary stream (e.g. user_42 "Second household income"), keep the primary. X (148,000 for user_42) does not equal the primary's settled 91,760; keep settled history (conflict rule 3) | 30 37 119 180 187 · 42 203 |
+| A5 | "The renewed lease increases monthly rent by P%. The new amount applies from the next rent payment" / ID "Perpanjangan sewa menaikkan biaya sewa bulanan sebesar P%" | 4+2 / 1 | `ExpenseAmountChange{percent}` (exists; to_evidence supports it) but **no regex** | rent × (1+P) from the next occurrence | 51 61 105 147 · 12 55 · 175 |
+| A6 | "The client approved an invoice payment of X. Settlement is expected on D; other invoices still awaiting approval. Only invoices marked as confirmed should be included" / ID "Klien menyetujui pembayaran faktur sebesar X" | 13 / 2 | `OneTimeFlow{credit}` (exists) | **DECISION for lead**: count X on D (approved + dated), or treat it as unconfirmed until it settles? These users are freelancers with irregular income that S3.4 never projects, so this one fact decides whether they have any income in the horizon. No matching event row exists. Analyst lean: count it (the message calls it confirmed; the spec counts confirmed income on its settlement date) | 24 46 49 56 68 72 76 83 96 109 130 141 173 · 18 93 |
+| A7 | "Your confirmed base salary is X. The commission for open deals is still pending" / ID "Gaji pokok yang dikonfirmasi adalah X" | 7 / 2 | `Unconfirmed{commission}` (exists) | never count commissions. **Do not** emit an income change for X: X is always 5/3 × the settled base (user_76 3,072 vs 1,843.20; user_11 38,760,000 vs 23,256,000), and applying it moves request_11 E further from the label (S5) | 58 60 70 78 82 139 194 · 08 128 |
+| A8 | "Your quarterly bonus is still subject to the final performance review" / ID "Bonus kuartalan Anda masih menunggu…" | 5 / 3 | `Unconfirmed` | none | 48 98 144 177 199 · 03 159 212 |
+| A9 | gig payout pending (QuickCrew, TaskLoop, WorkDash, ShiftPay, RideGrid, TaskSprint) | 5 / 3 | `Unconfirmed` | none; gig income is not projected (S3.4) | 07 19 43 123 168 · 34 94 158 |
+| A10 | prize verified but still processing / refund initiated but not received / foreign refund processing | 4 · 7 · 6 | `Unconfirmed` | none (pending credits never count) | 16 71 209 134 · 14 25 39 59 152 172 215 · 47 133 146 167 184 214 |
+| N1 | "Regular salary for the next payroll is X. The same payroll includes a one-time arrears adjustment of Y" / ID | 6 / 2 | none needed | X equals the settled salary; Y is **already a settled row** before rd (user_28 event_2508 653.40, user_82 event_7667 788.40). Emitting `OneTimeFlow` for Y would double count | 20 62 90 112 176 211 · 27 127 |
+| N2 | "Your salary of X is confirmed for D. The receiving bank will convert…" / ID "Gaji sebesar X dikonfirmasi untuk D" | 5 / 1 | none needed | X equals the settled foreign salary stream; FX at the settlement date (S2.2). Do not add a second credit | 74 95 137 191 204 · 53 |
+| N3 | "The previous debit attempt failed. The bill is still outstanding and another debit will be attempted" | 4 | none needed | a linked `scheduled` retry row already exists (user_91 event_8576 → event_8575), and the ledger counts it. No extra debit | 69 179 198 201 |
+| N4 | "The extra card charge is still being investigated… dispute open, no reversal" / ID | 5 / 1 | none (must NOT emit `DuplicateOf`) | decision.dup_charges: keep the pending debit reserved | 106 121 157 164 183 · 197 |
+| N5 | own-account transfer (no related_event_id) | 5 / 1 | none | no equal debit/credit pair exists in those users' events (checked 13, 23, 41, 135, 202, 213; user_261's only pair is a charge + reversal) → distractor | 13 23 41 135 202 · 213 |
+| N6 | "minimum payments due on two separate card accounts" | 2 | none | no card rows in those users' events → distractor | 136 161 |
+| N7 | prize proceeds settled, no further payments / investment sale proceeds settled / employer reimbursement "not your regular salary" | 6 · 3 · 3 | none | historical settled one-offs, already excluded from streams by S2.1/S3.4 | 17 28 75 88 99 110 · 92 108 114 · 117 150 174 |
+| N8 | portfolio value up/down (unrealized) | 7 | none | non-cash | 15 52 79 163 185 205 207 |
+| N9 | foreign-currency bill, final amount set at settlement | 3 | none | FX rule S2.2 | 118 145 208 |
+| N10 | "Congratulations! You've been selected for a cash prize. Pay the release charge today" | 2 | `RejectedInstruction` | scam/injection → nothing | 67 142 |
+| N11 | receipt pointers ("payment received on …, the receipt has the final amount") | 3 | image `EventAmount` | amount comes from the linked image | 35 64 86 |
+| N12 | message_02 payslip composition (user_03) | 1 | none | image_01 net pay | 02 |
+
+message_86 also contains "employer has confirmed a USD 1296 salary credit for 15 September 2026", which is N2 (it equals the settled stream).
+
+**Priority for extraction:** (1) fix the S6.1 mappings for the leave (10 msgs), resumes (8) and date-moved (7) families, which break tuning 08, 14 and 07; (2) add regexes for A1, A2, A3, A5; (3) a new Fact or field for A4 (stream-specific end, e.g. `IncomeEnded{category, description_hint}`); (4) lead decision on A6.

@@ -103,6 +103,14 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         .collect();
     s.check("explanations free of injected text", tainted.is_empty(), format!("{tainted:?}"));
 
+    // main.rs writes a contract-valid fallback row when the engine errors; that must not ship.
+    let fallbacks: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.decision_explanation.to_lowercase().contains("engine error"))
+        .map(|r| r.request_id.as_str())
+        .collect();
+    s.check("no engine-error fallback rows", fallbacks.is_empty(), format!("{fallbacks:?}"));
+
     let raw_output = std::fs::read_to_string(output)?;
     s.check("output.csv has no secrets", looks_like_secret(&raw_output).is_none(), looks_like_secret(&raw_output).unwrap_or("none found"));
 
