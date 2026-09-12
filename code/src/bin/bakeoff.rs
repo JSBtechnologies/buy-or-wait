@@ -28,7 +28,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use buyorwait::extract::images::{self as prod_images, ImageFigures};
 use buyorwait::hf::{ContentPart, HfClient, ModelCall, Usage};
+use chrono::NaiveDate;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -73,6 +75,9 @@ struct ImagePreprocessingConfig {
 #[derive(Debug, Deserialize)]
 struct CandidatesConfig {
     vlm: Vec<CandidateConfig>,
+    /// Defaults to empty so a top-up config (VLM finalists only) doesn't
+    /// need a placeholder `[[candidates.llm]]` block.
+    #[serde(default)]
     llm: Vec<CandidateConfig>,
 }
 
@@ -149,6 +154,10 @@ struct Args {
     out: PathBuf,
     cache_dir: PathBuf,
     runs: u32,
+    /// Skip the resolution sweep and use this exact max dimension for every
+    /// VLM candidate. For a top-up run of already-screened finalists at
+    /// their already-chosen resolution (no need to re-derive it).
+    fixed_resolution: Option<u32>,
 }
 
 fn parse_args() -> Args {
@@ -170,6 +179,7 @@ fn parse_args() -> Args {
         out: PathBuf::from(get("out", "../docs/bakeoff.md")),
         cache_dir: PathBuf::from(get("cache-dir", "store/bakeoff_cache")),
         runs: get("runs", "5").parse().unwrap_or(5),
+        fixed_resolution: map.get("fixed-resolution").and_then(|v| v.parse().ok()),
     }
 }
 
@@ -312,117 +322,117 @@ fn compare_message_records(expected: &Value, actual_records: Option<&Vec<Value>>
 }
 
 // ---------------------------------------------------------------------------
-// Selected-figure accuracy + reconciliation (lead directive: the one amount
-// the engine would actually use matters more than raw all-field accuracy).
-// Gold already encodes which field the deterministic selector
-// (image_transcription.v1.md) would read for each labeled image, so scoring
-// this is just: does the model's value at that field match?
+// Selected-figure accuracy + reconciliation, using PRODUCTION'S OWN selector
+// (lead directive: "so the metric matches production" — not a bake-off
+// reimplementation). `buyorwait::extract::images::{select, reconciles}` is
+// engine/extraction's real deterministic-selector code; this just feeds it
+// gold's `event_context` and the model's parsed figures.
+//
+// Also: instability in fields the selector never reads doesn't matter (lead
+// directive) — so stability here is of the SELECTED AMOUNT specifically,
+// not all-field JSON identity.
 // ---------------------------------------------------------------------------
 
-/// `None` when no reconciliation check was applicable (not enough of the
-/// relevant fields were non-null to check anything); `Some(true/false)`
-/// otherwise. Mirrors image_transcription.v1.md's reconciliation rules.
-fn reconciliation_ok(figures: &Value, event_currency: Option<&str>) -> Option<bool> {
-    let getf = |k: &str| figures.get(k).and_then(|v| v.as_f64());
-    const TOL: f64 = 0.01;
-    let mut any_check = false;
-    let mut all_pass = true;
-    let mut check = |applicable: bool, ok: bool| {
-        if applicable {
-            any_check = true;
-            if !ok {
-                all_pass = false;
-            }
-        }
-    };
-    if let (Some(subtotal), Some(tax), Some(total)) = (getf("subtotal"), getf("tax"), getf("total")) {
-        check(true, (subtotal + tax - total).abs() <= TOL);
-    }
-    if let (Some(gross), Some(ded), Some(net)) = (getf("gross_pay"), getf("deductions"), getf("net_pay")) {
-        check(true, (gross - ded - net).abs() <= TOL);
-    }
-    if let (Some(paid), Some(bal), Some(total)) = (getf("amount_paid"), getf("balance_due"), getf("total")) {
-        check(true, (paid + bal - total).abs() <= TOL);
-    }
-    if let Some(sum_check) = getf("line_items_sum_check") {
-        if let Some(subtotal) = getf("subtotal") {
-            check(true, (sum_check - subtotal).abs() <= TOL);
-        } else if let Some(total) = getf("total") {
-            check(true, (sum_check - total).abs() <= TOL);
-        }
-    }
-    if let Some(ec) = event_currency {
-        if let Some(cur) = figures.get("currency").and_then(|v| v.as_str()) {
-            check(true, cur.eq_ignore_ascii_case(ec));
-        }
-    }
-    any_check.then_some(all_pass)
+/// Builds the minimal `Event` `select`/`reconciles` need from gold's
+/// `event_context`. Fields unused by those two functions (id, description,
+/// category, direction, amount, linked_event_id, flexibility,
+/// minimum_allowed_amount) get harmless placeholders.
+fn event_from_gold(img: &GoldImage) -> Option<buyorwait::engine::types::Event> {
+    use buyorwait::engine::types::{Direction, EventType, Flexibility, Status};
+    use std::str::FromStr;
+
+    let ec = img.event_context.as_ref()?;
+    let event_type = EventType::from_str(ec.get("event_type")?.as_str()?).ok()?;
+    let status = Status::from_str(ec.get("status")?.as_str()?).ok()?;
+    let currency = ec.get("currency")?.as_str()?.to_string();
+    let event_date = NaiveDate::parse_from_str(ec.get("event_date")?.as_str()?, "%Y-%m-%d").ok()?;
+    let settlement_date = ec
+        .get("settlement_date")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+
+    Some(buyorwait::engine::types::Event {
+        id: img.image_id.clone(),
+        event_type,
+        description: ec.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        category: ec.get("category").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        direction: Direction::Debit,
+        amount: None,
+        currency,
+        event_date,
+        settlement_date,
+        status,
+        linked_event_id: None,
+        flexibility: Flexibility::Fixed,
+        minimum_allowed_amount: None,
+    })
 }
 
-#[derive(Debug, Default, Clone)]
-struct SelectorStats {
-    /// Labeled-image runs where gold specifies an expected selected field
-    /// and the model produced a JSON figure object to check it against.
-    checked: u32,
-    selected_correct: u32,
-    reconciliation_checked: u32,
-    reconciliation_passed: u32,
-    /// Among wrong selected-figure reads, how many were caught by a failed
-    /// reconciliation check (i.e. the safety net actually would have fired).
-    wrong_reads: u32,
-    wrong_reads_caught_by_reconciliation: u32,
+/// One labeled image's selected-figure results across all N runs of one
+/// candidate, via production's `images::select`/`images::reconciles`.
+#[derive(Debug, Clone)]
+struct PerImageSelectorResult {
+    image_id: String,
+    expected_field: String,
+    expected_amount: f64,
+    /// One entry per run: `None` when the model's figures didn't parse, or
+    /// the selector found nothing to select (a fully absent figure, exactly
+    /// like production would see — never guessed).
+    selected_amounts: Vec<Option<f64>>,
+    reconciles_per_run: Vec<bool>,
 }
 
-impl SelectorStats {
-    fn record(&mut self, img: &GoldImage, parsed: Option<&Value>) {
-        let (Some(field), Some(expected_amount)) = (&img.expected_selected_field, img.expected_selected_amount)
-        else {
-            return;
-        };
-        let Some(figures) = parsed else { return };
-        self.checked += 1;
-        let actual_amount = figures.get(field).and_then(|v| v.as_f64());
-        let correct = actual_amount.map(|a| (a - expected_amount).abs() <= 0.01).unwrap_or(false);
-        if correct {
-            self.selected_correct += 1;
-        } else {
-            self.wrong_reads += 1;
-        }
-        let event_currency = img
-            .event_context
-            .as_ref()
-            .and_then(|ec| ec.get("currency"))
-            .and_then(|v| v.as_str());
-        if let Some(recon_ok) = reconciliation_ok(figures, event_currency) {
-            self.reconciliation_checked += 1;
-            if recon_ok {
-                self.reconciliation_passed += 1;
-            } else if !correct {
-                self.wrong_reads_caught_by_reconciliation += 1;
-            }
+impl PerImageSelectorResult {
+    fn stable(&self) -> bool {
+        match self.selected_amounts.split_first() {
+            Some((first, rest)) => rest.iter().all(|v| v == first),
+            None => true,
         }
     }
-
-    fn selected_figure_accuracy(&self) -> f64 {
-        if self.checked == 0 {
-            0.0
-        } else {
-            self.selected_correct as f64 / self.checked as f64
+    /// Most common value across runs (ties broken by first occurrence);
+    /// this is what a majority-vote or "first successful read" production
+    /// path would end up using.
+    fn consensus_amount(&self) -> Option<f64> {
+        let mut best: Option<(f64, usize)> = None;
+        for v in self.selected_amounts.iter().flatten() {
+            let count = self.selected_amounts.iter().flatten().filter(|x| (**x - v).abs() <= 0.01).count();
+            if best.map(|(_, c)| count > c).unwrap_or(true) {
+                best = Some((*v, count));
+            }
         }
+        best.map(|(v, _)| v)
+    }
+    fn correct(&self) -> bool {
+        self.consensus_amount().map(|a| (a - self.expected_amount).abs() <= 0.01).unwrap_or(false)
     }
     fn reconciliation_pass_rate(&self) -> f64 {
-        if self.reconciliation_checked == 0 {
+        if self.reconciles_per_run.is_empty() {
             0.0
         } else {
-            self.reconciliation_passed as f64 / self.reconciliation_checked as f64
+            self.reconciles_per_run.iter().filter(|&&b| b).count() as f64 / self.reconciles_per_run.len() as f64
         }
     }
-    fn reconciliation_catch_rate(&self) -> f64 {
-        if self.wrong_reads == 0 {
-            0.0
-        } else {
-            self.wrong_reads_caught_by_reconciliation as f64 / self.wrong_reads as f64
-        }
+}
+
+fn selector_accuracy(results: &[PerImageSelectorResult]) -> f64 {
+    if results.is_empty() {
+        0.0
+    } else {
+        results.iter().filter(|r| r.correct()).count() as f64 / results.len() as f64
+    }
+}
+fn selector_stability(results: &[PerImageSelectorResult]) -> f64 {
+    if results.is_empty() {
+        0.0
+    } else {
+        results.iter().filter(|r| r.stable()).count() as f64 / results.len() as f64
+    }
+}
+fn selector_reconciliation_rate(results: &[PerImageSelectorResult]) -> f64 {
+    if results.is_empty() {
+        0.0
+    } else {
+        results.iter().map(|r| r.reconciliation_pass_rate()).sum::<f64>() / results.len() as f64
     }
 }
 
@@ -492,7 +502,7 @@ struct VlmCandidateReport {
     stability_rate: f64,
     pricing: Pricing,
     unavailable: bool,
-    selector: SelectorStats,
+    selector_results: Vec<PerImageSelectorResult>,
 }
 
 struct LlmCandidateReport {
@@ -578,15 +588,24 @@ fn run_vlm_candidate(
     dataset_dir: &Path,
     prompt: &PromptSet,
     runs: u32,
+    fixed_resolution: Option<u32>,
 ) -> Result<(VlmCandidateReport, HashMap<String, Vec<(String, Option<Value>)>>)> {
     let labeled: Vec<&GoldImage> = gold.images.iter().filter(|i| i.labeled).collect();
     let mut unlabeled_first_run: HashMap<String, Vec<(String, Option<Value>)>> = HashMap::new();
     let mut consecutive_failures = 0u32;
     let mut unavailable = false;
 
-    // --- resolution sweep: 1 run/labeled image per candidate size ---
+    // --- resolution sweep: 1 run/labeled image per candidate size (skipped
+    // entirely when `fixed_resolution` is set — a top-up run of an
+    // already-screened finalist reuses its already-chosen resolution
+    // instead of re-deriving it). ---
     let mut sweep = Vec::new();
-    'sweep: for &max_dim in &models_cfg.image_preprocessing.candidate_max_dimensions_px {
+    let sweep_resolutions: &[u32] = if fixed_resolution.is_some() {
+        &[]
+    } else {
+        &models_cfg.image_preprocessing.candidate_max_dimensions_px
+    };
+    'sweep: for &max_dim in sweep_resolutions {
         let mut acc = FieldAccuracy::default();
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
@@ -619,18 +638,22 @@ fn run_vlm_candidate(
             acc.rate() * 100.0
         );
     }
-    // Smallest resolution within 1 percentage point of the best observed accuracy.
-    let best_rate = sweep.iter().map(|(_, r)| *r).fold(0.0, f64::max);
-    let chosen_max_dim = sweep
-        .iter()
-        .filter(|(_, r)| *r >= best_rate - 0.01)
-        .map(|(d, _)| *d)
-        .min()
-        .unwrap_or_else(|| models_cfg.image_preprocessing.candidate_max_dimensions_px.last().copied().unwrap_or(1024));
+    // Smallest resolution within 1 percentage point of the best observed
+    // accuracy — unless `fixed_resolution` pins it (top-up run).
+    let chosen_max_dim = if let Some(px) = fixed_resolution {
+        px
+    } else {
+        let best_rate = sweep.iter().map(|(_, r)| *r).fold(0.0, f64::max);
+        sweep
+            .iter()
+            .filter(|(_, r)| *r >= best_rate - 0.01)
+            .map(|(d, _)| *d)
+            .min()
+            .unwrap_or_else(|| models_cfg.image_preprocessing.candidate_max_dimensions_px.last().copied().unwrap_or(1024))
+    };
 
     // --- full pass at chosen resolution: N runs over all 16 images ---
     let mut stats = RunStats::default();
-    let mut selector = SelectorStats::default();
     let mut per_image_outputs: HashMap<String, Vec<Option<Value>>> = HashMap::new();
     if !unavailable {
         consecutive_failures = 0;
@@ -668,7 +691,6 @@ fn run_vlm_candidate(
                 if let Some(expected) = &img.expected_figures {
                     stats.field_acc.add(compare_flat_object(expected, parsed.as_ref()));
                 }
-                selector.record(img, parsed.as_ref());
                 if !img.labeled && run_idx == 0 {
                     unlabeled_first_run
                         .entry(img.image_id.clone())
@@ -696,6 +718,44 @@ fn run_vlm_candidate(
         stable_images as f64 / total_images as f64
     };
 
+    // Selected-figure accuracy/stability/reconciliation, via production's
+    // own selector (buyorwait::extract::images), for every labeled image
+    // gold gives us an expected field+amount+event_context for.
+    let mut selector_results = Vec::new();
+    for img in &gold.images {
+        let (Some(field), Some(expected_amount)) =
+            (img.expected_selected_field.clone(), img.expected_selected_amount)
+        else {
+            continue;
+        };
+        let Some(event) = event_from_gold(img) else { continue };
+        let Some(outputs) = per_image_outputs.get(&img.image_id) else { continue };
+
+        let mut selected_amounts = Vec::new();
+        let mut reconciles_per_run = Vec::new();
+        for parsed in outputs {
+            let figures: Option<ImageFigures> =
+                parsed.as_ref().and_then(|v| serde_json::from_value(v.clone()).ok());
+            match &figures {
+                Some(f) => {
+                    selected_amounts.push(prod_images::select(f, &event));
+                    reconciles_per_run.push(prod_images::reconciles(f, &event));
+                }
+                None => {
+                    selected_amounts.push(None);
+                    reconciles_per_run.push(false);
+                }
+            }
+        }
+        selector_results.push(PerImageSelectorResult {
+            image_id: img.image_id.clone(),
+            expected_field: field,
+            expected_amount,
+            selected_amounts,
+            reconciles_per_run,
+        });
+    }
+
     Ok((
         VlmCandidateReport {
             id: candidate.id.clone(),
@@ -706,7 +766,7 @@ fn run_vlm_candidate(
             stability_rate,
             pricing: candidate.pricing_usd_per_m_tokens.clone(),
             unavailable,
-            selector,
+            selector_results,
         },
         unlabeled_first_run,
     ))
@@ -945,48 +1005,85 @@ fn render_vlm_section(
             cost_per_item * FULL_RUN_IMAGES as f64,
         ));
     }
+    s.push_str(&format!(
+        "\n**Note on labeled-image count:** this run scored against {labeled_count} labeled images (the gold subset actually loaded for this run — see the file/commit noted above). An earlier posted table said \"5 labeled\" from a stale binary whose report-header text hadn't picked up extraction's image_10/image_11 addition yet; the underlying field-accuracy numbers in that run were already computed against every image with `expected_figures` present, so only the header text was wrong, not the scoring.\n\n"
+    ));
+
     s.push_str(
-        "\n**Selected-figure accuracy** (lead directive: the one amount the engine's deterministic selector would actually use matters more than raw all-field accuracy) **and reconciliation** (image_transcription.v1.md's arithmetic checks — subtotal+tax=total, gross-deductions=net, paid+balance=total, line-item sum, currency match):\n\n",
+        "**Selected-figure metrics** (lead directive #2: the one amount the engine's deterministic selector would hand the engine matters more than raw all-field JSON identity, and instability in fields the selector never reads doesn't matter). Computed using **production's own selector code**, `buyorwait::extract::images::{select, reconciles}` — not a bake-off reimplementation — fed gold's `event_context` per image:\n\n",
     );
-    s.push_str("| Model | Selected-figure accuracy | Reconciliation pass rate | Reconciliation catch rate (wrong reads it would have flagged) |\n");
+    s.push_str("| Model | Selected-figure accuracy | Selected-figure stability (same amount every run) | Reconciliation pass rate |\n");
     s.push_str("|---|---|---|---|\n");
     for r in vlm {
         if r.unavailable {
             s.push_str(&format!("| {} | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE |\n", r.id));
             continue;
         }
+        if r.selector_results.is_empty() {
+            s.push_str(&format!("| {} | no labeled images with `event_context` scored | — | — |\n", r.id));
+            continue;
+        }
         s.push_str(&format!(
-            "| {} | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {:.1}% ({}/{}) |\n",
+            "| {} | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {:.1}% |\n",
             r.id,
-            r.selector.selected_figure_accuracy() * 100.0,
-            r.selector.selected_correct,
-            r.selector.checked,
-            r.selector.reconciliation_pass_rate() * 100.0,
-            r.selector.reconciliation_passed,
-            r.selector.reconciliation_checked,
-            r.selector.reconciliation_catch_rate() * 100.0,
-            r.selector.wrong_reads_caught_by_reconciliation,
-            r.selector.wrong_reads,
+            selector_accuracy(&r.selector_results) * 100.0,
+            r.selector_results.iter().filter(|x| x.correct()).count(),
+            r.selector_results.len(),
+            selector_stability(&r.selector_results) * 100.0,
+            r.selector_results.iter().filter(|x| x.stable()).count(),
+            r.selector_results.len(),
+            selector_reconciliation_rate(&r.selector_results) * 100.0,
         ));
     }
+    s.push_str("\nPer-image detail:\n\n");
+    for r in vlm {
+        if r.unavailable || r.selector_results.is_empty() {
+            continue;
+        }
+        s.push_str(&format!("`{}`:\n\n", r.id));
+        s.push_str("| Image | Expected field | Expected amount | Selected amount per run | Stable | Correct | Reconciles |\n");
+        s.push_str("|---|---|---|---|---|---|---|\n");
+        for pr in &r.selector_results {
+            let per_run: Vec<String> = pr
+                .selected_amounts
+                .iter()
+                .map(|v| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "null".to_string()))
+                .collect();
+            s.push_str(&format!(
+                "| {} | {} | {:.2} | {} | {} | {} | {:.0}% |\n",
+                pr.image_id,
+                pr.expected_field,
+                pr.expected_amount,
+                per_run.join(", "),
+                if pr.stable() { "yes" } else { "no" },
+                if pr.correct() { "yes" } else { "no" },
+                pr.reconciliation_pass_rate() * 100.0,
+            ));
+        }
+        s.push('\n');
+    }
 
-    let available: Vec<&VlmCandidateReport> = vlm.iter().filter(|r| !r.unavailable).collect();
-    if let Some(best) = recommend(
-        &available,
-        |r: &&VlmCandidateReport| {
-            if r.selector.checked > 0 {
-                r.selector.selected_figure_accuracy()
-            } else {
-                r.stats.field_acc.rate()
-            }
-        },
-        |r: &&VlmCandidateReport| r.stability_rate,
-        |r: &&VlmCandidateReport| r.stats.valid_json_rate(),
-        |r: &&VlmCandidateReport| r.pricing.cost_usd(r.stats.avg_prompt_tokens() as u64, r.stats.avg_completion_tokens() as u64),
-    ) {
+    s.push_str(&format!(
+        "**Ranking by the lead's stated criteria (selected-figure accuracy, then stability)** — no separate ml-engineer recommendation this time (a prior weighted auto-recommendation contradicted this ranking by folding in cost/valid-JSON weights the lead didn't ask for; removed rather than re-litigated):\n\n"
+    ));
+    let mut ranked: Vec<&VlmCandidateReport> = vlm.iter().filter(|r| !r.unavailable && !r.selector_results.is_empty()).collect();
+    ranked.sort_by(|a, b| {
+        selector_accuracy(&b.selector_results)
+            .partial_cmp(&selector_accuracy(&a.selector_results))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                selector_stability(&b.selector_results)
+                    .partial_cmp(&selector_stability(&a.selector_results))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    for (i, r) in ranked.iter().enumerate() {
         s.push_str(&format!(
-            "\n**ml-engineer recommendation (VLM, non-binding — the user decides):** `{}` via `{}` at {}px. Highest weighted score, using selected-figure accuracy (not raw all-field accuracy) as the accuracy term per the lead's directive, plus stability, valid-JSON rate, and cost/item; re-check against the actual numbers above before deciding.\n",
-            best.id, best.provider, best.chosen_max_dim
+            "{}. `{}` — selected-figure accuracy {:.1}%, stability {:.1}%\n",
+            i + 1,
+            r.id,
+            selector_accuracy(&r.selector_results) * 100.0,
+            selector_stability(&r.selector_results) * 100.0,
         ));
     }
     s.push_str("\nResolution sweep detail (labeled-image field accuracy per candidate max dimension):\n\n");
@@ -1123,7 +1220,7 @@ fn main() -> Result<()> {
             stability_rate: 0.0,
             pricing: candidate.pricing_usd_per_m_tokens.clone(),
             unavailable: true,
-            selector: SelectorStats::default(),
+            selector_results: Vec::new(),
         }
     }
 
@@ -1136,7 +1233,7 @@ fn main() -> Result<()> {
                 .map(|candidate| {
                     scope.spawn(|| {
                         eprintln!("=== VLM candidate: {} ({}) ===", candidate.id, candidate.provider);
-                        run_vlm_candidate(&client, candidate, &cfg, &gold, &args.dataset_dir, &image_prompt, args.runs)
+                        run_vlm_candidate(&client, candidate, &cfg, &gold, &args.dataset_dir, &image_prompt, args.runs, args.fixed_resolution)
                     })
                 })
                 .collect();
