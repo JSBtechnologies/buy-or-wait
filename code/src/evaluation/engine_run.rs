@@ -107,8 +107,24 @@ mod tests {
         }
     }
 
+    /// `Rules::default()` with a JSON object patch applied on top (e.g. `{"drop_late_plans":false}`).
+    fn rules_with(patch: &str) -> Rules {
+        let mut base = serde_json::to_value(Rules::default()).unwrap();
+        let patch: serde_json::Value = serde_json::from_str(if patch.trim().is_empty() { "{}" } else { patch })
+            .unwrap_or_else(|e| panic!("bad rules patch {patch:?}: {e}"));
+        for (k, v) in patch.as_object().expect("rules patch must be a JSON object") {
+            assert!(base.get(k).is_some(), "unknown Rules field {k}");
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
     fn session(inp: &Inputs, user: &str) -> anyhow::Result<Session> {
-        let mut s = Session::from_model(user, &inp.profiles, &inp.events, inp.rates.clone(), Rules::default())?;
+        session_with(inp, user, Rules::default())
+    }
+
+    fn session_with(inp: &Inputs, user: &str, rules: Rules) -> anyhow::Result<Session> {
+        let mut s = Session::from_model(user, &inp.profiles, &inp.events, inp.rates.clone(), rules)?;
         let ev = evidence(user);
         if !ev.is_empty() {
             s.apply_evidence(ev);
@@ -117,7 +133,11 @@ mod tests {
     }
 
     fn decide(inp: &Inputs, r: &Req) -> anyhow::Result<Decision> {
-        let session = session(inp, &r.user)?;
+        decide_with(inp, r, Rules::default())
+    }
+
+    fn decide_with(inp: &Inputs, r: &Req, rules: Rules) -> anyhow::Result<Decision> {
+        let session = session_with(inp, &r.user, rules)?;
         let opts = inp
             .options
             .iter()
@@ -188,6 +208,35 @@ mod tests {
         println!("invariant violations: {violations}, engine errors: {engine_errors}");
         let (_, text) = crate::evaluation::score_file(&dir(), &out, reveal).unwrap();
         println!("{text}");
+    }
+
+    /// Overfit guard: VERIFIER_RULES_A / VERIFIER_RULES_B are JSON patches over Rules::default().
+    /// Prints aggregate per-field counts for both splits and the B−A delta. No per-request detail.
+    #[test]
+    #[ignore]
+    fn rule_delta() {
+        let inp = inputs();
+        let ds = Dataset::load(&dir(), &dir().join("sample_requests.csv")).unwrap();
+        let run = |patch: &str| {
+            let rules = rules_with(patch);
+            let rows: Vec<crate::evaluation::OutputRow> = samples()
+                .iter()
+                .map(|r| match decide_with(&inp, r, rules.clone()) {
+                    Ok(d) => (&d.row).into(),
+                    Err(_) => crate::evaluation::OutputRow { request_id: r.id.clone(), ..Default::default() },
+                })
+                .collect();
+            crate::evaluation::scorer::score(&ds, &rows)
+        };
+        let (pa, pb) = (std::env::var("VERIFIER_RULES_A").unwrap_or_default(), std::env::var("VERIFIER_RULES_B").unwrap_or_default());
+        let (a, b) = (run(&pa), run(&pb));
+        println!("A={pa:?} B={pb:?}");
+        for (name, sa, sb) in [("tuning", &a.tuning, &b.tuning), ("held-out", &a.heldout, &b.heldout)] {
+            for f in crate::evaluation::scorer::FIELDS {
+                let (x, y) = (sa.matched.get(f).copied().unwrap_or(0), sb.matched.get(f).copied().unwrap_or(0));
+                println!("DELTA {name:<8} {f:<38} {x:>2} -> {y:>2} ({:+})", y as i64 - x as i64);
+            }
+        }
     }
 
     #[test]
