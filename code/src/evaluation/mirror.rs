@@ -286,6 +286,31 @@ mod tests {
         }
     }
 
+    /// Dump: message_id -> fact kinds the live pipeline emits (all requests), for classifier design.
+    #[test]
+    #[ignore]
+    fn dump_evidence_by_message() {
+        let inp = Inputs::load(&dir()).unwrap();
+        let mut reqs = model::load_requests(dir().join("requests.csv")).unwrap();
+        reqs.extend(model::load_sample_requests(dir().join("sample_requests.csv")).unwrap().into_iter().map(|s| model::Request {
+            request_id: s.request_id, user_id: s.user_id, request_date: s.request_date, request_type: s.request_type,
+            requested_amount: s.requested_amount, desired_completion_date: s.desired_completion_date,
+            allows_partial_payment: s.allows_partial_payment, request_text: s.request_text,
+        }));
+        let mut lines = Vec::new();
+        for r in &reqs {
+            for rec in evidence_for(&inp, &r.user_id, r.request_date) {
+                let kind = serde_json::to_value(&rec.fact).ok().and_then(|v| v.as_object().and_then(|m| m.keys().next().cloned())).unwrap_or_default();
+                lines.push(format!("{}	{}	{}", rec.record_id.split('#').next().unwrap_or(""), kind, serde_json::to_string(&rec.fact).unwrap()));
+            }
+        }
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/verifier/evidence_by_message.tsv");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, lines.join("
+")).unwrap();
+        println!("wrote {} records to {}", lines.len(), p.display());
+    }
+
     #[test]
     fn explanation_numbers_must_come_from_facts() {
         let inp = Inputs::load(&dir()).unwrap();

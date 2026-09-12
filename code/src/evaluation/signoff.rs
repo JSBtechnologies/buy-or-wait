@@ -120,6 +120,21 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         if ex_err.is_empty() { format!("0 errors, {ex_warn} duplicate-template warnings") } else { ex_err.iter().take(10).cloned().collect::<Vec<_>>().join(" | ") },
     );
 
+    // Evidence the pipeline applies == independent regeneration (snapshots + family coverage).
+    let repo_for_code = dataset_dir.parent().unwrap_or(Path::new(".."));
+    match super::evidence_consistency::check(dataset_dir, &repo_for_code.join("code")) {
+        Err(e) => s.check("evidence consistency", false, format!("could not run: {e}")),
+        Ok(f) => {
+            let errs: Vec<String> = f.iter().filter(|x| x.severity == Severity::Error).map(|x| x.to_string()).collect();
+            let warns = f.len() - errs.len();
+            s.check(
+                "evidence applied == independent regeneration (snapshot drift + family coverage)",
+                errs.is_empty(),
+                if errs.is_empty() { format!("0 errors, {warns} unclassified-message warnings") } else { errs.iter().take(8).cloned().collect::<Vec<_>>().join(" | ") },
+            );
+        }
+    }
+
     // Engine-backed stage: re-run the batch path and check what the file alone cannot show.
     match super::mirror::run(dataset_dir, &dataset_dir.join("requests.csv"), &rows) {
         Err(e) => s.check("engine mirror", false, format!("could not run: {e}")),
