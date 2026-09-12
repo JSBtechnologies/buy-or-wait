@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::forecast::{Forecast, ForecastInputs, SafetyReport, SpendingChange};
 use super::money::Money;
-use super::recurrence::{Occurrence, StreamKind, Streams};
+use super::recurrence::{Occurrence, Streams};
 use super::rules::{ChangePreference, Rules};
 use super::types::{id_rank, Direction, Payment, PaymentMethod, PaymentOption, Profile, RequestSpec};
 
@@ -330,11 +330,7 @@ pub fn eligible_actions(ctx: &PlanContext) -> Vec<ChangeAction> {
             continue;
         }
         for o in s.flexible_targets() {
-            let current = match s.kind {
-                StreamKind::Recurring => s.projected_amount,
-                StreamKind::VariableSpend => o.amount,
-            };
-            push_actions(&mut out, p, &s.category, o, current, ctx.rules);
+            push_actions(&mut out, p, &s.category, o, s.projected_amount, ctx.rules);
         }
     }
     out

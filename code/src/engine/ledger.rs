@@ -56,6 +56,9 @@ pub enum Fact {
     // ---- about the forecast (no one-to-one event row) ----------------------------------
     /// Recurring income amount changes from `effective` onward.
     IncomeAmountChange { category: String, amount: Money, currency: String, effective: NaiveDate },
+    /// Income starts or resumes (first salary, pay resuming after leave): monthly on
+    /// `first_date`'s day from `first_date`, replacing any projected income of the category.
+    IncomeStarts { category: String, amount: Money, currency: String, first_date: NaiveDate },
     /// Only the next income occurrence has a different amount.
     NextIncomeAmount { category: String, amount: Money, currency: String, date: Option<NaiveDate> },
     /// The next income occurrence moves to `new_date`.

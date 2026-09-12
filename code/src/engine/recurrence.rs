@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use super::ledger::{CashTreatment, Ledger};
+use super::ledger::{AmountSource, CashTreatment, Ledger};
 use super::money::Money;
 use super::rules::Rules;
 use super::types::{id_rank, Direction, EventType, Flexibility};
@@ -96,18 +96,12 @@ impl Stream {
         out
     }
 
-    /// The events the user may stop or reduce in this stream: the latest settled row of each
-    /// flexible description (S1.2: "latest settled occurrence of the stream").
+    /// The row a stop/reduce_to action names: the stream's latest flexible settled row
+    /// (S1.2: "latest settled occurrence of the stream"; request_11 dining -> event_989).
+    /// Its flexibility and minimum_allowed_amount govern the action; the action applies to
+    /// the whole stream.
     pub fn flexible_targets(&self) -> Vec<&Occurrence> {
-        let mut latest: BTreeMap<&str, &Occurrence> = BTreeMap::new();
-        for o in &self.occurrences {
-            if o.flexibility != Flexibility::Fixed {
-                latest.insert(&o.description, o);
-            }
-        }
-        let mut v: Vec<&Occurrence> = latest.into_values().collect();
-        v.sort_by_key(|o| (o.date, id_rank(&o.event_id)));
-        v
+        self.occurrences.iter().rev().find(|o| o.flexibility != Flexibility::Fixed).into_iter().collect()
     }
 }
 
@@ -143,6 +137,9 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
         let eligible = e.treatment == CashTreatment::Settled
             && e.cash_date < as_of
             && e.chain_root.is_none()
+            // S5: image-sourced figures are receipts for unusual rows (image_03 bulk grocery
+            // purchase); they never shape a stream's cadence or estimate.
+            && !(rules.exclude_evidence_amounts_from_streams && matches!(e.amount_source, AmountSource::Evidence(_)))
             && matches!(ev.event_type, EventType::Expense | EventType::Subscription | EventType::DebtPayment | EventType::Income)
             && ev.direction != Direction::NonCash;
         let Some(amount) = e.home_amount.filter(|_| eligible) else { continue };

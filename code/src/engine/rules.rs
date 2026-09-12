@@ -97,6 +97,9 @@ pub struct Rules {
     pub one_off_income_keywords: Vec<String>,
     /// Credit descriptions marking the last payment of a stream (S3.4: "Final employer payroll").
     pub income_end_keywords: Vec<String>,
+    /// Settled rows whose amount came from an image are left out of stream detection (S5:
+    /// image_03 bulk grocery purchase excluded from the groceries estimator).
+    pub exclude_evidence_amounts_from_streams: bool,
     /// An income stream whose next expected occurrence fell before rd has stopped (S3.4).
     pub stop_income_after_missed_occurrence: bool,
     /// A scheduled row replaces its calendar month's occurrence of a monthly stream with the
@@ -133,6 +136,7 @@ impl Default for Rules {
                 "bonus", "commission", "arrears", "prize", "lottery", "reimbursement", "refund", "payout", "windfall",
             ]),
             income_end_keywords: strings(&["final"]),
+            exclude_evidence_amounts_from_streams: true,
             stop_income_after_missed_occurrence: true,
             scheduled_replaces_month_occurrence: true,
             drop_late_plans: true,
@@ -148,11 +152,10 @@ impl Rules {
         self.horizon.end(rd)
     }
 
-    /// Rounds the closed-form safe amount to cents. Floor, so the partial plan built from it
-    /// replays as safe; differs from half-up only when FX amounts sit in the trough (no tuning
-    /// row). [GUESS vs S1.5 "rounded to 2 dp"]
+    /// Rounds the closed-form safe amount for output: half-up to 2 dp, nothing coarser
+    /// (RULES S1.5 rounding rule). Plan checks allow `forecast::SAFETY_TOLERANCE` for it.
     pub fn round_safe_amount(&self, raw: Money) -> Money {
-        raw.floor_to_cent()
+        raw.round_to_cent()
     }
 
     /// Months an installment option spans, compared with `max_installment_months`.
