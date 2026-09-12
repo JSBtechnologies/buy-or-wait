@@ -210,6 +210,65 @@ mod tests {
         println!("{text}");
     }
 
+    /// Full invariant pass over every eval request (VERIFY_OUTPUT=<output.csv> also compares each
+    /// shipped row with the engine's row for that request, byte for byte per field).
+    #[test]
+    #[ignore]
+    fn eval_invariants() {
+        let inp = inputs();
+        let inv = Invariants::load(&dir(), &dir().join("requests.csv")).unwrap();
+        let shipped: HashMap<String, crate::evaluation::OutputRow> = match std::env::var("VERIFY_OUTPUT") {
+            Ok(p) => crate::evaluation::contract::read_output(Path::new(&p)).unwrap().1.into_iter().map(|r| (r.request_id.clone(), r)).collect(),
+            Err(_) => HashMap::new(),
+        };
+        let (mut ok, mut violated, mut errors, mut diverged, mut warns) = (0, 0, 0, 0, 0);
+        let mut rows = Vec::new();
+        for r in eval_requests() {
+            let d = match decide(&inp, &r) {
+                Ok(d) => d,
+                Err(e) => {
+                    errors += 1;
+                    println!("ENGINE_ERROR {} {e}", r.id);
+                    continue;
+                }
+            };
+            let (b, bl, wc, wl) = (d.baseline_series(), d.baseline_low_series(), d.with_changes_series(), d.with_changes_low_series());
+            let fc = ForecastSeries { start: r.date, minimum: d.minimum_f64(), baseline: &b, baseline_low: Some(&bl), with_changes: wc.as_deref(), with_changes_low: wl.as_deref() };
+            match inv.assert_row(&d.row, &fc) {
+                Ok(w) => {
+                    ok += 1;
+                    for f in w {
+                        warns += 1;
+                        println!("WARN {f}");
+                    }
+                }
+                Err(v) => {
+                    violated += 1;
+                    print!("VIOLATION {v}");
+                }
+            }
+            let row: crate::evaluation::OutputRow = (&d.row).into();
+            if let Some(s) = shipped.get(&r.id) {
+                if *s != row {
+                    diverged += 1;
+                    for (i, (x, y)) in s.fields().iter().zip(row.fields()).enumerate() {
+                        if *x != y {
+                            println!("DIVERGED {} {}: shipped={x:?} engine={y:?}", r.id, crate::evaluation::contract::HEADER[i]);
+                        }
+                    }
+                }
+            }
+            rows.push(row);
+        }
+        let file = inv.assert_file(&rows);
+        println!(
+            "EVAL INVARIANTS: {} rows, {ok} pass, {violated} violations, {errors} engine errors, {warns} warnings, file-level {}, shipped rows compared {} diverged {diverged}",
+            rows.len(),
+            if file.is_ok() { "PASS" } else { "FAIL" },
+            shipped.len()
+        );
+    }
+
     /// Overfit guard: VERIFIER_RULES_A / VERIFIER_RULES_B are JSON patches over Rules::default().
     /// Prints aggregate per-field counts for both splits and the B−A delta. No per-request detail.
     #[test]
