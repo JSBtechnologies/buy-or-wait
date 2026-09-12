@@ -300,10 +300,11 @@ fn compare_message_records(expected: &Value, actual_records: Option<&Vec<Value>>
 #[derive(Debug, Default, Clone)]
 struct RunStats {
     calls: u32,
+    failed_calls: u32,
     valid_json: u32,
     prompt_tokens: u64,
     completion_tokens: u64,
-    latency_ms_sum: u64,
+    latencies_ms: Vec<u64>,
     field_acc: FieldAccuracy,
 }
 
@@ -312,7 +313,11 @@ impl RunStats {
         self.calls += 1;
         self.prompt_tokens += usage.prompt_tokens;
         self.completion_tokens += usage.completion_tokens;
-        self.latency_ms_sum += usage.latency_ms;
+        self.latencies_ms.push(usage.latency_ms);
+    }
+    fn record_failure(&mut self) {
+        self.calls += 1;
+        self.failed_calls += 1;
     }
     fn avg_prompt_tokens(&self) -> f64 {
         if self.calls == 0 {
@@ -328,12 +333,13 @@ impl RunStats {
             self.completion_tokens as f64 / self.calls as f64
         }
     }
-    fn avg_latency_ms(&self) -> f64 {
-        if self.calls == 0 {
-            0.0
-        } else {
-            self.latency_ms_sum as f64 / self.calls as f64
+    fn p50_latency_ms(&self) -> f64 {
+        if self.latencies_ms.is_empty() {
+            return 0.0;
         }
+        let mut sorted = self.latencies_ms.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2] as f64
     }
     fn valid_json_rate(&self) -> f64 {
         if self.calls == 0 {
@@ -351,7 +357,7 @@ struct VlmCandidateReport {
     resolution_sweep: Vec<(u32, f64)>, // (max_dim, field accuracy on labeled images)
     stats: RunStats,
     stability_rate: f64,
-    cost_usd: f64,
+    pricing: Pricing,
 }
 
 struct LlmCandidateReport {
@@ -360,7 +366,22 @@ struct LlmCandidateReport {
     stats: RunStats,
     stability_rate: f64,
     cost_usd: f64,
+    pricing: Pricing,
 }
+
+/// The real submission needs exactly one VLM call per blank-amount event
+/// (PLAN.md §2.3): 16 images, matching the gold subset's image count exactly.
+const FULL_RUN_IMAGES: usize = 16;
+
+/// `messages.csv` has 215 rows, but extraction's template induction resolves
+/// most of them deterministically once their skeleton is known (PLAN.md §3
+/// batching lever) — the model is only called for *unseen* skeletons. The
+/// gold subset (47 messages, hand-picked to cover every record type) contains
+/// 13 distinct `record_type` shapes (including combined types); that is a
+/// concrete lower-bound proxy for the number of skeletons the full dataset
+/// needs resolved by a model call, not a promise of the exact count (final
+/// count is extraction's template-induction survey, not ml-engineer's).
+const FULL_RUN_MESSAGE_SKELETONS_ESTIMATE: usize = 13;
 
 // ---------------------------------------------------------------------------
 // VLM: resolution sweep (1 run/image on the 5 labeled images) then the full
@@ -426,7 +447,14 @@ fn run_vlm_candidate(
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, max_dim)?;
-            let (parsed, _usage) = image_call(client, candidate, &models_cfg.decoding, prompt, &b64)?;
+            let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
+            let parsed = match outcome {
+                Ok((parsed, _usage)) => parsed,
+                Err(e) => {
+                    eprintln!("  [{}] sweep call failed for {} @ {max_dim}px: {e}", candidate.id, img.image_id);
+                    None
+                }
+            };
             if let Some(expected) = &img.expected_figures {
                 acc.add(compare_flat_object(expected, parsed.as_ref()));
             }
@@ -454,11 +482,26 @@ fn run_vlm_candidate(
         for img in &gold.images {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, chosen_max_dim)?;
-            let (parsed, usage) = image_call(client, candidate, &models_cfg.decoding, prompt, &b64)?;
-            stats.record_usage(&usage);
-            if parsed.is_some() {
-                stats.valid_json += 1;
-            }
+            let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
+            let parsed = match outcome {
+                Ok((parsed, usage)) => {
+                    stats.record_usage(&usage);
+                    if parsed.is_some() {
+                        stats.valid_json += 1;
+                    }
+                    parsed
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [{}] run {} call failed for {}: {e}",
+                        candidate.id,
+                        run_idx + 1,
+                        img.image_id
+                    );
+                    stats.record_failure();
+                    None
+                }
+            };
             if let Some(expected) = &img.expected_figures {
                 stats.field_acc.add(compare_flat_object(expected, parsed.as_ref()));
             }
@@ -486,10 +529,6 @@ fn run_vlm_candidate(
     }
     let stability_rate = stable_images as f64 / total_images as f64;
 
-    let cost_usd = candidate
-        .pricing_usd_per_m_tokens
-        .cost_usd(stats.prompt_tokens, stats.completion_tokens);
-
     Ok(VlmCandidateReport {
         id: candidate.id.clone(),
         provider: candidate.provider.clone(),
@@ -497,7 +536,7 @@ fn run_vlm_candidate(
         resolution_sweep: sweep,
         stats,
         stability_rate,
-        cost_usd,
+        pricing: candidate.pricing_usd_per_m_tokens.clone(),
     })
 }
 
@@ -543,7 +582,15 @@ fn run_llm_candidate(
             max_tokens: 6000,
             json_response: candidate.supports_structured_output,
         };
-        let resp = client.chat_completion_cold(&call)?;
+        let resp = match client.chat_completion_cold(&call) {
+            Ok(resp) => resp,
+            Err(e) => {
+                eprintln!("  [{}] message-batch call failed: {e}", candidate.id);
+                stats.record_failure();
+                outputs.push(None);
+                continue;
+            }
+        };
         stats.record_usage(&resp.usage);
         let parsed = parse_json_loose(&resp.raw_text);
         if parsed.is_some() {
@@ -583,6 +630,7 @@ fn run_llm_candidate(
         stats,
         stability_rate,
         cost_usd,
+        pricing: candidate.pricing_usd_per_m_tokens.clone(),
     })
 }
 
@@ -638,36 +686,72 @@ fn cross_model_agreement(unlabeled_first_run: &HashMap<String, Vec<(String, Opti
 // section into the existing docs/bakeoff.md, preserving everything else.
 // ---------------------------------------------------------------------------
 
+/// Non-binding: ml-engineer reports evidence, the user makes the final pick
+/// (PLAN.md Phase 2d). Simple weighted heuristic over the metrics that matter
+/// most for this challenge (accuracy first, efficiency as the tiebreaker):
+/// field accuracy (0.4) + stability (0.25) + valid-JSON (0.2) - normalized
+/// cost (0.15, cheaper is better, scaled against the group's max cost/item).
+fn recommend<'a, T>(
+    items: &'a [T],
+    field_acc: impl Fn(&T) -> f64,
+    stability: impl Fn(&T) -> f64,
+    valid_json: impl Fn(&T) -> f64,
+    cost_per_item: impl Fn(&T) -> f64,
+) -> Option<&'a T> {
+    let max_cost = items.iter().map(&cost_per_item).fold(0.0_f64, f64::max).max(1e-9);
+    items.iter().max_by(|a, b| {
+        let score = |x: &T| -> f64 {
+            0.40 * field_acc(x) + 0.25 * stability(x) + 0.20 * valid_json(x)
+                + 0.15 * (1.0 - cost_per_item(x) / max_cost)
+        };
+        score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
 fn render_report(vlm: &[VlmCandidateReport], llm: &[LlmCandidateReport], agreement: f64, runs: u32) -> String {
     let mut s = String::new();
     s.push_str("## Step 3 — Bake-off run (results)\n\n");
     s.push_str(&format!(
-        "Each candidate run {runs}x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Nothing here is a pick — the user chooses.\n\n"
+        "Each candidate run {runs}x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as corrected in `3df3082` (message_10 -> `salary_first_confirmed`). Nothing here is a pick — the user chooses.\n\n"
     ));
 
     s.push_str("### VLM candidates (image -> typed figure schema)\n\n");
-    s.push_str("| Model | Provider | Chosen resolution (px) | Valid-JSON rate | Field accuracy (5 labeled) | Stability (16 images) | Avg prompt tok | Avg completion tok | Avg latency (ms) | Total cost (subset) |\n");
-    s.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+    s.push_str("| Model | Provider | Chosen res. (px) | Field accuracy vs gold (5 labeled) | Valid-JSON rate | Stability (5 runs, 16 images) | Cross-model agreement (11 unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run (16 images) |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for r in vlm {
+        let cost_per_item = r.pricing.cost_usd(
+            r.stats.avg_prompt_tokens() as u64,
+            r.stats.avg_completion_tokens() as u64,
+        );
         s.push_str(&format!(
-            "| {} | {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.0} | {:.0} | {:.0} | ${:.4} |\n",
+            "| {} | {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.0} | {:.0} | {:.0} | ${:.5} | ${:.4} |\n",
             r.id,
             r.provider,
             r.chosen_max_dim,
-            r.stats.valid_json_rate() * 100.0,
             r.stats.field_acc.rate() * 100.0,
+            r.stats.valid_json_rate() * 100.0,
             r.stability_rate * 100.0,
+            agreement * 100.0,
             r.stats.avg_prompt_tokens(),
             r.stats.avg_completion_tokens(),
-            r.stats.avg_latency_ms(),
-            r.cost_usd,
+            r.stats.p50_latency_ms(),
+            cost_per_item,
+            cost_per_item * FULL_RUN_IMAGES as f64,
         ));
     }
-    s.push_str(&format!(
-        "\nCross-model agreement on the 11 unlabeled images (no ground truth; majority-vote field agreement across candidates): **{:.1}%**.\n\n",
-        agreement * 100.0
-    ));
-    s.push_str("Resolution sweep detail (labeled-image field accuracy per candidate max dimension):\n\n");
+    if let Some(best) = recommend(
+        vlm,
+        |r| r.stats.field_acc.rate(),
+        |r| r.stability_rate,
+        |r| r.stats.valid_json_rate(),
+        |r| r.pricing.cost_usd(r.stats.avg_prompt_tokens() as u64, r.stats.avg_completion_tokens() as u64),
+    ) {
+        s.push_str(&format!(
+            "\n**ml-engineer recommendation (VLM, non-binding — the user decides):** `{}` via `{}` at {}px. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost/item; re-check against the actual field-accuracy/cost numbers above before deciding.\n",
+            best.id, best.provider, best.chosen_max_dim
+        ));
+    }
+    s.push_str("\nResolution sweep detail (labeled-image field accuracy per candidate max dimension):\n\n");
     for r in vlm {
         let sweep_str: Vec<String> = r
             .resolution_sweep
@@ -678,23 +762,43 @@ fn render_report(vlm: &[VlmCandidateReport], llm: &[LlmCandidateReport], agreeme
     }
 
     s.push_str("\n### LLM candidates (message -> typed records)\n\n");
-    s.push_str("| Model | Provider | Valid-JSON rate | Field accuracy (47 labeled) | Stability | Avg prompt tok | Avg completion tok | Avg latency (ms) | Total cost (subset) |\n");
-    s.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    s.push_str("| Model | Provider | Field accuracy vs gold (47 labeled) | Valid-JSON rate | Stability (5 runs) | Cross-model agreement | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
+    const GOLD_MESSAGES_IN_BATCH: f64 = 47.0;
     for r in llm {
+        let per_item_tokens_in = r.stats.avg_prompt_tokens() / GOLD_MESSAGES_IN_BATCH;
+        let per_item_tokens_out = r.stats.avg_completion_tokens() / GOLD_MESSAGES_IN_BATCH;
+        let per_item_cost = r.pricing.cost_usd(per_item_tokens_in as u64, per_item_tokens_out as u64);
         s.push_str(&format!(
-            "| {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.0} | {:.0} | {:.0} | ${:.4} |\n",
+            "| {} | {} | {:.1}% | {:.1}% | {:.1}% | N/A (all 47 gold messages labeled) | {:.0} | {:.0} | {:.0} | ${:.5} | ${:.4} |\n",
             r.id,
             r.provider,
-            r.stats.valid_json_rate() * 100.0,
             r.stats.field_acc.rate() * 100.0,
+            r.stats.valid_json_rate() * 100.0,
             r.stability_rate * 100.0,
-            r.stats.avg_prompt_tokens(),
-            r.stats.avg_completion_tokens(),
-            r.stats.avg_latency_ms(),
-            r.cost_usd,
+            per_item_tokens_in,
+            per_item_tokens_out,
+            r.stats.p50_latency_ms(),
+            per_item_cost,
+            per_item_cost * FULL_RUN_MESSAGE_SKELETONS_ESTIMATE as f64,
         ));
     }
-    s.push_str("\n(LLM messages are batched one call per run for the whole 47-message gold subset, per PLAN.md §3's batching lever; a real per-user batch in production is far smaller.)\n\n");
+    if let Some(best) = recommend(
+        llm,
+        |r| r.stats.field_acc.rate(),
+        |r| r.stability_rate,
+        |r| r.stats.valid_json_rate(),
+        |r| r.cost_usd,
+    ) {
+        s.push_str(&format!(
+            "\n**ml-engineer recommendation (LLM, non-binding — the user decides):** `{}` via `{}`. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost; re-check against the actual field-accuracy/cost numbers above before deciding.\n",
+            best.id, best.provider
+        ));
+    }
+    s.push_str(&format!(
+        "\n\"Est. cost/full run\" for messages uses {FULL_RUN_MESSAGE_SKELETONS_ESTIMATE} as the number of model calls needed across the full 215-message dataset — the count of distinct `record_type` shapes in the 47-message gold subset, used as a concrete lower-bound proxy for the number of *unseen skeletons* extraction's template induction will send to a model (PLAN.md §3 batching lever); most of the 215 messages are expected to resolve deterministically once their skeleton is known, so message volume to models will be small. This is extraction's estimate to firm up, not ml-engineer's.\n\n"
+    ));
+    s.push_str("(Bake-off messages are batched one call per run for the whole 47-message gold subset, matching the batching lever being judged; a real per-user batch in production is far smaller — per-item token/cost figures above divide the batch call by its message count.)\n\n");
     s
 }
 

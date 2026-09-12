@@ -115,7 +115,7 @@ supports_structured_output = true
 supports_tools = true
 alt_providers = [
   { provider = "novita", pricing_usd_per_m_tokens = { input = 0.60, output = 3.60 }, context_length = 262144, supports_structured_output = false },
-  { provider = "scaleway", pricing_usd_per_m_tokens = { input = 0.684, output = 4.104 }, context_length = null, supports_structured_output = true },
+  { provider = "scaleway", pricing_usd_per_m_tokens = { input = 0.684, output = 4.104 }, supports_structured_output = true },
   { provider = "ovhcloud", pricing_usd_per_m_tokens = { input = 0.71, output = 4.25 }, context_length = 262144, supports_structured_output = true },
 ]
 notes = "Selected as 'the best Qwen3.5/3.6 multimodal model listed': the largest-parameter (397B total / A17B active) live multimodal Qwen3.5/3.6 variant with structured-output support on its cheapest provider. Other live text+image Qwen3.5/3.6 variants considered: Qwen3.6-35B-A3B, Qwen3.6-27B, Qwen3.5-122B-A10B, Qwen3.5-35B-A3B, Qwen3.5-27B, Qwen3.5-9B (all live; see docs/bakeoff.md for full dump)."
@@ -142,12 +142,12 @@ notes = "Cheapest strong general LLM candidate; large context headroom for multi
 id = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
 provider = "publicai"
 model_revision = "c41c291558bdd8cbc37d77868cec0bc5b6921476"
-context_length = null
+# context_length not reported by the router for this provider (publicai).
 pricing_usd_per_m_tokens = { input = 0.20, output = 0.40 }
 supports_structured_output = true
 supports_tools = false
 alt_providers = [
-  { provider = "featherless-ai", pricing_usd_per_m_tokens = null, context_length = null, supports_structured_output = null, note = "pricing/capability metadata not reported by router; treat as unverified until probed directly" },
+  { provider = "featherless-ai", note = "pricing/capability metadata not reported by router; treat as unverified until probed directly" },
 ]
 notes = "SEA-LION targets Southeast Asian languages (relevant: messages.csv includes Indonesian). publicai chosen over featherless-ai because it reports structured_output support and pricing; no tool-calling needed since the system never gives models a tool loop (§2.5)."
 
@@ -179,7 +179,7 @@ alt_providers = [
   { provider = "cerebras", pricing_usd_per_m_tokens = { input = 0.35, output = 0.75 }, context_length = 131072, supports_structured_output = true },
   { provider = "together", pricing_usd_per_m_tokens = { input = 0.15, output = 0.60 }, context_length = 131072, supports_structured_output = true },
   { provider = "fireworks-ai", pricing_usd_per_m_tokens = { input = 0.15, output = 0.60 }, context_length = 131072, supports_structured_output = true },
-  { provider = "scaleway", pricing_usd_per_m_tokens = { input = 0.171, output = 0.684 }, context_length = null, supports_structured_output = true },
+  { provider = "scaleway", pricing_usd_per_m_tokens = { input = 0.171, output = 0.684 }, supports_structured_output = true },
   { provider = "baseten", pricing_usd_per_m_tokens = { input = 0.10, output = 0.50 }, context_length = 128072, supports_structured_output = true },
 ]
 notes = "Cheapest LLM candidate overall on deepinfra; many redundant live providers if deepinfra is degraded."

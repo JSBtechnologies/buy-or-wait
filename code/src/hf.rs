@@ -20,7 +20,8 @@
 use std::env;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -103,6 +104,11 @@ pub struct HfClient {
     backoff_base_ms: u64,
     backoff_multiplier: f64,
     backoff_max_ms: u64,
+    /// Every successful call's `Usage` (cache hit or live), in call order.
+    /// Read back at the end of a run via `usage_records()` to build the
+    /// token/cost report (PLAN.md §6.5). A bake-off run and a real pipeline
+    /// run each get their own `HfClient`, so their usage logs never mix.
+    usage_log: Mutex<Vec<Usage>>,
 }
 
 impl HfClient {
@@ -118,6 +124,13 @@ impl HfClient {
         let token = env::var(HF_TOKEN_ENV)
             .with_context(|| format!("{HF_TOKEN_ENV} env var not set"))?;
         let http = reqwest::blocking::Client::builder()
+            // Without a request timeout, a provider that accepts the
+            // connection but never responds hangs the call forever — no
+            // status code ever arrives, so the 429/5xx retry path never
+            // triggers. A bounded timeout turns that into a retryable error
+            // instead (`is_timeout()`, handled in `call_once`).
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(90))
             .build()
             .context("failed to build HTTP client")?;
         Ok(Self {
@@ -128,7 +141,16 @@ impl HfClient {
             backoff_base_ms: 500,
             backoff_multiplier: 2.0,
             backoff_max_ms: 8000,
+            usage_log: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Every `Usage` recorded so far this run, in call order (cache hits
+    /// included, tagged via `Usage::cache_hit`). Feed this into
+    /// `render_usage_report` at the end of a full-dataset run to produce
+    /// `code/evaluation/usage_report.md` (PLAN.md §6.5).
+    pub fn usage_records(&self) -> Vec<Usage> {
+        self.usage_log.lock().expect("usage_log mutex poisoned").clone()
     }
 
     /// Override retry/backoff behavior (e.g. for tests). Defaults match
@@ -192,12 +214,14 @@ impl HfClient {
         if let Ok(bytes) = fs::read(&path) {
             if let Ok(mut cached) = serde_json::from_slice::<ModelResponse>(&bytes) {
                 cached.usage.cache_hit = true;
+                self.record_usage(&cached.usage);
                 return Ok(cached);
             }
         }
 
         let response = self.call_with_retry(call)?;
         self.write_cache(&path, &response);
+        self.record_usage(&response.usage);
         Ok(response)
     }
 
@@ -209,7 +233,15 @@ impl HfClient {
         let response = self.call_with_retry(call)?;
         let key = Self::cache_key(call);
         self.write_cache(&self.cache_path(&key), &response);
+        self.record_usage(&response.usage);
         Ok(response)
+    }
+
+    fn record_usage(&self, usage: &Usage) {
+        self.usage_log
+            .lock()
+            .expect("usage_log mutex poisoned")
+            .push(usage.clone());
     }
 
     fn write_cache(&self, path: &PathBuf, response: &ModelResponse) {
@@ -229,8 +261,13 @@ impl HfClient {
             match self.call_once(call) {
                 Ok(resp) => return Ok(resp),
                 Err(HfCallError::Retryable(status)) if attempt < self.max_attempts => {
+                    let reason = if status == 0 {
+                        "network/transport error".to_string()
+                    } else {
+                        format!("retryable HTTP {status}")
+                    };
                     eprintln!(
-                        "hf: retryable HTTP {status} calling {} via {} (attempt {attempt}/{}); backing off {backoff_ms}ms",
+                        "hf: {reason} calling {} via {} (attempt {attempt}/{}); backing off {backoff_ms}ms",
                         call.model_id, call.provider, self.max_attempts
                     );
                     thread::sleep(Duration::from_millis(backoff_ms));
@@ -283,7 +320,16 @@ impl HfClient {
             .bearer_auth(&self.token)
             .json(&body)
             .send()
-            .map_err(|e| HfCallError::Fatal(format!("request failed: {e}")))?;
+            .map_err(|e| {
+                // Transport-level failures (DNS blips, connection resets, timeouts)
+                // are usually transient, same as a 5xx: worth retrying with backoff.
+                // 0 is not a real HTTP status; it just carries the retry decision.
+                if e.is_timeout() || e.is_connect() || e.is_request() {
+                    HfCallError::Retryable(0)
+                } else {
+                    HfCallError::Fatal(format!("request failed: {e}"))
+                }
+            })?;
 
         let status = response.status();
         if status.as_u16() == 429 || status.is_server_error() {
@@ -343,6 +389,163 @@ struct ChatUsageRaw {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Usage report (`code/evaluation/usage_report.md`, PLAN.md §6.5)
+// ---------------------------------------------------------------------------
+
+/// Per-million-token pricing for one model, mirroring
+/// `code/config/models.toml`'s `pricing_usd_per_m_tokens`. Kept as a plain
+/// struct here (not parsed from TOML) so `hf.rs` has no dependency on a TOML
+/// parser; the caller reads `models.toml` and builds this map, keyed by
+/// `model_id`.
+#[derive(Debug, Clone, Copy)]
+pub struct Pricing {
+    pub input_per_m: f64,
+    pub output_per_m: f64,
+}
+
+impl Pricing {
+    pub fn cost_usd(&self, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+        (prompt_tokens as f64 / 1_000_000.0) * self.input_per_m
+            + (completion_tokens as f64 / 1_000_000.0) * self.output_per_m
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct ModelTotals {
+    provider: String,
+    calls: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cost_usd: f64,
+}
+
+/// Renders `code/evaluation/usage_report.md` from one run's `Usage` records.
+/// `pricing` is keyed by `model_id` (built by the caller from
+/// `code/config/models.toml`); a model with no pricing entry is still
+/// reported (calls/tokens) with its cost cell shown as "N/A" rather than
+/// silently omitted or treated as free. `total_requests` is the number of
+/// rows in `dataset/requests.csv` for this run — used only for the
+/// per-request averages, never for the per-call averages.
+///
+/// Renders every required section (Overview, per-model breakdown, Overall
+/// row) with zeros when `records` is empty — a baseline run with 0 model
+/// calls must still pass contract signoff (PLAN.md §6.5).
+pub fn render_usage_report(
+    records: &[Usage],
+    pricing: &std::collections::HashMap<String, Pricing>,
+    total_requests: usize,
+) -> String {
+    let mut by_model: std::collections::BTreeMap<String, ModelTotals> = std::collections::BTreeMap::new();
+    for r in records {
+        let entry = by_model.entry(r.model_id.clone()).or_insert_with(|| ModelTotals {
+            provider: r.provider.clone(),
+            ..Default::default()
+        });
+        entry.calls += 1;
+        entry.prompt_tokens += r.prompt_tokens;
+        entry.completion_tokens += r.completion_tokens;
+        if let Some(p) = pricing.get(&r.model_id) {
+            entry.cost_usd += p.cost_usd(r.prompt_tokens, r.completion_tokens);
+        }
+    }
+
+    let total_calls: u64 = by_model.values().map(|m| m.calls).sum();
+    let total_prompt: u64 = by_model.values().map(|m| m.prompt_tokens).sum();
+    let total_completion: u64 = by_model.values().map(|m| m.completion_tokens).sum();
+    let total_tokens = total_prompt + total_completion;
+    // `Sum for f64` folds from `-0.0`, so an empty/all-zero sum is `-0.0`,
+    // which would render as the confusing "$-0.000000" on a baseline (0-call)
+    // run; `+ 0.0` normalizes it back to `+0.0` (IEEE-754: -0.0 + 0.0 = +0.0).
+    let total_cost: f64 = by_model.values().map(|m| m.cost_usd).sum::<f64>() + 0.0;
+    let any_unpriced = records.iter().any(|r| !pricing.contains_key(&r.model_id));
+
+    let mut s = String::new();
+    s.push_str("# Usage report\n\n");
+    s.push_str(
+        "Generated from the final full-dataset run that produced `output.csv`. The run \
+         starts from an empty cache (`--cold`, PLAN.md \u{a7}2.11/\u{a7}3) so every call counted \
+         here is a real model invocation, not a cache hit.\n\n",
+    );
+
+    s.push_str("## Overview\n\n");
+    s.push_str(&format!("- Requests in this run: {total_requests}\n"));
+    s.push_str(&format!("- Model calls: {total_calls}\n"));
+    s.push_str(&format!("- Input tokens: {total_prompt}\n"));
+    s.push_str(&format!("- Output tokens: {total_completion}\n"));
+    s.push_str(&format!("- Total tokens: {total_tokens}\n"));
+    if total_requests > 0 {
+        s.push_str(&format!(
+            "- Avg tokens per request: {:.1}\n",
+            total_tokens as f64 / total_requests as f64
+        ));
+        s.push_str(&format!(
+            "- Avg cost per request: ${:.6}\n",
+            total_cost / total_requests as f64
+        ));
+    } else {
+        s.push_str("- Avg tokens per request: N/A (0 requests in this run)\n");
+        s.push_str("- Avg cost per request: N/A (0 requests in this run)\n");
+    }
+    s.push_str(&format!("- Estimated total cost: ${total_cost:.6}\n"));
+    if any_unpriced {
+        s.push_str(
+            "- Note: at least one model has no pricing entry in `code/config/models.toml`; \
+             its calls are counted in tokens/calls above but excluded from the cost total.\n",
+        );
+    }
+    s.push('\n');
+
+    s.push_str("## Per-model breakdown\n\n");
+    s.push_str(
+        "| Model | Provider | Calls | Input tokens | Output tokens | Total tokens | Avg tokens/call | Est. cost |\n",
+    );
+    s.push_str("|---|---|---|---|---|---|---|---|\n");
+    if by_model.is_empty() {
+        s.push_str("| — | — | 0 | 0 | 0 | 0 | 0.0 | $0.000000 |\n");
+    } else {
+        for (model_id, m) in &by_model {
+            let total = m.prompt_tokens + m.completion_tokens;
+            let avg_per_call = if m.calls == 0 { 0.0 } else { total as f64 / m.calls as f64 };
+            let cost_cell = if pricing.contains_key(model_id) {
+                format!("${:.6}", m.cost_usd)
+            } else {
+                "N/A (no pricing on file)".to_string()
+            };
+            s.push_str(&format!(
+                "| {model_id} | {} | {} | {} | {} | {} | {avg_per_call:.1} | {cost_cell} |\n",
+                m.provider, m.calls, m.prompt_tokens, m.completion_tokens, total
+            ));
+        }
+    }
+    let overall_avg = if total_calls == 0 {
+        0.0
+    } else {
+        total_tokens as f64 / total_calls as f64
+    };
+    s.push_str(&format!(
+        "| **Overall** | — | {total_calls} | {total_prompt} | {total_completion} | {total_tokens} | {overall_avg:.1} | ${total_cost:.6} |\n",
+    ));
+
+    s
+}
+
+/// Renders and writes `render_usage_report`'s output to `out_path`, creating
+/// parent directories as needed (used for `code/evaluation/usage_report.md`).
+pub fn write_usage_report(
+    out_path: &Path,
+    records: &[Usage],
+    pricing: &std::collections::HashMap<String, Pricing>,
+    total_requests: usize,
+) -> Result<()> {
+    let content = render_usage_report(records, pricing, total_requests);
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(out_path, content)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -429,5 +632,49 @@ mod tests {
         assert_eq!(resp2.raw_text, resp.raw_text);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn usage(model_id: &str, provider: &str, prompt: u64, completion: u64) -> Usage {
+        Usage {
+            model_id: model_id.to_string(),
+            provider: provider.to_string(),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            latency_ms: 100,
+            cache_hit: false,
+        }
+    }
+
+    #[test]
+    fn usage_report_baseline_zero_calls_has_every_section() {
+        let report = render_usage_report(&[], &std::collections::HashMap::new(), 250);
+        assert!(report.contains("## Overview"));
+        assert!(report.contains("## Per-model breakdown"));
+        assert!(report.contains("Model calls: 0"));
+        assert!(report.contains("Total tokens: 0"));
+        assert!(report.contains("Estimated total cost: $0.000000"));
+        assert!(report.contains("**Overall**"));
+    }
+
+    #[test]
+    fn usage_report_aggregates_multiple_calls_per_model() {
+        let records = vec![
+            usage("model-a", "provider-x", 100, 50),
+            usage("model-a", "provider-x", 200, 60),
+            usage("model-b", "provider-y", 10, 5),
+        ];
+        let mut pricing = std::collections::HashMap::new();
+        pricing.insert(
+            "model-a".to_string(),
+            Pricing { input_per_m: 1.0, output_per_m: 2.0 },
+        );
+        // model-b intentionally left unpriced.
+        let report = render_usage_report(&records, &pricing, 2);
+        assert!(report.contains("Model calls: 3"));
+        assert!(report.contains("Total tokens: 425")); // (100+50)+(200+60)+(10+5)
+        assert!(report.contains("N/A (no pricing on file)"));
+        // model-a cost: (300/1e6)*1.0 + (110/1e6)*2.0
+        let expected_cost = (300.0 / 1_000_000.0) * 1.0 + (110.0 / 1_000_000.0) * 2.0;
+        assert!(report.contains(&format!("${expected_cost:.6}")));
     }
 }
