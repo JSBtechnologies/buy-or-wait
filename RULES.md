@@ -288,6 +288,29 @@ Images (blank-amount events). Selector by linked event:
 
 Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
 
+**All 16 images: expected EventAmount (analyst read of every page; audit reference for the VLM path).** Selector per `extract/images.rs::select` (income → net pay; settled → amount paid / total; pending/scheduled → amount due for the cash date, else balance due).
+
+| image | event (status, cur) | expected | wrong-but-plausible figures on the page | risk |
+|---|---|---|---|---|
+| 01 | event_253 salary, settled, IDR | **4,365,000** net pay | total earnings 4,780,800; subtotal deductions 415,800. Arrears 1,964,250 is NOT on the payslip (separate settled event_211); never add it | history only |
+| 02 | event_1442 rent, **scheduled**, INR | **100,000** balance due | total 2,00,000; amount received 1,00,000 | cash-moving (−100,000 on 2023-08-16) |
+| 03 | event_1545 groceries, settled, INR | **41,272** cash paid | — | history; excluded from estimator (S5) |
+| 04 | event_1700 groceries, settled, INR | item bill **2,854** (line sum 2,854). The page is cropped below "Delivery…", so no final total is visible | a delivery fee line is cut off | selector returns None (no total/paid) → acceptable: history-only row, excluded from estimator; never 0 |
+| 05 | event_1786 utilities, **pending**, INR, settles 2026-02-09 | **822.05** amount due after 06-Feb-2026 (cash date is after the due date) | 704.05 due by 06-Feb; previous balance 3,543.54 | cash-moving |
+| 06 | event_3051 groceries, settled, INR | **1,995.00** invoice total | per-line totals 565/552/289; CGST/SGST 47.49 | history |
+| 07 | event_3231 dining, settled, INR | **8,528** grand total paid (alt 8,528.10 "Total") | subtotal 8,122; SGST/CGST 203.05 | reconciliation: subtotal 8,122 + tax 406.10 = 8,528.10, so a VLM `total` of 8,528 fails the exact check → rejected; allow ≥1 unit rounding tolerance or read `total`=8,528.10 |
+| 08 | event_4535 housing, settled, INR | **15,339** total amount received | line items 13,880 / 1,050 / 409 | history (message_35 confirms date only) |
+| 09 | event_5170 utilities, settled, INR | **723** total amount received | — | history |
+| 10 | event_6033 groceries, **pending**, INR | **79,679.26** balance due | subtotal 72,045; any single tax line 1,513.13 / 2,304 | cash-moving |
+| 11 | event_6859 healthcare, **scheduled**, INR | **3,650** amount payable / balance | detailed-breakup subtotals sum to **3,150** (250+1,400+1,000+500), inconsistent with the 3,650 summary; amount paid 0 | cash-moving; if the VLM fills `line_items_sum_check` from the breakup, the sum check (3,150 ≠ 3,650) rejects the image → leave that check off for this layout or take it from the top table (1,650+1,000+1,000) |
+| 12 | event_7307 transport, settled, **USD** | **33.50 USD** total (→ INR at the 2025-10-01 USD→INR row) | **cash paid 40.00**, change 6.50 | `select` prefers `amount_paid` → 40.00 would be wrong; amount paid must be net of change (= total) |
+| 13 | event_7941 shopping, settled, INR | **2,298** total paid | item prices 699 / 1,599 | history |
+| 14 | event_9421 healthcare, settled, INR (handwritten) | **4,543** total (lines 1,500+724+796+550+303+670) | struck-through line reads as 670 | history; handwriting read risk |
+| 15 | event_9806 transport, settled, INR | **9,968.00** grand total | 9,580 (air travel line incl. taxes), 9,512 (total excl. tax), 9,124 taxable | history |
+| 16 | event_10521 transport, settled, INR | **393.22** total | 333.24 energy amount; 29.99 each GST | history (message_86 confirms date only) |
+
+Cash-moving images (change a request's forecast): **02, 05, 10, 11**. The other 12 only feed stream estimators, and a missing figure there is safe (row excluded) as long as it is never read as 0.
+
 ---
 
 ## S1. Plan candidates, eligibility, selection, status/method mapping
