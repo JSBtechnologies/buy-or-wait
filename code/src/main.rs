@@ -243,6 +243,7 @@ fn decide_one(
         (model_ctx.client, model_ctx.image_prompt, model_ctx.config.vlm_primary())
     {
         let vlm_escalation = model_ctx.config.vlm_escalation();
+        let vlm_fallback = model_ctx.config.vlm_fallback();
         let image_max_dim_px = model_ctx.config.image_max_dim_px();
         for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
             let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
@@ -266,6 +267,7 @@ fn decide_one(
                 &image.image_id,
                 vlm_primary,
                 vlm_escalation,
+                vlm_fallback,
                 &typed_event,
             ) {
                 Ok(Some(record)) => facts.push(record),
@@ -284,6 +286,7 @@ fn decide_one(
             prompt,
             &model_ctx.config.decoding,
             llm_primary,
+            model_ctx.config.llm_fallback(),
             &evidence.messages,
             &home_currency,
         ) {

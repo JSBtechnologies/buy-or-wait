@@ -22,6 +22,8 @@ pub struct ModelsConfig {
     pub candidates: CandidatesConfig,
     #[serde(default)]
     pub selected: Selected,
+    #[serde(default)]
+    pub fallback: FallbackConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +53,22 @@ pub struct CandidateConfig {
     pub model_revision: String,
     #[serde(default)]
     pub supports_structured_output: bool,
+    /// Only set on `[[fallback.candidates]]` entries (ml-engineer 2f0746b): "llm", "vlm",
+    /// or "llm_and_vlm" for a multimodal backup that covers both roles with one model.
+    /// `None` for the primary `[[candidates.vlm]]`/`[[candidates.llm]]` entries, which
+    /// already know their role from which array they're in.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Backup/fallback model catalog (ml-engineer 2f0746b, user request): frontier-class,
+/// more-expensive models tried only when a primary candidate's output fails validation/
+/// reconciliation or the primary is unavailable — never a routine first choice. Separate
+/// from `candidates` so it can never accidentally become a primary pick.
+#[derive(Debug, Default, Deserialize)]
+pub struct FallbackConfig {
+    #[serde(default)]
+    pub candidates: Vec<CandidateConfig>,
 }
 
 /// Filled in once the bake-off concludes and the user picks (PLAN.md Phase 2d). Absent
@@ -96,16 +114,23 @@ impl ModelsConfig {
         self.selected.vlm_escalation.as_deref().and_then(|id| self.find_vlm(id))
     }
 
+    /// Resolves `[selected].vlm_fallback` against `[[candidates.vlm]]` first, then the
+    /// `[[fallback.candidates]]` catalog (ml-engineer 2f0746b) filtered to a "vlm" or
+    /// "llm_and_vlm" role.
     pub fn vlm_fallback(&self) -> Option<&CandidateConfig> {
-        self.selected.vlm_fallback.as_deref().and_then(|id| self.find_vlm(id))
+        let id = self.selected.vlm_fallback.as_deref()?;
+        self.find_vlm(id).or_else(|| self.find_fallback(id, "vlm"))
     }
 
     pub fn llm_primary(&self) -> Option<&CandidateConfig> {
         self.selected.llm_primary.as_deref().and_then(|id| self.find_llm(id))
     }
 
+    /// Resolves `[selected].llm_fallback` against `[[candidates.llm]]` first, then the
+    /// `[[fallback.candidates]]` catalog filtered to a "llm" or "llm_and_vlm" role.
     pub fn llm_fallback(&self) -> Option<&CandidateConfig> {
-        self.selected.llm_fallback.as_deref().and_then(|id| self.find_llm(id))
+        let id = self.selected.llm_fallback.as_deref()?;
+        self.find_llm(id).or_else(|| self.find_fallback(id, "llm"))
     }
 
     pub fn image_max_dim_px(&self) -> u32 {
@@ -118,6 +143,13 @@ impl ModelsConfig {
 
     fn find_llm(&self, id: &str) -> Option<&CandidateConfig> {
         self.candidates.llm.iter().find(|c| c.id == id)
+    }
+
+    fn find_fallback(&self, id: &str, wanted_role: &str) -> Option<&CandidateConfig> {
+        self.fallback.candidates.iter().find(|c| {
+            c.id == id
+                && c.role.as_deref().is_some_and(|r| r == wanted_role || r == "llm_and_vlm")
+        })
     }
 }
 
