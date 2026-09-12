@@ -198,7 +198,10 @@ pub fn parse_known_skeleton(text: &str) -> Option<Vec<MessageRecord>> {
     static RE_SALARY_RESUMES: &str =
         r"Regular salary of ([A-Z]{2,4}) ([\d,]+(?:\.\d+)?) resumes on (\d{4}-\d{2}-\d{2})\. A new recurring (.+?) payment begins";
     if let Some(c) = regex::Regex::new(RE_SALARY_RESUMES).unwrap().captures(text) {
-        let mut salary = blank_record(RecordType::SalaryChange);
+        // engine#63/8cc70f3: "resumes" is Fact::IncomeStarts (re-anchors the monthly
+        // cadence from first_date), same as a first salary — use SalaryFirstConfirmed
+        // so to_evidence() routes it there instead of a plain amount change.
+        let mut salary = blank_record(RecordType::SalaryFirstConfirmed);
         salary.currency = Some(c[1].to_string());
         salary.amount = Some(amt(&c[2]));
         salary.date = Some(c[3].to_string());

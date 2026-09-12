@@ -1,0 +1,19 @@
+[
+  {
+    "record_id": "message_01#0",
+    "source": {
+      "Message": {
+        "source_type": "employer"
+      }
+    },
+    "observed_at": "2025-07-29T09:30:00",
+    "fact": {
+      "IncomeAmountChange": {
+        "category": "salary",
+        "amount": 427500000000,
+        "currency": "IDR",
+        "effective": "2025-08-15"
+      }
+    }
+  }
+]
