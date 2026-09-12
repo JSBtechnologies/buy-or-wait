@@ -13,7 +13,7 @@ use super::explain;
 use super::facts::{CandidateFact, CandidateOutcome, ChangeFact, DecisionFacts};
 use super::forecast::{Forecast, ForecastInputs, SpendingChange};
 use super::ledger::{EvidenceRecord, Ledger, LedgerIssue};
-use super::money::Cents;
+use super::money::Money;
 use super::plans::{self, Outcome, PlanContext};
 use super::recurrence::{self, Streams};
 use super::rules::Rules;
@@ -53,13 +53,23 @@ impl Decision {
         self.with_changes.as_ref().map(|f| to_f64(&f.balance))
     }
 
+    /// Intraday lows (after each day's debits, before its credits), baseline projection.
+    pub fn baseline_low_series(&self) -> Vec<f64> {
+        to_f64(&self.baseline.low)
+    }
+
+    /// Intraday lows with the recommended spending changes applied.
+    pub fn with_changes_low_series(&self) -> Option<Vec<f64>> {
+        self.with_changes.as_ref().map(|f| to_f64(&f.low))
+    }
+
     pub fn minimum_f64(&self) -> f64 {
-        self.baseline.minimum_balance.0 as f64 / 100.0
+        self.baseline.minimum_balance.to_f64()
     }
 }
 
-fn to_f64(v: &[Cents]) -> Vec<f64> {
-    v.iter().map(|c| c.0 as f64 / 100.0).collect()
+fn to_f64(v: &[Money]) -> Vec<f64> {
+    v.iter().map(|c| c.to_f64()).collect()
 }
 
 impl Session {
@@ -113,7 +123,7 @@ impl Session {
 
     /// Decide one request of this session's user. `options` are that request's payment options.
     pub fn decide(&self, request_id: &str, request_date: NaiveDate, spec: &RequestSpec, options: &[PaymentOption]) -> Result<Decision> {
-        ensure!(spec.amount > Cents::ZERO, "{request_id}: non-positive requested amount");
+        ensure!(spec.amount > Money::ZERO, "{request_id}: non-positive requested amount");
         let rules = &self.rules;
         let profile = &self.profile;
         let streams = self.streams(request_date);
@@ -293,7 +303,7 @@ fn issue_text(i: &LedgerIssue) -> String {
 /// Engine-side hard checks that facts and row agree (the verifier runs the full §2.10 set).
 fn self_check(f: &DecisionFacts, row: &model::OutputRow) -> Result<()> {
     let id = &f.request_id;
-    ensure!(f.safe_amount >= Cents::ZERO && f.safe_amount <= f.requested_amount, "{id}: safe amount out of range");
+    ensure!(f.safe_amount >= Money::ZERO && f.safe_amount <= f.requested_amount, "{id}: safe amount out of range");
     if f.status == AffordabilityStatus::AffordableNow {
         ensure!(f.earliest_full_date == Some(f.request_date), "{id}: affordable_now without earliest == request_date");
         ensure!(f.method == PaymentMethod::FullPayment, "{id}: affordable_now must be full_payment");
@@ -301,7 +311,7 @@ fn self_check(f: &DecisionFacts, row: &model::OutputRow) -> Result<()> {
     ensure!(f.plan.windows(2).all(|w| w[0].date <= w[1].date), "{id}: plan not chronological");
     match f.method {
         PaymentMethod::FullPayment | PaymentMethod::Wait | PaymentMethod::PartialPayment => {
-            let total: Cents = f.plan.iter().map(|p| p.amount).sum();
+            let total: Money = f.plan.iter().map(|p| p.amount).sum();
             ensure!(total == f.requested_amount, "{id}: plan sums to {total}, not the requested amount");
         }
         PaymentMethod::NotRecommended => ensure!(row.payment_plan == "none", "{id}: not_recommended with a plan"),

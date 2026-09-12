@@ -15,7 +15,7 @@ use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use super::ledger::Ledger;
-use super::money::Cents;
+use super::money::Money;
 use super::rules::Rules;
 use super::types::{Direction, EventType, Flexibility};
 
@@ -39,10 +39,10 @@ pub struct Occurrence {
     pub description: String,
     pub date: NaiveDate,
     /// Home-currency magnitude.
-    pub amount: Cents,
+    pub amount: Money,
     pub flexibility: Flexibility,
     /// Home-currency floor for reduce_to, when the row carries one.
-    pub minimum_allowed_amount: Option<Cents>,
+    pub minimum_allowed_amount: Option<Money>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,7 +58,7 @@ pub struct Stream {
     /// Chronological supporting history.
     pub occurrences: Vec<Occurrence>,
     /// Home-currency magnitude of each projected occurrence (before spending changes).
-    pub projected_amount: Cents,
+    pub projected_amount: Money,
 }
 
 impl Stream {
@@ -144,7 +144,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
 
     for e in ledger.settled_history(as_of) {
         let ev = &e.event;
-        if !is_stream_eligible(ev.event_type, ev.direction) || e.reversed_by.is_some() {
+        if !is_stream_eligible(ev.event_type, ev.direction) || e.chain_root.is_some() {
             one_offs.push(ev.id.clone());
             continue;
         }
@@ -172,7 +172,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
         occs.sort_by_key(|o| (o.date, super::types::id_rank(&o.event_id)));
         match recurring_cadence(&occs, as_of, rules) {
             Some(cadence) => {
-                let amounts: Vec<Cents> = occs.iter().map(|o| o.amount).collect();
+                let amounts: Vec<Money> = occs.iter().map(|o| o.amount).collect();
                 streams.push(Stream {
                     id: format!("rec:{}:{}:{}", direction.as_str(), category, description),
                     kind: StreamKind::Recurring,
@@ -191,7 +191,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
         occs.sort_by_key(|o| (o.date, super::types::id_rank(&o.event_id)));
         match variable_cadence(&occs, as_of, rules) {
             Some(cadence) => {
-                let amounts: Vec<Cents> = occs.iter().map(|o| o.amount).collect();
+                let amounts: Vec<Money> = occs.iter().map(|o| o.amount).collect();
                 streams.push(Stream {
                     id: format!("var:{category}"),
                     kind: StreamKind::VariableSpend,
@@ -206,8 +206,50 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
             None => one_offs.extend(occs.into_iter().map(|o| o.event_id)),
         }
     }
+    anchor_scheduled_income(ledger, &mut streams);
     one_offs.sort_by_key(|id| super::types::id_rank(id));
     Streams { as_of: Some(as_of), streams, one_off_event_ids: one_offs }
+}
+
+/// RULES S2.1: a scheduled income row (`Next confirmed salary`) *is* that month's occurrence of
+/// its income stream, and the stream continues monthly afterwards at the scheduled amount.
+/// With no detected stream (e.g. only a prorated first salary) the row seeds one.
+fn anchor_scheduled_income(ledger: &Ledger, streams: &mut Vec<Stream>) {
+    let scheduled = ledger
+        .scheduled()
+        .filter(|e| e.event.direction == Direction::Credit && e.event.event_type == EventType::Income);
+    for e in scheduled {
+        let Some(amount) = e.home_amount else { continue };
+        let occ = Occurrence {
+            event_id: e.event.id.clone(),
+            description: e.event.description.clone(),
+            date: e.cash_date,
+            amount,
+            flexibility: e.event.flexibility,
+            minimum_allowed_amount: None,
+        };
+        let existing = streams
+            .iter_mut()
+            .filter(|s| s.kind == StreamKind::Recurring && s.direction == Direction::Credit && s.category == e.event.category)
+            .max_by_key(|s| s.last_date());
+        match existing {
+            Some(s) if s.last_date() < e.cash_date => {
+                s.occurrences.push(occ);
+                s.projected_amount = amount;
+            }
+            Some(_) => {}
+            None => streams.push(Stream {
+                id: format!("sched:credit:{}:{}", e.event.category, e.event.id),
+                kind: StreamKind::Recurring,
+                direction: Direction::Credit,
+                category: e.event.category.clone(),
+                description: Some(e.event.description.clone()),
+                cadence: Cadence::Monthly { day: e.cash_date.day() },
+                occurrences: vec![occ],
+                projected_amount: amount,
+            }),
+        }
+    }
 }
 
 /// Refunds, investment rows and non-cash valuations are never streams.
@@ -293,9 +335,9 @@ fn clamp_day(y: i32, m: u32, day: u32) -> NaiveDate {
 }
 
 /// Convert a foreign-currency floor with the same ratio as its row's amount conversion.
-fn scale_like(value: Cents, row_amount: Cents, home_amount: Cents) -> Option<Cents> {
+fn scale_like(value: Money, row_amount: Money, home_amount: Money) -> Option<Money> {
     if row_amount.0 == 0 {
         return None;
     }
-    Some(Cents(((value.0 as i128 * home_amount.0 as i128) / row_amount.0 as i128) as i64))
+    Some(Money(((value.0 as i128 * home_amount.0 as i128) / row_amount.0 as i128) as i64))
 }

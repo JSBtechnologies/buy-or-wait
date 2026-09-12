@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::money::Cents;
+use super::money::Money;
 use super::types::PaymentOption;
 
 /// How a regular variable-spend stream turns its recent occurrences into a projected amount.
@@ -23,20 +23,20 @@ pub enum AmountEstimator {
 
 impl AmountEstimator {
     /// `amounts` is chronological (oldest first). Empty input yields zero.
-    pub fn estimate(self, amounts: &[Cents]) -> Cents {
+    pub fn estimate(self, amounts: &[Money]) -> Money {
         match self {
-            AmountEstimator::Last => amounts.last().copied().unwrap_or(Cents::ZERO),
+            AmountEstimator::Last => amounts.last().copied().unwrap_or(Money::ZERO),
             AmountEstimator::MaxOfLast(n) => {
-                amounts.iter().rev().take(n).copied().max().unwrap_or(Cents::ZERO)
+                amounts.iter().rev().take(n).copied().max().unwrap_or(Money::ZERO)
             }
             AmountEstimator::MeanOfLast(n) => {
-                let tail: Vec<Cents> = amounts.iter().rev().take(n).copied().collect();
+                let tail: Vec<Money> = amounts.iter().rev().take(n).copied().collect();
                 if tail.is_empty() {
-                    return Cents::ZERO;
+                    return Money::ZERO;
                 }
                 let sum: i64 = tail.iter().map(|c| c.0).sum();
                 let len = tail.len() as i64;
-                Cents((sum + len - 1).div_euclid(len))
+                Money((sum + len - 1).div_euclid(len))
             }
         }
     }
@@ -44,13 +44,13 @@ impl AmountEstimator {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rules {
-    /// Number of forecast days starting at request_date (day 0). PROVISIONAL: 90 days,
-    /// i.e. request_date ..= request_date + 89.
+    /// Number of forecast days starting at request_date (day 0). RULES S2.3 [EXACT]:
+    /// rd ..= rd + 90, i.e. 91 days.
     pub horizon_days: i64,
 
     // ---- ledger (§2.1) ------------------------------------------------------------------
-    /// Pending debits are reserved on request_date (money already gone). If false they are
-    /// reserved on their settlement date instead. PROVISIONAL: true (PLAN.md §2.1 wording).
+    /// Pending debits are reserved on request_date if true, else on max(rd, settlement_date)
+    /// (RULES S2.1; both give identical tuning labels).
     pub reserve_pending_on_request_date: bool,
     /// Scheduled rows whose cash date is before request_date are assumed already reflected in
     /// the balance and ignored. PROVISIONAL.
@@ -99,8 +99,8 @@ pub enum ChangePreference {
 impl Default for Rules {
     fn default() -> Self {
         Rules {
-            horizon_days: 90,
-            reserve_pending_on_request_date: true,
+            horizon_days: 91,
+            reserve_pending_on_request_date: false,
             ignore_scheduled_before_request_date: true,
             min_stream_occurrences: 3,
             monthly_dom_tolerance: 3,
@@ -126,21 +126,22 @@ impl Rules {
         self.variable_categories.iter().any(|c| c == category)
     }
 
-    /// Rounds the closed-form safe amount for output. PROVISIONAL: floor to the cent (the
-    /// forecast is already in cents, so this is the identity until RULES.md says otherwise).
-    pub fn round_safe_amount(&self, raw: Cents) -> Cents {
-        raw
+    /// Rounds the closed-form safe amount to cents. Floor, so the partial plan built from it
+    /// replays as safe; only differs from half-up when FX amounts sit in the trough (no
+    /// tuning row). [GUESS vs RULES S1.5 "rounded to 2 dp"]
+    pub fn round_safe_amount(&self, raw: Money) -> Money {
+        raw.floor_to_cent()
     }
 
     /// Months an installment option spans, compared with `max_installment_months`.
-    /// PROVISIONAL: the number of payments.
+    /// RULES S1.1 [FIT]: the number of payments.
     pub fn installment_months(&self, option: &PaymentOption) -> u32 {
         option.number_of_payments
     }
 
     /// The amount a projected reduce_to target is lowered to. PROVISIONAL: the event's
     /// minimum_allowed_amount (samples 11 and 21 reduce exactly to it).
-    pub fn reduce_to_amount(&self, minimum_allowed: Cents) -> Cents {
+    pub fn reduce_to_amount(&self, minimum_allowed: Money) -> Money {
         minimum_allowed
     }
 }

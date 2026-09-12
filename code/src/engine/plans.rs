@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use super::forecast::{Forecast, ForecastInputs, SafetyReport, SpendingChange};
-use super::money::Cents;
+use super::money::Money;
 use super::recurrence::{Occurrence, StreamKind, Streams};
 use super::rules::{ChangePreference, Rules};
 use super::types::{id_rank, Direction, Payment, PaymentMethod, PaymentOption, Profile, RequestSpec};
@@ -20,7 +20,7 @@ pub struct Candidate {
     pub payments: Vec<Payment>,
     pub option_id: Option<String>,
     pub changes: Vec<SpendingChange>,
-    pub total_paid: Cents,
+    pub total_paid: Money,
 }
 
 impl Candidate {
@@ -53,9 +53,9 @@ pub struct RankKey {
     pub misses_deadline: bool,
     /// 2. Require no spending changes; among change plans, per `Rules::change_preference`
     ///    either fewer changes (RULES S1.3) or the smallest spending cut.
-    pub change_order: (usize, Cents),
+    pub change_order: (usize, Money),
     /// 3. Minimize the total amount paid.
-    pub total_paid: Cents,
+    pub total_paid: Money,
     /// 4. Start payment earlier.
     pub start: NaiveDate,
     /// 5. Use fewer payments.
@@ -63,7 +63,7 @@ pub struct RankKey {
     /// 6. Lowest payment_option_id; non-option plans sort first on a full tie (RULES S1.3).
     pub option_rank: Option<(u64, String)>,
     /// 7. Remaining change tie-breaks (the other of count/cut, then event ids).
-    pub change_tail: (usize, Cents, Vec<String>),
+    pub change_tail: (usize, Money, Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,12 +72,12 @@ pub enum DropReason {
     InstallmentsNotConsidered,
     ExceedsMaxInstallmentMonths { months: u32, max: u32 },
     PartialNotAllowedByRequest,
-    PartialAmountOutOfRange { safe: Cents },
+    PartialAmountOutOfRange { safe: Money },
     NoSafeFullDateInHorizon,
     FullDateAfterDeadline { date: NaiveDate },
     NotLater,
     CompletesAfterDeadline { completion: NaiveDate },
-    Unsafe { date: NaiveDate, balance: Cents },
+    Unsafe { date: NaiveDate, balance: Money },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ impl SearchResult {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChangeAction {
     pub change: SpendingChange,
-    pub cut: Cents,
+    pub cut: Money,
     pub description: String,
     pub category: String,
 }
@@ -124,7 +124,7 @@ pub struct PlanContext<'a> {
     pub request_date: NaiveDate,
     pub options: &'a [PaymentOption],
     pub baseline: &'a Forecast,
-    pub safe_amount: Cents,
+    pub safe_amount: Money,
     pub earliest_full_date: Option<NaiveDate>,
     pub streams: &'a Streams,
     pub forecast_inputs: &'a ForecastInputs<'a>,
@@ -159,14 +159,14 @@ pub fn search(ctx: &PlanContext) -> SearchResult {
                 for c in &today {
                     let mut v = (*c).clone();
                     v.changes = changes.clone();
-                    let cut: Cents = set.iter().map(|a| a.cut).sum();
+                    let cut: Money = set.iter().map(|a| a.cut).sum();
                     let mut e = evaluate(ctx, &forecast, v);
                     if let Outcome::Survived { key, .. } = &mut e.outcome {
                         let count = key.change_order.0;
                         let ids = std::mem::take(&mut key.change_tail.2);
                         (key.change_order, key.change_tail) = match ctx.rules.change_preference {
-                            ChangePreference::FewestChanges => ((count, cut), (0, Cents::ZERO, ids)),
-                            ChangePreference::SmallestCut => ((1, cut), (count, Cents::ZERO, ids)),
+                            ChangePreference::FewestChanges => ((count, cut), (0, Money::ZERO, ids)),
+                            ChangePreference::SmallestCut => ((1, cut), (count, Money::ZERO, ids)),
                         };
                     }
                     // Unsafe change variants are not worth recording individually.
@@ -254,7 +254,7 @@ fn base_candidates(ctx: &PlanContext, evaluated: &mut Vec<Evaluated>) -> Vec<Can
             drop(c, DropReason::PartialNotAllowedByRequest);
         } else if !p.accepts(PaymentMethod::PartialPayment) {
             drop(c, DropReason::MethodNotAccepted);
-        } else if !(safe > Cents::ZERO && safe < spec.amount) {
+        } else if !(safe > Money::ZERO && safe < spec.amount) {
             drop(c, DropReason::PartialAmountOutOfRange { safe });
         } else if earliest > spec.deadline {
             drop(c, DropReason::FullDateAfterDeadline { date: earliest });
@@ -299,14 +299,24 @@ fn evaluate(ctx: &PlanContext, forecast: &Forecast, c: Candidate) -> Evaluated {
     if let Some((date, balance)) = safety.first_breach {
         return Evaluated { candidate: c, outcome: Outcome::Dropped(DropReason::Unsafe { date, balance }) };
     }
+    // RULES S1.1(a): full payment today needs that forecast's safe amount >= req, which also
+    // covers the request day's own pre-credit low.
+    if c.method == PaymentMethod::FullPayment && c.start() == Some(forecast.start) {
+        let safe = forecast.raw_safe_amount();
+        if safe < c.total_paid {
+            let (balance, date) = forecast.trough();
+            let balance = balance - c.total_paid;
+            return Evaluated { candidate: c, outcome: Outcome::Dropped(DropReason::Unsafe { date, balance }) };
+        }
+    }
     let key = RankKey {
         misses_deadline,
-        change_order: (c.changes.len(), Cents::ZERO),
+        change_order: (c.changes.len(), Money::ZERO),
         total_paid: c.total_paid,
         start: c.start().unwrap_or(ctx.request_date),
         payment_count: c.payments.len(),
         option_rank: c.option_id.as_deref().map(id_rank),
-        change_tail: (0, Cents::ZERO, c.changes.iter().map(|x| x.event_id().to_string()).collect()),
+        change_tail: (0, Money::ZERO, c.changes.iter().map(|x| x.event_id().to_string()).collect()),
     };
     Evaluated { candidate: c, outcome: Outcome::Survived { key, safety } }
 }
@@ -330,7 +340,7 @@ pub fn eligible_actions(ctx: &PlanContext) -> Vec<ChangeAction> {
     out
 }
 
-fn push_actions(out: &mut Vec<ChangeAction>, p: &Profile, category: &str, o: &Occurrence, current: Cents, rules: &Rules) {
+fn push_actions(out: &mut Vec<ChangeAction>, p: &Profile, category: &str, o: &Occurrence, current: Money, rules: &Rules) {
     let in_list = |list: &[String]| list.iter().any(|c| c == category);
     if o.flexibility.can_stop() && in_list(&p.stoppable_categories) {
         out.push(ChangeAction {
