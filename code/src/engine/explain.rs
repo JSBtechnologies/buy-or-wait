@@ -4,12 +4,12 @@
 use chrono::{Datelike, NaiveDate};
 
 use super::facts::DecisionFacts;
-use super::money::Cents;
+use super::money::Money;
 use super::types::PaymentMethod;
 
 pub fn render(f: &DecisionFacts) -> String {
     let cur = &f.currency;
-    let money = |c: Cents| format!("{cur} {}", c.fmt_grouped());
+    let money = |c: Money| format!("{cur} {}", c.fmt_grouped());
     let min = money(f.minimum_balance);
     let req = money(f.requested_amount);
     match f.method {
@@ -49,7 +49,7 @@ pub fn render(f: &DecisionFacts) -> String {
         PaymentMethod::NotRecommended => {
             // Variant B iff methods == {partial_payment}, partial allowed, safe > 0, no E [FIT].
             let only_partial = f.accepted_methods == [PaymentMethod::PartialPayment];
-            if only_partial && f.allows_partial_payment && f.safe_amount > Cents::ZERO && f.earliest_full_date.is_none() {
+            if only_partial && f.allows_partial_payment && f.safe_amount > Money::ZERO && f.earliest_full_date.is_none() {
                 format!(
                     "Do not proceed with the {req} request. Although {} is available today, the full amount cannot be completed safely within 90 days.",
                     money(f.safe_amount)

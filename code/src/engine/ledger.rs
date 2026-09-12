@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
-use super::money::Cents;
+use super::money::Money;
 use super::rules::Rules;
 use super::types::{Direction, Event, EventType, RateProvider, Status};
 
@@ -41,13 +41,13 @@ pub struct EvidenceRecord {
 pub enum Fact {
     // ---- about one supplied event row --------------------------------------------------
     /// The figure for a row with a blank amount (image selector output).
-    EventAmount { event_id: String, amount: Cents, currency: String },
+    EventAmount { event_id: String, amount: Money, currency: String },
     /// The row's transaction was explicitly cancelled / reversed.
     EventCancelled { event_id: String },
     /// The row explicitly settled (optionally with its final amount / date).
-    EventSettled { event_id: String, amount: Option<Cents>, date: Option<NaiveDate> },
+    EventSettled { event_id: String, amount: Option<Money>, date: Option<NaiveDate> },
     /// The row was explicitly amended (new amount and/or new cash date).
-    EventAmended { event_id: String, amount: Option<Cents>, date: Option<NaiveDate> },
+    EventAmended { event_id: String, amount: Option<Money>, date: Option<NaiveDate> },
     /// The row duplicates another (e.g. pending copy of a settled charge).
     DuplicateOf { event_id: String, of_event_id: Option<String> },
     /// The row is a transfer between the user's own accounts.
@@ -55,9 +55,9 @@ pub enum Fact {
 
     // ---- about the forecast (no one-to-one event row) ----------------------------------
     /// Recurring income amount changes from `effective` onward.
-    IncomeAmountChange { category: String, amount: Cents, currency: String, effective: NaiveDate },
+    IncomeAmountChange { category: String, amount: Money, currency: String, effective: NaiveDate },
     /// Only the next income occurrence has a different amount.
-    NextIncomeAmount { category: String, amount: Cents, currency: String, date: Option<NaiveDate> },
+    NextIncomeAmount { category: String, amount: Money, currency: String, date: Option<NaiveDate> },
     /// The next income occurrence moves to `new_date`.
     IncomeDateMoved { category: String, new_date: NaiveDate },
     /// Recurring income stops from `effective` onward.
@@ -66,17 +66,26 @@ pub enum Fact {
     NewRecurringExpense {
         description: String,
         category: String,
-        amount: Cents,
+        amount: Money,
         currency: String,
         first_date: NaiveDate,
         /// `None` means monthly on `first_date`'s day of month.
         every_days: Option<u32>,
     },
+    /// An existing recurring expense changes from `effective` onward, either to a new
+    /// amount or by a percentage (e.g. rent +12% on renewal). Exactly one of amount/percent.
+    ExpenseAmountChange {
+        category: String,
+        amount: Option<Money>,
+        percent: Option<f64>,
+        currency: Option<String>,
+        effective: NaiveDate,
+    },
     /// A confirmed one-time cash flow (e.g. arrears payment, one-off bill).
-    OneTimeFlow { direction: Direction, category: String, amount: Cents, currency: String, date: NaiveDate },
+    OneTimeFlow { direction: Direction, category: String, amount: Money, currency: String, date: NaiveDate },
     /// Income/credit that is announced but not confirmed (bonus, commission, prize, refund,
     /// payout). Recorded for the explanation facts; never counted.
-    Unconfirmed { category: String, amount: Option<Cents>, currency: Option<String> },
+    Unconfirmed { category: String, amount: Option<Money>, currency: Option<String> },
 }
 
 impl Fact {
@@ -151,24 +160,26 @@ pub struct LedgerEntry {
     /// Date the cash moves (settlement date, possibly amended).
     pub cash_date: NaiveDate,
     /// Amount in the event currency after amendments.
-    pub amount: Option<Cents>,
+    pub amount: Option<Money>,
     pub amount_source: AmountSource,
     /// Amount converted to the user's home currency (positive magnitude).
-    pub home_amount: Option<Cents>,
+    pub home_amount: Option<Money>,
     /// Evidence record ids applied to this entry, in application order.
     pub applied_evidence: Vec<String>,
-    /// Settled refund that reversed this charge; such pairs are excluded from stream history.
-    pub reversed_by: Option<String>,
+    /// Root event of the linked chain this row belongs to (authorization -> settlement,
+    /// failed -> retry, charge -> refund, purchase -> valuation). Chain rows are one
+    /// transaction and never feed stream detection.
+    pub chain_root: Option<String>,
 }
 
 impl LedgerEntry {
     /// Signed home-currency cash effect: credits positive, debits negative.
-    pub fn signed_home_amount(&self) -> Option<Cents> {
+    pub fn signed_home_amount(&self) -> Option<Money> {
         let a = self.home_amount?;
         match self.event.direction {
             Direction::Credit => Some(a),
             Direction::Debit => Some(-a),
-            Direction::NonCash => Some(Cents::ZERO),
+            Direction::NonCash => Some(Money::ZERO),
         }
     }
 }
@@ -217,7 +228,7 @@ impl Ledger {
                 amount_source: if e.amount.is_some() { AmountSource::Row } else { AmountSource::Missing },
                 home_amount: None,
                 applied_evidence: Vec::new(),
-                reversed_by: None,
+                chain_root: None,
                 event: e.clone(),
             });
         }
@@ -285,16 +296,30 @@ impl Ledger {
                 }
             }
         }
-        // A settled refund reverses its linked charge: neither is regular spending history.
-        let reversals: Vec<(String, String)> = self
+        // RULES S2.1: a linked chain is one transaction; every row in it (root included) is
+        // excluded from recurrence detection. Record each row's chain root.
+        let parent: HashMap<String, String> = self
             .entries
             .iter()
-            .filter(|e| e.event.event_type == EventType::Refund && e.treatment == CashTreatment::Settled)
-            .filter_map(|e| e.event.linked_event_id.clone().map(|l| (l, e.event.id.clone())))
+            .filter_map(|e| e.event.linked_event_id.clone().map(|l| (e.event.id.clone(), l)))
             .collect();
-        for (charge_id, refund_id) in reversals {
-            if let Some(charge) = self.get_mut(&charge_id) {
-                charge.reversed_by = Some(refund_id);
+        let root_of = |id: &str| {
+            let mut cur = id.to_string();
+            let mut steps = 0;
+            while let Some(p) = parent.get(&cur) {
+                cur = p.clone();
+                steps += 1;
+                if steps > parent.len() {
+                    break; // malformed cycle: stop deterministically
+                }
+            }
+            cur
+        };
+        let roots: Vec<(String, String)> =
+            parent.keys().chain(parent.values()).map(|id| (id.clone(), root_of(id))).collect();
+        for (id, root) in roots {
+            if let Some(e) = self.get_mut(&id) {
+                e.chain_root = Some(root);
             }
         }
     }
@@ -379,7 +404,7 @@ fn apply_fact(entry: &mut LedgerEntry, rec: &EvidenceRecord) -> Result<(), Strin
             if currency != &entry.event.currency {
                 return Err(format!("currency {currency} != event currency {}", entry.event.currency));
             }
-            if *amount <= Cents::ZERO {
+            if *amount <= Money::ZERO {
                 return Err("non-positive figure".into());
             }
             if entry.event.amount.is_some() {
@@ -435,7 +460,7 @@ fn apply_fact(entry: &mut LedgerEntry, rec: &EvidenceRecord) -> Result<(), Strin
 
 /// Convert with the rate row for `date` in the stated direction; fall back to the inverse
 /// of the opposite-direction row for the same date.
-pub fn to_home(amount: Cents, from: &str, home: &str, date: NaiveDate, rates: &dyn RateProvider) -> Option<Cents> {
+pub fn to_home(amount: Money, from: &str, home: &str, date: NaiveDate, rates: &dyn RateProvider) -> Option<Money> {
     if from == home {
         return Some(amount);
     }
@@ -462,7 +487,7 @@ mod tests {
             description: "x".into(),
             category: "shopping".into(),
             direction: dir,
-            amount: Some(Cents::from_units(10)),
+            amount: Some(Money::from_units(10)),
             currency: "ZAR".into(),
             event_date: d,
             settlement_date: Some(d),
