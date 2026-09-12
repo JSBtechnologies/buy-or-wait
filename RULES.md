@@ -39,11 +39,125 @@ Linked-chain rule: walk `linked_event_id` to the root; the chain is one transact
 
 ### S2.3 Same-day ordering and day boundaries [EXACT]
 
-- Horizon = days `rd .. rd+90` inclusive (rd+89 and rd+90 give identical labels; rd+91 breaks request_12).
+- Horizon: see §S3.1 (ends on the last day of month(rd)+2, not rd+90).
 - Events on `rd` itself are in the forecast (user_18 utilities due 2026-07-07 = rd).
 - **Within a day, debits are applied before credits.** The trough includes a debit that falls on salary day (request_18: dining on 2026-07-15 before the 2310 salary → safe 462; credits-first gives 546).
 - For `E`, a payment on day d is made **after** day d's credits: `headroom_from(d) = min(end_of_day_balance(d), min_{t>d} intraday_low(t)) − M`, where `intraday_low(t)` = balance after t's debits, before t's credits. `E = first d with headroom_from(d) ≥ req`. This yields salary days (2025-09-15, 2019-11-15, 2024-06-15 …) rather than the day after.
 - `safe = clamp(min_{t≥rd} intraday_low(t) − M, 0, req)`.
+
+---
+
+## S3. Recurrence, forecast horizon, estimators [FIT — see scoreboard S3.6]
+
+### S3.1 Horizon [FIT, strong]
+
+```
+horizon_end = last calendar day of month(rd) + 2        # e.g. rd 2025-02-07 → 2025-04-30
+days = rd ..= horizon_end
+```
+Not `rd+90`. Evidence (tightest bounds from tuning labels, each bound = the first projected rent that must be excluded):
+- request_08 E=2025-04-15 requires the 2025-05-01 rent to be outside → end ≤ rd+82 = 2025-04-30 = eom+2.
+- request_12 safe capped at 65,164 requires the 2026-07-01 rent outside → end ≤ rd+86 = 2026-06-30 = eom+2.
+- request_05 outflow requires the 2026-02-02 rent outside → end ≤ 2026-02-01; eom+2 = 2026-01-31.
+- request_13 E=2024-05-15 requires the 2024-06-02 rent outside; request_03 E=2019-11-15 requires end ≥ rd+74.
+- Fixed H=90: E exact 13/18. eom+2: E exact 15/18 and safe within 1% on 9/18 (vs 11/18 within 5% at H=90 but only 2 exact-cap).
+- The explanation text still says "90 days" (template constant).
+
+### S3.2 Stream detection [FIT]
+
+```
+hist = rows with status == settled, settlement_date < rd, no linked_event_id, not the target of a linked row,
+       event_type in {expense, subscription, debt_payment, income}, amount known (image-filled if blank)
+group hist by (category, direction)
+for each group:
+    if direction == debit and the group has > 1 distinct description:        # variable spending (groceries, transport, dining…)
+        step = modal gap in days between consecutive settlement_dates
+        require every gap % step == 0                                        # gaps of 2*step = a skipped week: still the stream
+        stream = Interval(step), next dates = last + k*step
+    else:                                                                    # split by description
+        for each description subgroup with >= 2 rows:
+            if every gap in 28..31: stream = Monthly(day_of_month(last)), next = same DOM each month, clamped to month length
+            else: not a stream (one-offs, bonus, arrears, commissions, irregular)
+```
+Worked: user_01 groceries 26 rows, 7 descriptions, gaps all 7 → Interval(7), last 2024-03-01 → 03-08, 03-15 …; user_03 rent "Landlord standing order" gaps 30/31 → Monthly(4) → 2019-09-04, 10-04, 11-04.
+- Minimum occurrences: 2, 3 or 4 give identical results on 01–18 (every real stream has ≥5 rows). Use 3.
+- Projected occurrences are included only if `rd <= date <= horizon_end`.
+
+### S3.3 Amount estimators [FIT]
+
+```
+if all historical amounts in the stream are identical: amount = that value            # rent 5148, streaming 19
+elif stream is Monthly  (variable bill: utilities, healthcare, shopping, entertainment): amount = mean(last 3 amounts)
+elif stream is Interval (groceries, transport, dining):                               amount = mean(all amounts in history)
+no rounding of estimates
+```
+- request_03 lead hypothesis max-of-last-3 for everything gives 872,452.60 (label 873,000) but is badly wrong elsewhere (08: −52%, 11: −36%, 13: −99%). Grid over {mean, max, median} × {last 3,4,6,8,12, all} for bills and variable spend separately; `bill=mean3, var=meanAll` maximises exact-ish matches (9/18 within 1%).
+- Labels imply integer-valued outflow totals (B0 − M − safe is an integer on every EUR row: 452, 624, 1134, 487), which no history statistic reproduces. The generator most likely used hidden integer base amounts; exact recovery of those is not possible from history. Expect ±1–3% on safe amounts.
+
+### S3.4 Income [FIT]
+
+```
+salary stream = Monthly stream in category salary (per description)
+project it at its LAST settled amount on its day-of-month, unless:
+  - a scheduled "Next confirmed salary" row exists → that row is the occurrence for its month; later months use its amount
+  - a message amends amount / date / end (§S5 facts)               # overrides history
+  - the description marks an end ("Final employer payroll")      # user_05 → no income
+  - the stream missed its expected occurrence before rd            # user_12 (last 2026-01-15, rd 2026-04-05), user_13 "Second household income" (no 2024-02-20) → stop
+never project: bonus, commission, arrears, prize, reimbursement, gig/platform payouts with irregular gaps (user_09, user_10)
+```
+Salary schedules that reproduce the tuning labels (engine test vectors):
+
+| user | projected salary |
+|---|---|
+| 01 | 2024-03-15 23,320 (scheduled) then monthly 15th |
+| 02 | 42,750,000 from 2025-08-15 (message_01 raise) monthly 15th |
+| 03 | 4,365,000 monthly 15th (image_01 net pay confirms; arrears event_211 is one-off) |
+| 04 | 38,190,000 monthly 15th; pending quarterly bonus (message_03) not counted |
+| 05 | none ("Final employer payroll") |
+| 06 | 1,037.52 monthly 15th (message_04 temporary pay) |
+| 07 | 149,000 on 2024-09-23 (message_05 date move) then monthly 23rd → E 2024-10-23 |
+| 08 | 1,422.85 monthly 15th (message_06) |
+| 11 | base 23,256,000 monthly 15th; commissions not counted (message_08) |
+| 12 | none (message_09 contract ended) |
+| 13 | 2024-03-15 1,343.54 (scheduled) then monthly; second household income stopped |
+| 14 | 2,717 from 2025-08-15 (message_10 resumes) |
+| 15 | 1,661 from 2026-01-15 (message_11) |
+| 16 | 173,000 monthly 15th |
+| 17 | 2026-03-15 206,000 (scheduled) then monthly |
+| 18 | 2,310 monthly 15th |
+
+### S3.5 Forecast assembly
+
+```
+items = pending debits (§S2) + scheduled rows + projected streams (§S3.2–3.4), each (date, signed home amount)
+per day: apply debits, record intraday_low; then credits, record end_of_day
+safe  = clamp(min_t intraday_low(t) − M, 0, req)
+E     = first d with min(end_of_day(d), min_{t>d} intraday_low(t)) − M >= req, else None
+plan_is_safe(pays): same simulation with each payment as a debit on its date; require intraday_low − M >= 0 every day
+```
+
+### S3.6 Scoreboard for this spec (request_01–18; relative error of safe, E match)
+
+| req | safe rel err | E | open issue |
+|---|---|---|---|
+| 01 | 0 (cap) | ✓ | |
+| 02 | −0.7% | ✓ | |
+| 03 | +11.9% | ✓ | max3 fits better here (−0.06%) |
+| 04 | +8.7% | ✓ | |
+| 05 | +44.8% | ✓ | no-income; outflow short |
+| 06 | −18.8% | ✗ (02-15 vs 01-15) | trough composition unresolved |
+| 07 | −0.8% | ✓ | |
+| 08 | +0.2% | ✓ | |
+| 09 | 0 (cap) | ✓ | |
+| 10 | +176% | ✓ | gig income handling unresolved |
+| 11 | −0.9% | ✗ (06-15 vs 07-15) | |
+| 12 | 0 (cap) | ✓ | |
+| 13 | +5.9% | ✓ | |
+| 14 | +3.3% | ✓ | childcare payment amount unknown (message_10) |
+| 15 | −100% | ✓ | trough composition unresolved |
+| 16 | 0 (cap) | ✓ | |
+| 17 | −0.3% | ✗ (04-15 vs 03-15) | |
+| 18 | −1.6% | ✓ | |
 
 ---
 
