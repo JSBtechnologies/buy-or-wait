@@ -288,6 +288,8 @@ Consequences: full-now beats everything; partial (starts today, total=req) beats
 
 ### S1.5 Number and date formatting [EXACT]
 
+Rounding rule (lead priority 3): there is **no** magnitude rounding (no floor to 100/1000). Round-looking labels (873,000; 8,401,800; 462) are round because the label generator's outflow totals are round (§S3.3), not because of an output rounding step — e.g. 17,229,139.2 and 284.57 keep B0's cents. Compute in full precision (or integer cents), round half-up to 2 dp only when writing. Partial second payment = `round2(req − safe)`; installment amounts are copied verbatim from the option row.
+
 - `amount_safe_to_pay` column: shortest decimal repr of the value rounded to 2 dp, no trailing zeros: `17229139.2`, `603.3`, `873000`, `284.57`.
 - `payment_plan` amounts and `reduce_to` amounts: integer values without decimals (`25256`, `665950`), otherwise exactly 2 dp (`620.40`, `996.60`, `15952906.67`).
 - Text amounts in explanations: `CUR` + space + thousands-separated number, integers without decimals (`ZAR 25,256`, `IDR 29,158,400`), non-integers with 2 dp (`EUR 620.40`, `IDR 15,952,906.67`).
