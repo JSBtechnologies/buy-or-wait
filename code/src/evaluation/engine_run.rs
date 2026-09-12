@@ -107,8 +107,24 @@ mod tests {
         }
     }
 
+    /// `Rules::default()` with a JSON object patch applied on top (e.g. `{"drop_late_plans":false}`).
+    fn rules_with(patch: &str) -> Rules {
+        let mut base = serde_json::to_value(Rules::default()).unwrap();
+        let patch: serde_json::Value = serde_json::from_str(if patch.trim().is_empty() { "{}" } else { patch })
+            .unwrap_or_else(|e| panic!("bad rules patch {patch:?}: {e}"));
+        for (k, v) in patch.as_object().expect("rules patch must be a JSON object") {
+            assert!(base.get(k).is_some(), "unknown Rules field {k}");
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
     fn session(inp: &Inputs, user: &str) -> anyhow::Result<Session> {
-        let mut s = Session::from_model(user, &inp.profiles, &inp.events, inp.rates.clone(), Rules::default())?;
+        session_with(inp, user, Rules::default())
+    }
+
+    fn session_with(inp: &Inputs, user: &str, rules: Rules) -> anyhow::Result<Session> {
+        let mut s = Session::from_model(user, &inp.profiles, &inp.events, inp.rates.clone(), rules)?;
         let ev = evidence(user);
         if !ev.is_empty() {
             s.apply_evidence(ev);
@@ -117,7 +133,11 @@ mod tests {
     }
 
     fn decide(inp: &Inputs, r: &Req) -> anyhow::Result<Decision> {
-        let session = session(inp, &r.user)?;
+        decide_with(inp, r, Rules::default())
+    }
+
+    fn decide_with(inp: &Inputs, r: &Req, rules: Rules) -> anyhow::Result<Decision> {
+        let session = session_with(inp, &r.user, rules)?;
         let opts = inp
             .options
             .iter()
@@ -188,6 +208,104 @@ mod tests {
         println!("invariant violations: {violations}, engine errors: {engine_errors}");
         let (_, text) = crate::evaluation::score_file(&dir(), &out, reveal).unwrap();
         println!("{text}");
+    }
+
+    /// Full invariant pass over every eval request (VERIFY_OUTPUT=<output.csv> also compares each
+    /// shipped row with the engine's row for that request, byte for byte per field).
+    #[test]
+    #[ignore]
+    fn eval_invariants() {
+        let inp = inputs();
+        let inv = Invariants::load(&dir(), &dir().join("requests.csv")).unwrap();
+        let shipped: HashMap<String, crate::evaluation::OutputRow> = match std::env::var("VERIFY_OUTPUT") {
+            Ok(p) => crate::evaluation::contract::read_output(Path::new(&p)).unwrap().1.into_iter().map(|r| (r.request_id.clone(), r)).collect(),
+            Err(_) => HashMap::new(),
+        };
+        let (mut ok, mut violated, mut errors, mut diverged, mut warns) = (0, 0, 0, 0, 0);
+        let mut rows = Vec::new();
+        for r in eval_requests() {
+            let d = match decide(&inp, &r) {
+                Ok(d) => d,
+                Err(e) => {
+                    errors += 1;
+                    println!("ENGINE_ERROR {} {e}", r.id);
+                    continue;
+                }
+            };
+            let (b, bl, wc, wl) = (d.baseline_series(), d.baseline_low_series(), d.with_changes_series(), d.with_changes_low_series());
+            let fc = ForecastSeries { start: r.date, minimum: d.minimum_f64(), baseline: &b, baseline_low: Some(&bl), with_changes: wc.as_deref(), with_changes_low: wl.as_deref() };
+            match inv.assert_row(&d.row, &fc) {
+                Ok(w) => {
+                    ok += 1;
+                    for f in w {
+                        warns += 1;
+                        println!("WARN {f}");
+                    }
+                }
+                Err(v) => {
+                    violated += 1;
+                    print!("VIOLATION {v}");
+                }
+            }
+            let row: crate::evaluation::OutputRow = (&d.row).into();
+            if let Some(s) = shipped.get(&r.id) {
+                if *s != row {
+                    diverged += 1;
+                    for (i, (x, y)) in s.fields().iter().zip(row.fields()).enumerate() {
+                        if *x != y {
+                            println!("DIVERGED {} {}: shipped={x:?} engine={y:?}", r.id, crate::evaluation::contract::HEADER[i]);
+                        }
+                    }
+                }
+            }
+            rows.push(row);
+        }
+        let file = inv.assert_file(&rows);
+        println!(
+            "EVAL INVARIANTS: {} rows, {ok} pass, {violated} violations, {errors} engine errors, {warns} warnings, file-level {}, shipped rows compared {} diverged {diverged}",
+            rows.len(),
+            if file.is_ok() { "PASS" } else { "FAIL" },
+            shipped.len()
+        );
+    }
+
+    /// Overfit guard: VERIFIER_RULES_A / VERIFIER_RULES_B are JSON patches over Rules::default().
+    /// Prints aggregate per-field counts for both splits and the B−A delta. No per-request detail.
+    #[test]
+    #[ignore]
+    fn rule_delta() {
+        let inp = inputs();
+        let ds = Dataset::load(&dir(), &dir().join("sample_requests.csv")).unwrap();
+        let run = |patch: &str| {
+            let rules = rules_with(patch);
+            let rows: Vec<crate::evaluation::OutputRow> = samples()
+                .iter()
+                .map(|r| match decide_with(&inp, r, rules.clone()) {
+                    Ok(d) => (&d.row).into(),
+                    Err(_) => crate::evaluation::OutputRow { request_id: r.id.clone(), ..Default::default() },
+                })
+                .collect();
+            crate::evaluation::scorer::score(&ds, &rows)
+        };
+        let (pa, pb) = (std::env::var("VERIFIER_RULES_A").unwrap_or_default(), std::env::var("VERIFIER_RULES_B").unwrap_or_default());
+        let (a, b) = (run(&pa), run(&pb));
+        println!("A={pa:?} B={pb:?}");
+        for (name, sa, sb) in [("tuning", &a.tuning, &b.tuning), ("held-out", &a.heldout, &b.heldout)] {
+            for f in crate::evaluation::scorer::FIELDS {
+                let (x, y) = (sa.matched.get(f).copied().unwrap_or(0), sb.matched.get(f).copied().unwrap_or(0));
+                println!("DELTA {name:<8} {f:<38} {x:>2} -> {y:>2} ({:+})", y as i64 - x as i64);
+            }
+            let stats = |v: &[f64]| {
+                let mut e: Vec<f64> = v.iter().copied().filter(|x| x.is_finite()).collect();
+                e.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mean = if e.is_empty() { f64::NAN } else { e.iter().sum::<f64>() / e.len() as f64 };
+                let median = e.get(e.len() / 2).copied().unwrap_or(f64::NAN);
+                let within5 = e.iter().filter(|x| **x <= 0.05).count();
+                (mean * 100.0, median * 100.0, within5)
+            };
+            let ((ma, da, wa), (mb, db, wb)) = (stats(&sa.amount_rel_err), stats(&sb.amount_rel_err));
+            println!("DELTA {name:<8} amount rel err mean {ma:.2}% -> {mb:.2}%, median {da:.2}% -> {db:.2}%, within5% {wa} -> {wb}");
+        }
     }
 
     #[test]
@@ -265,6 +383,21 @@ mod tests {
                 by.entry((f.category.clone(), f.date.format("%Y-%m").to_string(), f.amount.0 > 0))
                     .or_default()
                     .push(tag);
+            }
+            // Announced/one-off income must never be projected as a stream (spec: bonuses,
+            // commissions, refunds, prizes count only once settled, and never recur).
+            for f in &d.baseline.flows {
+                if let FlowSource::Stream { stream_id } = &f.source {
+                    let lower = stream_id.to_lowercase();
+                    if f.amount.0 > 0
+                        && ["bonus", "commission", "prize", "lottery", "refund", "reimburse", "arrears", "windfall", "payout"]
+                            .iter()
+                            .any(|k| lower.contains(k))
+                    {
+                        hits += 1;
+                        println!("ONE-OFF-INCOME-PROJECTED {} {stream_id} @{}", r.id, f.date);
+                    }
+                }
             }
             let mut keys: Vec<_> = by.into_iter().collect();
             keys.sort();
