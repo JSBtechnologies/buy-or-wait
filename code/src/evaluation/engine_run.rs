@@ -192,6 +192,24 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn evidence_audit() {
+        let root = std::env::var("VERIFIER_EVIDENCE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("store/evidence"));
+        if !root.exists() {
+            println!("no evidence dir at {}", root.display());
+            return;
+        }
+        let findings = crate::evaluation::evidence_audit::audit_dir(&dir(), &root, crate::engine::money::SCALE).unwrap();
+        for f in &findings {
+            println!("EVIDENCE {f}");
+        }
+        let errors = findings.iter().filter(|f| f.severity == Severity::Error).count();
+        println!("evidence audit: {errors} errors, {} warnings", findings.len() - errors);
+    }
+
+    #[test]
+    #[ignore]
     fn ledger_gate() {
         let inp = inputs();
         let ds = Dataset::load(&dir(), &dir().join("requests.csv")).unwrap();
