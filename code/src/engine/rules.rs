@@ -83,6 +83,17 @@ pub struct Rules {
     pub ignore_payments_after_horizon: bool,
     /// Maximum spending-change actions in one plan (problem statement: up to three).
     pub max_spending_changes: usize,
+    /// How change plans are ordered after "no changes". RULES S1.3: fewest changes.
+    pub change_preference: ChangePreference,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangePreference {
+    /// Fewer stop/reduce actions first, then the smaller cut (RULES S1.3).
+    FewestChanges,
+    /// Smallest total cut to projected spending first, then fewer actions. Indistinguishable
+    /// from `FewestChanges` on tuning rows 01–18.
+    SmallestCut,
 }
 
 impl Default for Rules {
@@ -105,6 +116,7 @@ impl Default for Rules {
             drop_late_plans: true,
             ignore_payments_after_horizon: true,
             max_spending_changes: 3,
+            change_preference: ChangePreference::FewestChanges,
         }
     }
 }

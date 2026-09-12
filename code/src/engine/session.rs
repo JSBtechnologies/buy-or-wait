@@ -222,6 +222,7 @@ impl Session {
             requested_amount: spec.amount,
             desired_completion_date: spec.deadline,
             allows_partial_payment: spec.allows_partial_payment,
+            accepted_methods: profile.accepted_methods.clone(),
             starting_balance: profile.current_available_balance,
             minimum_balance: profile.minimum_balance_to_keep,
             reserved_pending_total: baseline.reserved_total,

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::forecast::{Forecast, ForecastInputs, SafetyReport, SpendingChange};
 use super::money::Cents;
 use super::recurrence::{Occurrence, StreamKind, Streams};
-use super::rules::Rules;
+use super::rules::{ChangePreference, Rules};
 use super::types::{id_rank, Direction, Payment, PaymentMethod, PaymentOption, Profile, RequestSpec};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,22 +51,19 @@ impl Candidate {
 pub struct RankKey {
     /// 1. Complete the full request by desired_completion_date (false sorts first).
     pub misses_deadline: bool,
-    /// 2. Require no spending changes.
-    pub has_changes: bool,
+    /// 2. Require no spending changes; among change plans, per `Rules::change_preference`
+    ///    either fewer changes (RULES S1.3) or the smallest spending cut.
+    pub change_order: (usize, Cents),
     /// 3. Minimize the total amount paid.
     pub total_paid: Cents,
     /// 4. Start payment earlier.
     pub start: NaiveDate,
     /// 5. Use fewer payments.
     pub payment_count: usize,
-    /// 6. Lowest payment_option_id (plans without an option sort last).
-    pub option_rank: (u64, String),
-    /// 7. Among change sets: smallest cut to the user's spending. PROVISIONAL (sample 21
-    ///    picks stop+reduce cutting 34.5 over a single stop cutting 47).
-    pub change_cut: Cents,
-    /// 8. Fewer change actions, then event ids, for full determinism.
-    pub change_count: usize,
-    pub change_ids: Vec<String>,
+    /// 6. Lowest payment_option_id; non-option plans sort first on a full tie (RULES S1.3).
+    pub option_rank: Option<(u64, String)>,
+    /// 7. Remaining change tie-breaks (the other of count/cut, then event ids).
+    pub change_tail: (usize, Cents, Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -162,9 +159,15 @@ pub fn search(ctx: &PlanContext) -> SearchResult {
                 for c in &today {
                     let mut v = (*c).clone();
                     v.changes = changes.clone();
+                    let cut: Cents = set.iter().map(|a| a.cut).sum();
                     let mut e = evaluate(ctx, &forecast, v);
                     if let Outcome::Survived { key, .. } = &mut e.outcome {
-                        key.change_cut = set.iter().map(|a| a.cut).sum();
+                        let count = key.change_order.0;
+                        let ids = std::mem::take(&mut key.change_tail.2);
+                        (key.change_order, key.change_tail) = match ctx.rules.change_preference {
+                            ChangePreference::FewestChanges => ((count, cut), (0, Cents::ZERO, ids)),
+                            ChangePreference::SmallestCut => ((1, cut), (count, Cents::ZERO, ids)),
+                        };
                     }
                     // Unsafe change variants are not worth recording individually.
                     if matches!(e.outcome, Outcome::Survived { .. }) {
@@ -298,14 +301,12 @@ fn evaluate(ctx: &PlanContext, forecast: &Forecast, c: Candidate) -> Evaluated {
     }
     let key = RankKey {
         misses_deadline,
-        has_changes: !c.changes.is_empty(),
+        change_order: (c.changes.len(), Cents::ZERO),
         total_paid: c.total_paid,
         start: c.start().unwrap_or(ctx.request_date),
         payment_count: c.payments.len(),
-        option_rank: c.option_id.as_deref().map(id_rank).unwrap_or((u64::MAX, String::new())),
-        change_cut: Cents::ZERO,
-        change_count: c.changes.len(),
-        change_ids: c.changes.iter().map(|x| x.event_id().to_string()).collect(),
+        option_rank: c.option_id.as_deref().map(id_rank),
+        change_tail: (0, Cents::ZERO, c.changes.iter().map(|x| x.event_id().to_string()).collect()),
     };
     Evaluated { candidate: c, outcome: Outcome::Survived { key, safety } }
 }
