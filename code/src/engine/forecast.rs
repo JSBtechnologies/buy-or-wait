@@ -349,6 +349,12 @@ fn changed_amount(stream: &Stream, changes: &[SpendingChange], _rules: &Rules) -
     Some(amount)
 }
 
+fn add_months_clamped(d: NaiveDate, k: u32) -> NaiveDate {
+    let m0 = d.month0() + k;
+    let (y, m) = (d.year() + (m0 / 12) as i32, m0 % 12 + 1);
+    (1..=d.day()).rev().find_map(|day| NaiveDate::from_ymd_opt(y, m, day)).expect("valid date")
+}
+
 /// The description behind a projected flow: its stream's description or its ledger row's.
 fn flow_description(f: &Flow, inp: &ForecastInputs) -> Option<String> {
     match &f.source {
@@ -451,15 +457,10 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                 // day of month (RULES S3.4 user_07: 09-23 then monthly 23rd).
                 let mut income: Vec<&mut Flow> = flows.iter_mut().filter(|f| is_income_flow(f, category)).collect();
                 income.sort_by_key(|f| f.date);
-                for (i, f) in income.into_iter().enumerate() {
-                    f.date = if i == 0 {
-                        *new_date
-                    } else {
-                        let (y, m) = (f.date.year(), f.date.month());
-                        NaiveDate::from_ymd_opt(y, m, new_date.day())
-                            .unwrap_or_else(|| NaiveDate::from_ymd_opt(y, m, 28).unwrap())
-                            .max(*new_date + Duration::days(1))
-                    };
+                // RULES S6.1: every later occurrence re-anchors, k-th one = new_date + k months
+                // (day clamped to month end), so a move across a month boundary never collides.
+                for (k, f) in income.into_iter().enumerate() {
+                    f.date = add_months_clamped(*new_date, k as u32);
                 }
             }
             Fact::ExpenseAmountChange { category, amount, percent, currency, effective } => {
