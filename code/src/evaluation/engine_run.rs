@@ -151,7 +151,7 @@ mod tests {
     }
 
     fn decide(inp: &Inputs, r: &Req) -> anyhow::Result<Decision> {
-        decide_with(inp, r, Rules::default())
+        decide_with(inp, r, rules_with(&std::env::var("VERIFIER_RULES").unwrap_or_default()))
     }
 
     fn decide_with(inp: &Inputs, r: &Req, rules: Rules) -> anyhow::Result<Decision> {
@@ -253,6 +253,10 @@ mod tests {
             let (b, bl, wc, wl) = (d.baseline_series(), d.baseline_low_series(), d.with_changes_series(), d.with_changes_low_series());
             let fc = ForecastSeries { start: r.date, minimum: d.minimum_f64(), baseline: &b, baseline_low: Some(&bl), with_changes: wc.as_deref(), with_changes_low: wl.as_deref() };
             if std::env::var("VERIFIER_ONLY").map(|o| o.split(',').any(|x| x == r.id)).unwrap_or(false) {
+                let no_ev = std::env::var("VERIFIER_NO_EVIDENCE").is_ok();
+                for rec in if no_ev { Vec::new() } else { pipeline_evidence(&inp, &r.user, r.date) } {
+                    println!("EVREC {} {} {:?}", r.id, rec.record_id, rec.fact);
+                }
                 for f in &d.baseline.flows {
                     if let FlowSource::Evidence { record_id } = &f.source {
                         println!("EVFLOW {} {} {} {} {}", r.id, record_id, f.date, f.category, f.amount.to_f64());
