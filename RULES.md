@@ -7,6 +7,46 @@ Notation: `rd` = request_date, `due` = desired_completion_date, `req` = requeste
 
 ---
 
+## S2. Ledger: cash rules by status, linked chains, FX [EXACT unless tagged]
+
+`B0` (current_available_balance) already contains every **settled** row dated before `rd`. The forecast never re-applies history; history is used only to detect streams (§S3) and estimate amounts.
+
+### S2.1 Row → forecast cash effect
+
+| row | forecast effect | evidence |
+|---|---|---|
+| `settled`, settlement_date < rd | none (already in B0); feeds stream detection unless excluded below | all users |
+| `pending` debit | reserve: `−amount` on `max(rd, settlement_date)` (timing irrelevant for safe; on-date and day-0 give identical labels on 01–18) | user_03 event_254 (95,000) is required to reach 873,000; user_01 event_102, user_02 event_185 |
+| `pending` credit (refund, payout, bonus, commission) | **none** | spec; user_20 event_1785 (not tuned) |
+| `scheduled` debit | `−amount` on settlement_date | user_04 event_357 school fee 2024-06-11 |
+| `scheduled` credit (`Next confirmed salary`) | `+amount` on settlement_date; it **is** that month's salary occurrence (do not also project the stream that month) and the salary stream continues monthly afterwards at this amount | user_01 (needs 04-15/05-15 salaries to reach affordable_now), user_13, user_17 |
+| `failed` | none; not a stream occurrence | user_05 event_438 |
+| `cancelled` | none; not a stream occurrence | user_01 event_100, user_06 event_557 |
+| `unrealized` / direction `non_cash` (investment_valuation) | none, never cash | user_21/22 (not tuned) |
+| `investment_purchase` settled | historical one-off, not a stream | user_21–24 |
+| `refund` settled, or any row with `linked_event_id` | historical lifecycle: exclude BOTH the row and the row it links to from stream detection (net zero, already in B0) | user_01 event_98/99, user_17 event_1543/1544 |
+| authorization → settled purchase (`linked_event_id` → cancelled auth) | only the terminal settled row is real cash; still a one-off (single description) so no stream | user_01 event_100/101 |
+| blank `amount` | take the figure from the linked image (§S5); never 0 | user_03 event_253, user_16 event_1442, user_17 event_1545 |
+| `windfall`, bonus, commission, arrears (one-off income descriptions) | never projected | user_03 event_211, user_04 "Quarterly performance bonus", user_11 commissions, user_24 prize |
+
+Linked-chain rule: walk `linked_event_id` to the root; the chain is one transaction. Its cash effect = the terminal row's status per the table; every row in a chain is excluded from recurrence detection.
+
+### S2.2 FX [EXACT on data coverage]
+
+- Every foreign-currency row has a rate row with `rate_date == settlement_date`, `from_currency == row currency`, `to_currency == home_currency` (140/140 rows; 0 need inversion). `home_amount = amount * rate`.
+- Rates are constant per pair across all dates (EUR→ZAR 20, USD→IDR 15833.33, USD→INR 83.33, EUR→USD 1.09, USD→EUR 0.92). Extra rows exist on future 15ths (e.g. 2024-04-15 USD→IDR for user_25) = **projected foreign salaries convert at the row for the projected date**. If a projected date has no row, use the latest row ≤ that date for the pair (same value).
+- Do not round converted amounts (keep full precision; round only at output).
+
+### S2.3 Same-day ordering and day boundaries [EXACT]
+
+- Horizon = days `rd .. rd+90` inclusive (rd+89 and rd+90 give identical labels; rd+91 breaks request_12).
+- Events on `rd` itself are in the forecast (user_18 utilities due 2026-07-07 = rd).
+- **Within a day, debits are applied before credits.** The trough includes a debit that falls on salary day (request_18: dining on 2026-07-15 before the 2310 salary → safe 462; credits-first gives 546).
+- For `E`, a payment on day d is made **after** day d's credits: `headroom_from(d) = min(end_of_day_balance(d), min_{t>d} intraday_low(t)) − M`, where `intraday_low(t)` = balance after t's debits, before t's credits. `E = first d with headroom_from(d) ≥ req`. This yields salary days (2025-09-15, 2019-11-15, 2024-06-15 …) rather than the day after.
+- `safe = clamp(min_{t≥rd} intraday_low(t) − M, 0, req)`.
+
+---
+
 ## S1. Plan candidates, eligibility, selection, status/method mapping
 
 ### S1.1 Candidate generation [EXACT on 01–18]
