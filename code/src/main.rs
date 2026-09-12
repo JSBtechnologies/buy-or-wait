@@ -9,7 +9,7 @@ use buyorwait::engine::types::{PaymentOption, RateTable, RequestSpec};
 use buyorwait::engine::Rules;
 use buyorwait::evaluation::{Finding, ForecastSeries, InvariantViolation, Invariants};
 use buyorwait::extract::{messages::deterministic_evidence, retrieval};
-use buyorwait::hf;
+use buyorwait::hf::{self, HfClient};
 use buyorwait::model;
 use buyorwait::store::cache::DiskCache;
 use buyorwait::store::processed::ProcessedStore;
@@ -86,9 +86,28 @@ fn main() -> anyhow::Result<ExitCode> {
     };
     processed_store.save("_meta", "last_run", &serde_json::json!({ "cold": cold }))?;
 
-    // TODO(extraction/ml-engineer): once the bake-off picks a VLM/LLM, run image and
-    // free-text message extraction through `model_cache` here too. For now every request
-    // is decided from the ledger plus `extract::messages::deterministic_evidence` (the
+    // ml-engineer's HfClient owns the actual HF router calls and their own on-disk cache
+    // (PLAN.md §2.11); `--cold` wipes it the same way as `store/cache` and `store/processed`
+    // above, so a cold run never reads a prior run's cached responses, and a later warm
+    // rerun reuses whatever this run writes (determinism + cache-hit-rate check, §3 Phase 3).
+    // Optional: HF_TOKEN may be unset while no call site uses this yet (extraction hasn't
+    // wired live VLM/LLM extraction into the per-request loop), in which case usage stays
+    // empty rather than failing the whole baseline run.
+    let model_cache_dir = store_root.join("model_cache");
+    if cold && model_cache_dir.exists() {
+        std::fs::remove_dir_all(&model_cache_dir)?;
+    }
+    let hf_client: Option<HfClient> = match HfClient::with_cache_dir(&model_cache_dir) {
+        Ok(client) => Some(client),
+        Err(e) => {
+            eprintln!("no live model calls this run ({e:#}); usage report will show 0 calls");
+            None
+        }
+    };
+
+    // TODO(extraction): once the bake-off picks a VLM/LLM, run image and free-text message
+    // extraction through `hf_client` here too, per request. For now every request is
+    // decided from the ledger plus `extract::messages::deterministic_evidence` (the
     // zero-token skeleton parser) only -- the baseline build has no model calls.
     let rates = Arc::new(RateTable::from_model(&rates));
     let invariants = Invariants::load(dataset_dir, &requests_path)?;
@@ -138,11 +157,11 @@ fn main() -> anyhow::Result<ExitCode> {
     }
     writer.flush()?;
 
-    // No model calls in this baseline build (deterministic evidence only), so the usage
-    // records are empty; `write_usage_report` still renders every required section with
+    // Every call `hf_client` made this run (empty until extraction wires a live call site
+    // into `decide_one`); `write_usage_report` still renders every required section with
     // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
     let pricing = load_pricing(Path::new("config/models.toml"))?;
-    let usage_records: Vec<hf::Usage> = Vec::new();
+    let usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
     hf::write_usage_report(
         Path::new("evaluation/usage_report.md"),
         &usage_records,
