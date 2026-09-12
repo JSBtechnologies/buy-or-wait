@@ -1,7 +1,7 @@
 //! Model bake-off harness (owner: ml-engineer). PLAN.md §3 / Phase 2d.
 //!
-//! Runs every VLM candidate against `docs/gold_subset.json` images (5 labeled
-//! + 11 unlabeled), sweeping image resolution to find the smallest size that
+//! Runs every VLM candidate against `docs/gold_subset.json` images (labeled +
+//! unlabeled counts come from the file itself), sweeping image resolution to find the smallest size that
 //! keeps gold accuracy, then runs the chosen resolution 5x for a stability
 //! rate. Runs every LLM candidate against the gold messages (all labeled)
 //! 5x. Reports valid-JSON rate, field accuracy vs gold, cross-model
@@ -39,6 +39,11 @@ use serde_json::Value;
 #[derive(Debug, Deserialize)]
 struct ModelsConfig {
     decoding: DecodingConfig,
+    // Kept for schema completeness (production's HfClient reads this section
+    // for its own retry policy) — the bake-off deliberately uses its own
+    // tighter, hardcoded policy instead (see `main`), so this field itself
+    // is unused here.
+    #[allow(dead_code)]
     retry: RetryConfig,
     image_preprocessing: ImagePreprocessingConfig,
     candidates: CandidatesConfig,
@@ -51,6 +56,7 @@ struct DecodingConfig {
     max_tokens_vlm: u32,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct RetryConfig {
     max_attempts: u32,
@@ -110,6 +116,18 @@ struct GoldImage {
     labeled: bool,
     #[serde(default)]
     expected_figures: Option<Value>,
+    /// The event context this image is linked to — only `currency` is used
+    /// here, for the reconciliation check.
+    #[serde(default)]
+    event_context: Option<Value>,
+    /// The one field the deterministic selector (image_transcription.v1.md)
+    /// would read for this event, and the correct amount at that field —
+    /// gold already encodes the selector's decision, so scoring "selected-
+    /// figure accuracy" is just: does the model's value at this field match?
+    #[serde(default)]
+    expected_selected_field: Option<String>,
+    #[serde(default)]
+    expected_selected_amount: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +312,121 @@ fn compare_message_records(expected: &Value, actual_records: Option<&Vec<Value>>
 }
 
 // ---------------------------------------------------------------------------
+// Selected-figure accuracy + reconciliation (lead directive: the one amount
+// the engine would actually use matters more than raw all-field accuracy).
+// Gold already encodes which field the deterministic selector
+// (image_transcription.v1.md) would read for each labeled image, so scoring
+// this is just: does the model's value at that field match?
+// ---------------------------------------------------------------------------
+
+/// `None` when no reconciliation check was applicable (not enough of the
+/// relevant fields were non-null to check anything); `Some(true/false)`
+/// otherwise. Mirrors image_transcription.v1.md's reconciliation rules.
+fn reconciliation_ok(figures: &Value, event_currency: Option<&str>) -> Option<bool> {
+    let getf = |k: &str| figures.get(k).and_then(|v| v.as_f64());
+    const TOL: f64 = 0.01;
+    let mut any_check = false;
+    let mut all_pass = true;
+    let mut check = |applicable: bool, ok: bool| {
+        if applicable {
+            any_check = true;
+            if !ok {
+                all_pass = false;
+            }
+        }
+    };
+    if let (Some(subtotal), Some(tax), Some(total)) = (getf("subtotal"), getf("tax"), getf("total")) {
+        check(true, (subtotal + tax - total).abs() <= TOL);
+    }
+    if let (Some(gross), Some(ded), Some(net)) = (getf("gross_pay"), getf("deductions"), getf("net_pay")) {
+        check(true, (gross - ded - net).abs() <= TOL);
+    }
+    if let (Some(paid), Some(bal), Some(total)) = (getf("amount_paid"), getf("balance_due"), getf("total")) {
+        check(true, (paid + bal - total).abs() <= TOL);
+    }
+    if let Some(sum_check) = getf("line_items_sum_check") {
+        if let Some(subtotal) = getf("subtotal") {
+            check(true, (sum_check - subtotal).abs() <= TOL);
+        } else if let Some(total) = getf("total") {
+            check(true, (sum_check - total).abs() <= TOL);
+        }
+    }
+    if let Some(ec) = event_currency {
+        if let Some(cur) = figures.get("currency").and_then(|v| v.as_str()) {
+            check(true, cur.eq_ignore_ascii_case(ec));
+        }
+    }
+    any_check.then_some(all_pass)
+}
+
+#[derive(Debug, Default, Clone)]
+struct SelectorStats {
+    /// Labeled-image runs where gold specifies an expected selected field
+    /// and the model produced a JSON figure object to check it against.
+    checked: u32,
+    selected_correct: u32,
+    reconciliation_checked: u32,
+    reconciliation_passed: u32,
+    /// Among wrong selected-figure reads, how many were caught by a failed
+    /// reconciliation check (i.e. the safety net actually would have fired).
+    wrong_reads: u32,
+    wrong_reads_caught_by_reconciliation: u32,
+}
+
+impl SelectorStats {
+    fn record(&mut self, img: &GoldImage, parsed: Option<&Value>) {
+        let (Some(field), Some(expected_amount)) = (&img.expected_selected_field, img.expected_selected_amount)
+        else {
+            return;
+        };
+        let Some(figures) = parsed else { return };
+        self.checked += 1;
+        let actual_amount = figures.get(field).and_then(|v| v.as_f64());
+        let correct = actual_amount.map(|a| (a - expected_amount).abs() <= 0.01).unwrap_or(false);
+        if correct {
+            self.selected_correct += 1;
+        } else {
+            self.wrong_reads += 1;
+        }
+        let event_currency = img
+            .event_context
+            .as_ref()
+            .and_then(|ec| ec.get("currency"))
+            .and_then(|v| v.as_str());
+        if let Some(recon_ok) = reconciliation_ok(figures, event_currency) {
+            self.reconciliation_checked += 1;
+            if recon_ok {
+                self.reconciliation_passed += 1;
+            } else if !correct {
+                self.wrong_reads_caught_by_reconciliation += 1;
+            }
+        }
+    }
+
+    fn selected_figure_accuracy(&self) -> f64 {
+        if self.checked == 0 {
+            0.0
+        } else {
+            self.selected_correct as f64 / self.checked as f64
+        }
+    }
+    fn reconciliation_pass_rate(&self) -> f64 {
+        if self.reconciliation_checked == 0 {
+            0.0
+        } else {
+            self.reconciliation_passed as f64 / self.reconciliation_checked as f64
+        }
+    }
+    fn reconciliation_catch_rate(&self) -> f64 {
+        if self.wrong_reads == 0 {
+            0.0
+        } else {
+            self.wrong_reads_caught_by_reconciliation as f64 / self.wrong_reads as f64
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Aggregated stats
 // ---------------------------------------------------------------------------
 
@@ -358,6 +491,8 @@ struct VlmCandidateReport {
     stats: RunStats,
     stability_rate: f64,
     pricing: Pricing,
+    unavailable: bool,
+    selector: SelectorStats,
 }
 
 struct LlmCandidateReport {
@@ -365,6 +500,7 @@ struct LlmCandidateReport {
     provider: String,
     stats: RunStats,
     stability_rate: f64,
+    unavailable: bool,
     cost_usd: f64,
     pricing: Pricing,
 }
@@ -428,6 +564,12 @@ fn image_call(
     Ok((parsed, resp.usage))
 }
 
+/// After this many consecutive call failures for one candidate, stop
+/// calling it and mark it unavailable rather than retrying every remaining
+/// item at the full timeout (lead directive: a hanging provider must not
+/// block the run).
+const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
 fn run_vlm_candidate(
     client: &HfClient,
     candidate: &CandidateConfig,
@@ -436,22 +578,33 @@ fn run_vlm_candidate(
     dataset_dir: &Path,
     prompt: &PromptSet,
     runs: u32,
-    unlabeled_first_run: &mut HashMap<String, Vec<(String, Option<Value>)>>,
-) -> Result<VlmCandidateReport> {
+) -> Result<(VlmCandidateReport, HashMap<String, Vec<(String, Option<Value>)>>)> {
     let labeled: Vec<&GoldImage> = gold.images.iter().filter(|i| i.labeled).collect();
+    let mut unlabeled_first_run: HashMap<String, Vec<(String, Option<Value>)>> = HashMap::new();
+    let mut consecutive_failures = 0u32;
+    let mut unavailable = false;
 
     // --- resolution sweep: 1 run/labeled image per candidate size ---
     let mut sweep = Vec::new();
-    for &max_dim in &models_cfg.image_preprocessing.candidate_max_dimensions_px {
+    'sweep: for &max_dim in &models_cfg.image_preprocessing.candidate_max_dimensions_px {
         let mut acc = FieldAccuracy::default();
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, max_dim)?;
             let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
             let parsed = match outcome {
-                Ok((parsed, _usage)) => parsed,
+                Ok((parsed, _usage)) => {
+                    consecutive_failures = 0;
+                    parsed
+                }
                 Err(e) => {
                     eprintln!("  [{}] sweep call failed for {} @ {max_dim}px: {e}", candidate.id, img.image_id);
+                    consecutive_failures += 1;
+                    if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                        eprintln!("  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> marking unavailable, skipping rest", candidate.id);
+                        unavailable = true;
+                        break 'sweep;
+                    }
                     None
                 }
             };
@@ -477,43 +630,53 @@ fn run_vlm_candidate(
 
     // --- full pass at chosen resolution: N runs over all 16 images ---
     let mut stats = RunStats::default();
+    let mut selector = SelectorStats::default();
     let mut per_image_outputs: HashMap<String, Vec<Option<Value>>> = HashMap::new();
-    for run_idx in 0..runs {
-        for img in &gold.images {
-            let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
-            let b64 = downscale_and_encode(&path, chosen_max_dim)?;
-            let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
-            let parsed = match outcome {
-                Ok((parsed, usage)) => {
-                    stats.record_usage(&usage);
-                    if parsed.is_some() {
-                        stats.valid_json += 1;
+    if !unavailable {
+        consecutive_failures = 0;
+        'runs: for run_idx in 0..runs {
+            for img in &gold.images {
+                let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
+                let b64 = downscale_and_encode(&path, chosen_max_dim)?;
+                let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64);
+                let parsed = match outcome {
+                    Ok((parsed, usage)) => {
+                        consecutive_failures = 0;
+                        stats.record_usage(&usage);
+                        if parsed.is_some() {
+                            stats.valid_json += 1;
+                        }
+                        parsed
                     }
-                    parsed
+                    Err(e) => {
+                        eprintln!(
+                            "  [{}] run {} call failed for {}: {e}",
+                            candidate.id,
+                            run_idx + 1,
+                            img.image_id
+                        );
+                        stats.record_failure();
+                        consecutive_failures += 1;
+                        if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                            eprintln!("  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> marking unavailable, skipping rest", candidate.id);
+                            unavailable = true;
+                            break 'runs;
+                        }
+                        None
+                    }
+                };
+                if let Some(expected) = &img.expected_figures {
+                    stats.field_acc.add(compare_flat_object(expected, parsed.as_ref()));
                 }
-                Err(e) => {
-                    eprintln!(
-                        "  [{}] run {} call failed for {}: {e}",
-                        candidate.id,
-                        run_idx + 1,
-                        img.image_id
-                    );
-                    stats.record_failure();
-                    None
-                }
-            };
-            if let Some(expected) = &img.expected_figures {
-                stats.field_acc.add(compare_flat_object(expected, parsed.as_ref()));
-            }
-            if !img.labeled {
-                if run_idx == 0 {
+                selector.record(img, parsed.as_ref());
+                if !img.labeled && run_idx == 0 {
                     unlabeled_first_run
                         .entry(img.image_id.clone())
                         .or_default()
                         .push((candidate.id.clone(), parsed.clone()));
                 }
+                per_image_outputs.entry(img.image_id.clone()).or_default().push(parsed);
             }
-            per_image_outputs.entry(img.image_id.clone()).or_default().push(parsed);
         }
     }
 
@@ -527,17 +690,26 @@ fn run_vlm_candidate(
             }
         }
     }
-    let stability_rate = stable_images as f64 / total_images as f64;
+    let stability_rate = if per_image_outputs.is_empty() {
+        0.0
+    } else {
+        stable_images as f64 / total_images as f64
+    };
 
-    Ok(VlmCandidateReport {
-        id: candidate.id.clone(),
-        provider: candidate.provider.clone(),
-        chosen_max_dim,
-        resolution_sweep: sweep,
-        stats,
-        stability_rate,
-        pricing: candidate.pricing_usd_per_m_tokens.clone(),
-    })
+    Ok((
+        VlmCandidateReport {
+            id: candidate.id.clone(),
+            provider: candidate.provider.clone(),
+            chosen_max_dim,
+            resolution_sweep: sweep,
+            stats,
+            stability_rate,
+            pricing: candidate.pricing_usd_per_m_tokens.clone(),
+            unavailable,
+            selector,
+        },
+        unlabeled_first_run,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -563,8 +735,13 @@ fn run_llm_candidate(
 
     let mut stats = RunStats::default();
     let mut outputs: Vec<Option<Value>> = Vec::new();
+    let mut consecutive_failures = 0u32;
+    let mut unavailable = false;
 
     for _run in 0..runs {
+        if unavailable {
+            break;
+        }
         let call = ModelCall {
             model_id: candidate.id.clone(),
             provider: candidate.provider.clone(),
@@ -583,11 +760,19 @@ fn run_llm_candidate(
             json_response: candidate.supports_structured_output,
         };
         let resp = match client.chat_completion_cold(&call) {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                consecutive_failures = 0;
+                resp
+            }
             Err(e) => {
                 eprintln!("  [{}] message-batch call failed: {e}", candidate.id);
                 stats.record_failure();
                 outputs.push(None);
+                consecutive_failures += 1;
+                if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+                    eprintln!("  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> marking unavailable, skipping rest", candidate.id);
+                    unavailable = true;
+                }
                 continue;
             }
         };
@@ -629,6 +814,7 @@ fn run_llm_candidate(
         provider: candidate.provider.clone(),
         stats,
         stability_rate,
+        unavailable,
         cost_usd,
         pricing: candidate.pricing_usd_per_m_tokens.clone(),
     })
@@ -708,17 +894,37 @@ fn recommend<'a, T>(
     })
 }
 
-fn render_report(vlm: &[VlmCandidateReport], llm: &[LlmCandidateReport], agreement: f64, runs: u32) -> String {
+fn render_intro(runs: u32) -> String {
     let mut s = String::new();
     s.push_str("## Step 3 — Bake-off run (results)\n\n");
     s.push_str(&format!(
-        "Each candidate run {runs}x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as corrected in `3df3082` (message_10 -> `salary_first_confirmed`). Nothing here is a pick — the user chooses.\n\n"
+        "Each candidate run {runs}x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as of `3f1c26a` (message_10 corrected to `salary_first_confirmed` in `3df3082`; image_10/image_11 gold added in `3f1c26a`, 7 labeled + 9 unlabeled images). Nothing here is a pick — the user chooses.\n\n"
     ));
+    s.push_str(
+        "**Production weight note (from the lead):** extraction's deterministic parser now covers 214/215 messages; the LLM is called for exactly 1 message (`msg_86`) in production, while the VLM is called for all 16 images. Weight the VLM table far more heavily than the LLM table when choosing — the VLM choice is the one that matters at scale.\n\n",
+    );
+    s
+}
 
+fn render_vlm_section(
+    vlm: &[VlmCandidateReport],
+    agreement: f64,
+    runs: u32,
+    labeled_count: usize,
+    unlabeled_count: usize,
+) -> String {
+    let mut s = String::new();
     s.push_str("### VLM candidates (image -> typed figure schema)\n\n");
-    s.push_str("| Model | Provider | Chosen res. (px) | Field accuracy vs gold (5 labeled) | Valid-JSON rate | Stability (5 runs, 16 images) | Cross-model agreement (11 unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run (16 images) |\n");
+    s.push_str(&format!("| Model | Provider | Chosen res. (px) | Field accuracy vs gold ({labeled_count} labeled) | Valid-JSON rate | Stability ({runs} runs, {} images) | Cross-model agreement ({unlabeled_count} unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run ({} images) |\n", labeled_count + unlabeled_count, FULL_RUN_IMAGES));
     s.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for r in vlm {
+        if r.unavailable {
+            s.push_str(&format!(
+                "| {} | {} | — | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE | — | — | — | — | — | — |\n",
+                r.id, r.provider
+            ));
+            continue;
+        }
         let cost_per_item = r.pricing.cost_usd(
             r.stats.avg_prompt_tokens() as u64,
             r.stats.avg_completion_tokens() as u64,
@@ -739,20 +945,56 @@ fn render_report(vlm: &[VlmCandidateReport], llm: &[LlmCandidateReport], agreeme
             cost_per_item * FULL_RUN_IMAGES as f64,
         ));
     }
+    s.push_str(
+        "\n**Selected-figure accuracy** (lead directive: the one amount the engine's deterministic selector would actually use matters more than raw all-field accuracy) **and reconciliation** (image_transcription.v1.md's arithmetic checks — subtotal+tax=total, gross-deductions=net, paid+balance=total, line-item sum, currency match):\n\n",
+    );
+    s.push_str("| Model | Selected-figure accuracy | Reconciliation pass rate | Reconciliation catch rate (wrong reads it would have flagged) |\n");
+    s.push_str("|---|---|---|---|\n");
+    for r in vlm {
+        if r.unavailable {
+            s.push_str(&format!("| {} | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE |\n", r.id));
+            continue;
+        }
+        s.push_str(&format!(
+            "| {} | {:.1}% ({}/{}) | {:.1}% ({}/{}) | {:.1}% ({}/{}) |\n",
+            r.id,
+            r.selector.selected_figure_accuracy() * 100.0,
+            r.selector.selected_correct,
+            r.selector.checked,
+            r.selector.reconciliation_pass_rate() * 100.0,
+            r.selector.reconciliation_passed,
+            r.selector.reconciliation_checked,
+            r.selector.reconciliation_catch_rate() * 100.0,
+            r.selector.wrong_reads_caught_by_reconciliation,
+            r.selector.wrong_reads,
+        ));
+    }
+
+    let available: Vec<&VlmCandidateReport> = vlm.iter().filter(|r| !r.unavailable).collect();
     if let Some(best) = recommend(
-        vlm,
-        |r| r.stats.field_acc.rate(),
-        |r| r.stability_rate,
-        |r| r.stats.valid_json_rate(),
-        |r| r.pricing.cost_usd(r.stats.avg_prompt_tokens() as u64, r.stats.avg_completion_tokens() as u64),
+        &available,
+        |r: &&VlmCandidateReport| {
+            if r.selector.checked > 0 {
+                r.selector.selected_figure_accuracy()
+            } else {
+                r.stats.field_acc.rate()
+            }
+        },
+        |r: &&VlmCandidateReport| r.stability_rate,
+        |r: &&VlmCandidateReport| r.stats.valid_json_rate(),
+        |r: &&VlmCandidateReport| r.pricing.cost_usd(r.stats.avg_prompt_tokens() as u64, r.stats.avg_completion_tokens() as u64),
     ) {
         s.push_str(&format!(
-            "\n**ml-engineer recommendation (VLM, non-binding — the user decides):** `{}` via `{}` at {}px. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost/item; re-check against the actual field-accuracy/cost numbers above before deciding.\n",
+            "\n**ml-engineer recommendation (VLM, non-binding — the user decides):** `{}` via `{}` at {}px. Highest weighted score, using selected-figure accuracy (not raw all-field accuracy) as the accuracy term per the lead's directive, plus stability, valid-JSON rate, and cost/item; re-check against the actual numbers above before deciding.\n",
             best.id, best.provider, best.chosen_max_dim
         ));
     }
     s.push_str("\nResolution sweep detail (labeled-image field accuracy per candidate max dimension):\n\n");
     for r in vlm {
+        if r.unavailable {
+            s.push_str(&format!("- `{}`: UNAVAILABLE (marked unavailable after repeated call failures)\n", r.id));
+            continue;
+        }
         let sweep_str: Vec<String> = r
             .resolution_sweep
             .iter()
@@ -760,12 +1002,23 @@ fn render_report(vlm: &[VlmCandidateReport], llm: &[LlmCandidateReport], agreeme
             .collect();
         s.push_str(&format!("- `{}`: {}\n", r.id, sweep_str.join(", ")));
     }
+    s
+}
 
+fn render_llm_section(llm: &[LlmCandidateReport], runs: u32) -> String {
+    let mut s = String::new();
     s.push_str("\n### LLM candidates (message -> typed records)\n\n");
-    s.push_str("| Model | Provider | Field accuracy vs gold (47 labeled) | Valid-JSON rate | Stability (5 runs) | Cross-model agreement | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run |\n");
+    s.push_str(&format!("| Model | Provider | Field accuracy vs gold (47 labeled) | Valid-JSON rate | Stability ({runs} runs) | Cross-model agreement | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run |\n"));
     s.push_str("|---|---|---|---|---|---|---|---|---|---|---|\n");
     const GOLD_MESSAGES_IN_BATCH: f64 = 47.0;
     for r in llm {
+        if r.unavailable {
+            s.push_str(&format!(
+                "| {} | {} | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE | — | — | — | — | — | — |\n",
+                r.id, r.provider
+            ));
+            continue;
+        }
         let per_item_tokens_in = r.stats.avg_prompt_tokens() / GOLD_MESSAGES_IN_BATCH;
         let per_item_tokens_out = r.stats.avg_completion_tokens() / GOLD_MESSAGES_IN_BATCH;
         let per_item_cost = r.pricing.cost_usd(per_item_tokens_in as u64, per_item_tokens_out as u64);
@@ -783,20 +1036,21 @@ fn render_report(vlm: &[VlmCandidateReport], llm: &[LlmCandidateReport], agreeme
             per_item_cost * FULL_RUN_MESSAGE_SKELETONS_ESTIMATE as f64,
         ));
     }
+    let available: Vec<&LlmCandidateReport> = llm.iter().filter(|r| !r.unavailable).collect();
     if let Some(best) = recommend(
-        llm,
-        |r| r.stats.field_acc.rate(),
-        |r| r.stability_rate,
-        |r| r.stats.valid_json_rate(),
-        |r| r.cost_usd,
+        &available,
+        |r: &&LlmCandidateReport| r.stats.field_acc.rate(),
+        |r: &&LlmCandidateReport| r.stability_rate,
+        |r: &&LlmCandidateReport| r.stats.valid_json_rate(),
+        |r: &&LlmCandidateReport| r.cost_usd,
     ) {
         s.push_str(&format!(
-            "\n**ml-engineer recommendation (LLM, non-binding — the user decides):** `{}` via `{}`. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost; re-check against the actual field-accuracy/cost numbers above before deciding.\n",
+            "\n**ml-engineer recommendation (LLM, non-binding — the user decides):** `{}` via `{}`. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost; re-check against the actual field-accuracy/cost numbers above before deciding. Given production LLM volume is now just 1 message (`msg_86`), this pick matters far less than the VLM pick above.\n",
             best.id, best.provider
         ));
     }
     s.push_str(&format!(
-        "\n\"Est. cost/full run\" for messages uses {FULL_RUN_MESSAGE_SKELETONS_ESTIMATE} as the number of model calls needed across the full 215-message dataset — the count of distinct `record_type` shapes in the 47-message gold subset, used as a concrete lower-bound proxy for the number of *unseen skeletons* extraction's template induction will send to a model (PLAN.md §3 batching lever); most of the 215 messages are expected to resolve deterministically once their skeleton is known, so message volume to models will be small. This is extraction's estimate to firm up, not ml-engineer's.\n\n"
+        "\n\"Est. cost/full run\" for messages uses {FULL_RUN_MESSAGE_SKELETONS_ESTIMATE} as a lower-bound proxy from the gold subset's distinct `record_type` shapes — now superseded by the lead's harder number: extraction's deterministic parser covers 214/215 messages, so production LLM volume is 1 message (`msg_86`), not {FULL_RUN_MESSAGE_SKELETONS_ESTIMATE}.\n\n"
     ));
     s.push_str("(Bake-off messages are batched one call per run for the whole 47-message gold subset, matching the batching lever being judged; a real per-user batch in production is far smaller — per-item token/cost figures above divide the batch call by its message count.)\n\n");
     s
@@ -838,15 +1092,17 @@ fn main() -> Result<()> {
         "User prompt template",
     )?;
 
-    let client = HfClient::with_cache_dir(&args.cache_dir)?.with_retry_policy(
-        cfg.retry.max_attempts,
-        cfg.retry.backoff_base_ms,
-        cfg.retry.backoff_multiplier,
-        cfg.retry.backoff_max_ms,
-    );
+    // Bake-off-specific policy, deliberately tighter than production's
+    // config/models.toml [retry]: a hard 60s per-request timeout and few
+    // retries, so one hanging provider costs seconds, not the whole run
+    // (lead directive). Production runs use the fuller retry policy from
+    // models.toml via their own HfClient.
+    let client = HfClient::with_cache_dir(&args.cache_dir)?
+        .with_request_timeout(60)?
+        .with_retry_policy(2, 1000, 2.0, 4000);
 
     eprintln!(
-        "bake-off: {} VLM candidate(s), {} LLM candidate(s), {} runs each, {} labeled + {} unlabeled images, {} messages",
+        "bake-off: {} VLM candidate(s), {} LLM candidate(s), {} runs each, {} labeled + {} unlabeled images, {} messages (parallel per modality, 60s/req timeout, circuit breaker at {CIRCUIT_BREAKER_THRESHOLD} consecutive failures)",
         cfg.candidates.vlm.len(),
         cfg.candidates.llm.len(),
         args.runs,
@@ -855,34 +1111,119 @@ fn main() -> Result<()> {
         gold.messages.len(),
     );
 
+    // --- VLM candidates run in parallel (they carry nearly all production
+    // calls per the lead; report this table first, before LLM starts). ---
+    fn unavailable_vlm_report(candidate: &CandidateConfig) -> VlmCandidateReport {
+        VlmCandidateReport {
+            id: candidate.id.clone(),
+            provider: candidate.provider.clone(),
+            chosen_max_dim: 0,
+            resolution_sweep: Vec::new(),
+            stats: RunStats::default(),
+            stability_rate: 0.0,
+            pricing: candidate.pricing_usd_per_m_tokens.clone(),
+            unavailable: true,
+            selector: SelectorStats::default(),
+        }
+    }
+
+    let vlm_results: Vec<(VlmCandidateReport, HashMap<String, Vec<(String, Option<Value>)>>)> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = cfg
+                .candidates
+                .vlm
+                .iter()
+                .map(|candidate| {
+                    scope.spawn(|| {
+                        eprintln!("=== VLM candidate: {} ({}) ===", candidate.id, candidate.provider);
+                        run_vlm_candidate(&client, candidate, &cfg, &gold, &args.dataset_dir, &image_prompt, args.runs)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .zip(&cfg.candidates.vlm)
+                .map(|(h, candidate)| match h.join() {
+                    Ok(Ok((report, unlabeled))) => (report, unlabeled),
+                    Ok(Err(e)) => {
+                        eprintln!("=== VLM candidate {} failed outright: {e} -> marking unavailable ===", candidate.id);
+                        (unavailable_vlm_report(candidate), HashMap::new())
+                    }
+                    Err(_) => {
+                        eprintln!("=== VLM candidate {} thread panicked -> marking unavailable ===", candidate.id);
+                        (unavailable_vlm_report(candidate), HashMap::new())
+                    }
+                })
+                .collect()
+        });
+
+    let mut vlm_reports: Vec<VlmCandidateReport> = Vec::new();
     let mut unlabeled_first_run: HashMap<String, Vec<(String, Option<Value>)>> = HashMap::new();
-    let mut vlm_reports = Vec::new();
-    for candidate in &cfg.candidates.vlm {
-        eprintln!("=== VLM candidate: {} ({}) ===", candidate.id, candidate.provider);
-        let report = run_vlm_candidate(
-            &client,
-            candidate,
-            &cfg,
-            &gold,
-            &args.dataset_dir,
-            &image_prompt,
-            args.runs,
-            &mut unlabeled_first_run,
-        )?;
+    for (report, unlabeled) in vlm_results {
+        for (image_id, entries) in unlabeled {
+            unlabeled_first_run.entry(image_id).or_default().extend(entries);
+        }
         vlm_reports.push(report);
     }
     let agreement = cross_model_agreement(&unlabeled_first_run);
 
-    let mut llm_reports = Vec::new();
-    for candidate in &cfg.candidates.llm {
-        eprintln!("=== LLM candidate: {} ({}) ===", candidate.id, candidate.provider);
-        let report = run_llm_candidate(&client, candidate, &cfg.decoding, &gold, &message_prompt, args.runs)?;
-        llm_reports.push(report);
-    }
+    let section_intro = render_intro(args.runs);
+    let labeled_count = gold.images.iter().filter(|i| i.labeled).count();
+    let unlabeled_count = gold.images.iter().filter(|i| !i.labeled).count();
+    let vlm_section = render_vlm_section(&vlm_reports, agreement, args.runs, labeled_count, unlabeled_count);
+    splice_into_bakeoff_md(&args.out, &format!("{section_intro}{vlm_section}"))?;
+    eprintln!("bake-off: VLM table written into {} (LLM section running next)", args.out.display());
 
-    let section = render_report(&vlm_reports, &llm_reports, agreement, args.runs);
-    splice_into_bakeoff_md(&args.out, &section)?;
-    eprintln!("bake-off: results written into {}", args.out.display());
+    // --- LLM candidates: low production stakes now (1 msg in prod), but
+    // still run in parallel for speed. ---
+    let llm_reports: Vec<LlmCandidateReport> = std::thread::scope(|scope| {
+        let handles: Vec<_> = cfg
+            .candidates
+            .llm
+            .iter()
+            .map(|candidate| {
+                scope.spawn(|| {
+                    eprintln!("=== LLM candidate: {} ({}) ===", candidate.id, candidate.provider);
+                    run_llm_candidate(&client, candidate, &cfg.decoding, &gold, &message_prompt, args.runs)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .zip(&cfg.candidates.llm)
+            .map(|(h, candidate)| match h.join() {
+                Ok(Ok(report)) => report,
+                Ok(Err(e)) => {
+                    eprintln!("=== LLM candidate {} failed outright: {e} -> marking unavailable ===", candidate.id);
+                    LlmCandidateReport {
+                        id: candidate.id.clone(),
+                        provider: candidate.provider.clone(),
+                        stats: RunStats::default(),
+                        stability_rate: 0.0,
+                        unavailable: true,
+                        cost_usd: 0.0,
+                        pricing: candidate.pricing_usd_per_m_tokens.clone(),
+                    }
+                }
+                Err(_) => {
+                    eprintln!("=== LLM candidate {} thread panicked -> marking unavailable ===", candidate.id);
+                    LlmCandidateReport {
+                        id: candidate.id.clone(),
+                        provider: candidate.provider.clone(),
+                        stats: RunStats::default(),
+                        stability_rate: 0.0,
+                        unavailable: true,
+                        cost_usd: 0.0,
+                        pricing: candidate.pricing_usd_per_m_tokens.clone(),
+                    }
+                }
+            })
+            .collect()
+    });
+
+    let llm_section = render_llm_section(&llm_reports, args.runs);
+    splice_into_bakeoff_md(&args.out, &format!("{section_intro}{vlm_section}{llm_section}"))?;
+    eprintln!("bake-off: full report written into {}", args.out.display());
 
     Ok(())
 }

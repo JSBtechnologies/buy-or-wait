@@ -153,6 +153,19 @@ impl HfClient {
         self.usage_log.lock().expect("usage_log mutex poisoned").clone()
     }
 
+    /// Rebuild the HTTP client with a hard per-request timeout (connect
+    /// timeout is `secs / 4`, minimum 5s). Use a tight bound (e.g. the
+    /// bake-off's 60s) where a hanging provider must fail fast rather than
+    /// block a whole run.
+    pub fn with_request_timeout(mut self, secs: u64) -> Result<Self> {
+        self.http = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs((secs / 4).max(5)))
+            .timeout(Duration::from_secs(secs))
+            .build()
+            .context("failed to rebuild HTTP client with custom timeout")?;
+        Ok(self)
+    }
+
     /// Override retry/backoff behavior (e.g. for tests). Defaults match
     /// `code/config/models.toml` `[retry]`.
     pub fn with_retry_policy(

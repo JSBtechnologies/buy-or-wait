@@ -39,24 +39,29 @@ Blocked on the integrator's scaffold (`P1.scaffold`, bus topic `scaffold`).
 Will build once `atrium ctl bus sub scaffold` reports done and `git merge
 main` is run in this worktree.
 
-## Step 3 — Bake-off run (`code/src/bin/bakeoff.rs`)
+## Step 3 — Bake-off run (results)
 
-Blocked on `docs/gold_subset.json` and prompts from extraction (bus topic
-`extract`). Plan: run every candidate above on the identical fixed subset with
-identical prompts, 5 times each at `temperature=0`, sweeping image resolution
-(512/768/1024/1536 px max dimension) for the VLM candidates. Report per model:
+Each candidate run 3x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as corrected in `3df3082` (message_10 -> `salary_first_confirmed`). Nothing here is a pick — the user chooses.
 
-- valid-JSON rate
-- field accuracy vs gold
-- agreement on unlabeled items (cross-model)
-- stability rate (identical parsed output across the 5 runs) — reproducibility
-  is a selection criterion, not just accuracy
-- avg input/output tokens per item
-- latency
-- cost
-- smallest image resolution that keeps gold accuracy (per VLM candidate)
+**Production weight note (from the lead):** extraction's deterministic parser now covers 214/215 messages; the LLM is called for exactly 1 message (`msg_86`) in production, while the VLM is called for all 16 images. Weight the VLM table far more heavily than the LLM table when choosing — the VLM choice is the one that matters at scale.
 
-Results table to be filled in after the run.
+### VLM candidates (image -> typed figure schema)
+
+| Model | Provider | Chosen res. (px) | Field accuracy vs gold (5 labeled) | Valid-JSON rate | Stability (3 runs, 16 images) | Cross-model agreement (11 unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run (16 images) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen/Qwen3-VL-235B-A22B-Instruct | deepinfra | 1024 | 77.5% | 100.0% | 31.2% | 92.9% | 936 | 184 | 5861 | $0.00035 | $0.0056 |
+| Qwen/Qwen3-VL-30B-A3B-Instruct | deepinfra | 1024 | 69.8% | 100.0% | 100.0% | 92.9% | 936 | 163 | 6151 | $0.00024 | $0.0038 |
+| google/gemma-4-31B-it | deepinfra | 768 | 86.2% | 97.9% | 56.2% | 92.9% | 545 | 171 | 8871 | $0.00014 | $0.0022 |
+| Qwen/Qwen3.5-397B-A17B | deepinfra | 512 | 0.0% | 0.0% | 100.0% | 92.9% | 432 | 400 | 7472 | $0.00139 | $0.0223 |
+
+**ml-engineer recommendation (VLM, non-binding — the user decides):** `Qwen/Qwen3-VL-30B-A3B-Instruct` via `deepinfra` at 1024px. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost/item; re-check against the actual field-accuracy/cost numbers above before deciding.
+
+Resolution sweep detail (labeled-image field accuracy per candidate max dimension):
+
+- `Qwen/Qwen3-VL-235B-A22B-Instruct`: 512px=59%, 768px=75%, 1024px=78%, 1536px=76%
+- `Qwen/Qwen3-VL-30B-A3B-Instruct`: 512px=47%, 768px=63%, 1024px=70%, 1536px=67%
+- `google/gemma-4-31B-it`: 512px=70%, 768px=86%, 1024px=82%, 1536px=79%
+- `Qwen/Qwen3.5-397B-A17B`: 512px=0%, 768px=0%, 1024px=0%, 1536px=0%
 
 ## Step 4 — Usage report (`code/evaluation/usage_report.md`)
 
