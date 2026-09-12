@@ -349,6 +349,24 @@ fn changed_amount(stream: &Stream, changes: &[SpendingChange], _rules: &Rules) -
     Some(amount)
 }
 
+/// The description behind a projected flow: its stream's description or its ledger row's.
+fn flow_description(f: &Flow, inp: &ForecastInputs) -> Option<String> {
+    match &f.source {
+        FlowSource::Stream { stream_id } => {
+            inp.streams.streams.iter().find(|s| &s.id == stream_id).and_then(|s| s.description.clone())
+        }
+        FlowSource::Scheduled { event_id } | FlowSource::Reserved { event_id } => {
+            inp.ledger.get(event_id).map(|e| e.event.description.clone())
+        }
+        FlowSource::Evidence { .. } => None,
+    }
+}
+
+fn descriptions_match(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seed_monthly_income(
     flows: &mut Vec<Flow>,
@@ -468,8 +486,14 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                     }
                 }
             }
-            Fact::IncomeEnded { category, effective } => {
-                flows.retain(|f| !(is_income_flow(f, category) && f.date >= *effective));
+            Fact::IncomeEnded { category, effective, description } => {
+                flows.retain(|f| {
+                    let selected = match description {
+                        None => true,
+                        Some(want) => flow_description(f, inp).is_some_and(|have| descriptions_match(&have, want)),
+                    };
+                    !(is_income_flow(f, category) && f.date >= *effective && selected)
+                });
             }
             Fact::NewRecurringExpense { category, amount, currency, first_date, every_days, description } => {
                 let occ = super::recurrence::Occurrence {
