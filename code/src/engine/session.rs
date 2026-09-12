@@ -12,7 +12,7 @@ use chrono::NaiveDate;
 use super::explain;
 use super::facts::{CandidateFact, CandidateOutcome, ChangeFact, DecisionFacts};
 use super::forecast::{Forecast, ForecastInputs, SpendingChange};
-use super::ledger::{EvidenceRecord, Ledger, LedgerIssue};
+use super::ledger::{AmountSource, EvidenceRecord, Ledger, LedgerIssue};
 use super::money::Money;
 use super::plans::{self, Outcome, PlanContext};
 use super::recurrence::{self, Streams};
@@ -253,6 +253,13 @@ impl Session {
             option_id,
             changes: change_facts,
             plan_trough,
+            missing_amounts: self
+                .ledger
+                .entries
+                .iter()
+                .filter(|e| e.amount_source == AmountSource::Missing)
+                .map(|e| e.event.id.clone())
+                .collect(),
             ledger_issues: self.ledger.issues.iter().map(issue_text).collect(),
             rejected_evidence: self.ledger.rejected.iter().map(|r| format!("{}: {}", r.record_id, r.reason)).collect(),
             applied_evidence: self
@@ -272,7 +279,7 @@ impl Session {
             payment_plan: render_plan(&plan),
             earliest_date_for_full_payment: earliest.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
             spending_changes_needed: render_changes(&changes),
-            decision_explanation: explain::render(&facts),
+            decision_explanation: explain::render(&facts, rules),
         };
         self_check(&facts, &row)?;
         Ok(Decision { row, facts, streams, baseline, with_changes })

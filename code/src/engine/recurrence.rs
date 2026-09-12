@@ -211,7 +211,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
                 occurrences: occs,
             };
             if income {
-                if category == SALARY && final_payroll.is_some() {
+                if rules.final_payroll_stops_income && category == SALARY && final_payroll.is_some() {
                     out.inactive.push((stream.id, format!("income ended (final payroll {})", final_payroll.unwrap())));
                     continue;
                 }
@@ -224,7 +224,7 @@ pub fn detect(ledger: &Ledger, as_of: NaiveDate, rules: &Rules) -> Streams {
             out.streams.push(stream);
         }
     }
-    if final_payroll.is_none() {
+    if rules.seeded_salary_stream && !(rules.final_payroll_stops_income && final_payroll.is_some()) {
         anchor_scheduled_income(ledger, &mut out.streams, rules);
     }
     out
@@ -289,7 +289,9 @@ fn anchor_scheduled_income(ledger: &Ledger, streams: &mut Vec<Stream>, rules: &R
         match existing {
             Some(s) if s.last_date() < e.cash_date => {
                 // S3.4(c): later months follow the scheduled row's day of month.
-                s.cadence = Cadence::Monthly { day: e.cash_date.day() };
+                if rules.scheduled_replaces_cycle {
+                    s.cadence = Cadence::Monthly { day: e.cash_date.day() };
+                }
                 s.occurrences.push(occ);
                 s.projected_amount = amount;
             }

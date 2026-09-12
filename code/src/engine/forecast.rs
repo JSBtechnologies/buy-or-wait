@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::ledger::{Fact, Ledger, LedgerEntry};
 use super::money::Money;
 use super::recurrence::{Cadence, Stream, StreamKind, Streams};
-use super::rules::Rules;
+use super::rules::{DayOrder, PaymentTiming, Rules};
 use super::types::{Direction, Payment, RateProvider};
 
 /// Half a cent: plan amounts are written rounded to cents (RULES S1.5), so a plan built from
@@ -76,6 +76,8 @@ pub struct Forecast {
     pub balance: Vec<Money>,
     /// `suffix_low[d] = min over t >= d of low[t]`.
     pub suffix_low: Vec<Money>,
+    /// How `check` applies a plan payment within its day.
+    pub payment_timing: PaymentTiming,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -143,10 +145,14 @@ impl Forecast {
         // Stream projections, with spending changes and forecast-level evidence applied.
         for stream in &inp.streams.streams {
             let Some(amount) = changed_amount(stream, changes, rules) else { continue };
-            let mut dates = stream.dates_between(start, end);
+            let stream_end = match (stream.kind, rules.variable_horizon) {
+                (StreamKind::VariableSpend, Some(h)) => h.end(start).min(end),
+                _ => end,
+            };
+            let mut dates = stream.dates_between(start, stream_end);
             // RULES S3.4(c): a scheduled row replaces the projected occurrence of a monthly
             // stream with the same category and direction within the window (verifier#45).
-            if matches!(stream.cadence, Cadence::Monthly { .. }) {
+            if rules.scheduled_replaces_cycle && matches!(stream.cadence, Cadence::Monthly { .. }) {
                 dates.retain(|d| {
                     !scheduled.iter().any(|e| {
                         e.event.category == stream.category
@@ -171,7 +177,28 @@ impl Forecast {
         apply_adjustments(&mut flows, inp, start, end);
 
         flows.sort_by(|a, b| (a.date, &a.category).cmp(&(b.date, &b.category)));
-        Forecast::from_flows(start, inp.opening_balance, inp.minimum_balance, reserved_total, flows, horizon_days)
+        let mut f = Forecast::from_flows(start, inp.opening_balance, inp.minimum_balance, reserved_total, flows, horizon_days);
+        if rules.same_day_order == DayOrder::CreditsFirst {
+            f.apply_credits_first();
+        }
+        f.payment_timing = rules.payment_timing;
+        f
+    }
+
+    /// Recompute intraday lows with credits applied before debits (S0 SAME_DAY_ORDER A/B).
+    fn apply_credits_first(&mut self) {
+        let mut prev = self.opening_balance;
+        for t in 0..self.balance.len() {
+            let debits = self.low[t] - prev; // <= 0
+            let credits = self.balance[t] - self.low[t]; // >= 0
+            self.low[t] = prev + credits + debits;
+            prev = self.balance[t];
+        }
+        let mut m = Money(i64::MAX);
+        for t in (0..self.low.len()).rev() {
+            m = m.min(self.low[t]);
+            self.suffix_low[t] = m;
+        }
     }
 
     pub fn from_flows(
@@ -210,7 +237,17 @@ impl Forecast {
             m = m.min(low[t]);
             suffix_low[t] = m;
         }
-        Forecast { start, opening_balance, minimum_balance, reserved_total, flows, low, balance, suffix_low }
+        Forecast {
+            start,
+            opening_balance,
+            minimum_balance,
+            reserved_total,
+            flows,
+            low,
+            balance,
+            suffix_low,
+            payment_timing: PaymentTiming::AfterDayRows,
+        }
     }
 
     pub fn horizon_end(&self) -> NaiveDate {
@@ -273,7 +310,10 @@ impl Forecast {
         let mut first_breach = None;
         let mut trough = (Money(i64::MAX), self.start);
         for t in 0..n {
-            let low = self.low[t] - paid_before;
+            let low = match self.payment_timing {
+                PaymentTiming::AfterDayRows => self.low[t] - paid_before,
+                PaymentTiming::BeforeCredits => self.low[t] - paid_before - add[t],
+            };
             let end = self.balance[t] - paid_before - add[t];
             for v in [low, end] {
                 if v < trough.0 {
@@ -307,6 +347,24 @@ fn changed_amount(stream: &Stream, changes: &[SpendingChange], _rules: &Rules) -
         }
     }
     Some(amount)
+}
+
+/// The description behind a projected flow: its stream's description or its ledger row's.
+fn flow_description(f: &Flow, inp: &ForecastInputs) -> Option<String> {
+    match &f.source {
+        FlowSource::Stream { stream_id } => {
+            inp.streams.streams.iter().find(|s| &s.id == stream_id).and_then(|s| s.description.clone())
+        }
+        FlowSource::Scheduled { event_id } | FlowSource::Reserved { event_id } => {
+            inp.ledger.get(event_id).map(|e| e.event.description.clone())
+        }
+        FlowSource::Evidence { .. } => None,
+    }
+}
+
+fn descriptions_match(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -428,8 +486,14 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                     }
                 }
             }
-            Fact::IncomeEnded { category, effective } => {
-                flows.retain(|f| !(is_income_flow(f, category) && f.date >= *effective));
+            Fact::IncomeEnded { category, effective, description } => {
+                flows.retain(|f| {
+                    let selected = match description {
+                        None => true,
+                        Some(want) => flow_description(f, inp).is_some_and(|have| descriptions_match(&have, want)),
+                    };
+                    !(is_income_flow(f, category) && f.date >= *effective && selected)
+                });
             }
             Fact::NewRecurringExpense { category, amount, currency, first_date, every_days, description } => {
                 let occ = super::recurrence::Occurrence {
