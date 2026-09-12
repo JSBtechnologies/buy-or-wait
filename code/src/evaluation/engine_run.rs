@@ -325,6 +325,21 @@ mod tests {
                     .or_default()
                     .push(tag);
             }
+            // Announced/one-off income must never be projected as a stream (spec: bonuses,
+            // commissions, refunds, prizes count only once settled, and never recur).
+            for f in &d.baseline.flows {
+                if let FlowSource::Stream { stream_id } = &f.source {
+                    let lower = stream_id.to_lowercase();
+                    if f.amount.0 > 0
+                        && ["bonus", "commission", "prize", "lottery", "refund", "reimburse", "arrears", "windfall", "payout"]
+                            .iter()
+                            .any(|k| lower.contains(k))
+                    {
+                        hits += 1;
+                        println!("ONE-OFF-INCOME-PROJECTED {} {stream_id} @{}", r.id, f.date);
+                    }
+                }
+            }
             let mut keys: Vec<_> = by.into_iter().collect();
             keys.sort();
             for ((cat, ym, credit), tags) in keys {
