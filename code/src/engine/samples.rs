@@ -215,3 +215,60 @@ mod explanations {
         std::fs::write(std::env::var("EXPLAIN_OUT").unwrap_or_else(|_| "explanations.tsv".into()), out).unwrap();
     }
 }
+
+#[cfg(test)]
+mod image_preview {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::patched_rules;
+    use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
+    use crate::engine::money::Money;
+    use crate::engine::{session::Session, types::*};
+    use crate::model;
+
+    /// board verify.images_64_73: with the verifier's image readings as EventAmount facts,
+    /// request_64 -> safe 0, E blank; request_73 -> not_affordable, safe 68498.58, E 2023-02-15.
+    #[test]
+    #[ignore]
+    fn preview_64_73() {
+        let ds = Path::new("../dataset");
+        let profiles = model::load_financial_profiles(ds.join("financial_profiles.csv")).unwrap();
+        let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
+        let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
+        let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
+        let messages = model::load_messages(ds.join("messages.csv")).unwrap();
+        let requests = model::load_requests(ds.join("requests.csv")).unwrap();
+        for (rid, eid, amount) in [("request_64", "event_6033", 79679.26), ("request_73", "event_6859", 3650.0)] {
+            let r = requests.iter().find(|r| r.request_id == rid).unwrap();
+            let mut session = Session::from_model(&r.user_id, &profiles, &events, rates.clone(), patched_rules()).unwrap();
+            let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == r.user_id && m.sent_at.date_naive() <= r.request_date).collect();
+            let home = session.profile().home_currency.clone();
+            let currency = session.ledger().get(eid).unwrap().event.currency.clone();
+            let mut ev = crate::extract::messages::deterministic_evidence(&msgs, &home);
+            ev.push(EvidenceRecord {
+                record_id: format!("image_for_{eid}"),
+                source: EvidenceSource::Image,
+                observed_at: r.request_date.and_hms_opt(0, 0, 0).unwrap(),
+                fact: Fact::EventAmount { event_id: eid.into(), amount: Money::from_f64(amount), currency },
+            });
+            if rid == "request_73" && !ev.iter().any(|e| matches!(e.fact, Fact::ExpenseAmountChange { .. })) {
+                // message_55 (rent +12% on renewal, next payment): in main's store/evidence,
+                // not parsed by the zero-token skeletons.
+                ev.push(EvidenceRecord {
+                    record_id: "message_55#0".into(),
+                    source: EvidenceSource::Message { source_type: "service_provider".into() },
+                    observed_at: chrono::NaiveDate::from_ymd_opt(2023, 1, 19).unwrap().and_hms_opt(9, 30, 0).unwrap(),
+                    fact: Fact::ExpenseAmountChange { category: "rent".into(), amount: None, percent: Some(12.0), currency: None, effective: None },
+                });
+            }
+            session.apply_evidence(ev);
+            let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == rid).map(|o| PaymentOption::from_model(o).unwrap()).collect();
+            let d = session.decide(rid, r.request_date, &RequestSpec::from_model(r), &opts).unwrap();
+            println!("  raw_safe={} trough={:?}", d.facts.raw_safe_amount, (d.facts.trough_balance, d.facts.trough_date));
+            for f in d.baseline.flows.iter().filter(|f| (f.date - r.request_date).num_days() <= 12) { println!("  flow {} {} {} {:?}", f.date, f.amount, f.category, f.source); }
+            println!("{} {} {} safe={} E={:?} missing={:?} rejected={:?} | {}", rid, d.row.affordability_status, d.row.recommended_payment_method,
+                d.row.amount_safe_to_pay, d.row.earliest_date_for_full_payment, d.facts.missing_amounts, d.facts.rejected_evidence, d.row.decision_explanation);
+        }
+    }
+}
