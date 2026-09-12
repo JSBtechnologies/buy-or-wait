@@ -224,12 +224,13 @@
       "text": "Ada informasi baru dari Greenfield Foods tentang gaji Anda. Gaji yang sudah dikonfirmasi kini diperkirakan masuk pada 2025-02-23. Tanggal ini menggantikan tanggal penggajian pada pemberitahuan sebelumnya. Gunakan tanggal terbaru ini untuk pembayaran yang biasanya dilakukan saat gajian. Ref payroll EMP-0165.",
       "expected": [ { "record_type": "salary_change", "amount": null, "currency": null, "percent": null, "date": "2025-02-23", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "pay_date_moved_supersedes_prior" } ] },
 
-    { "message_id": "message_10", "language": "en", "record_type": "salary_change+recurring_expense_change",
+    { "message_id": "message_10", "language": "en", "record_type": "salary_first_confirmed+recurring_expense_change",
       "text": "Here’s the latest payroll information from HarborWorks. Regular salary of EUR 2717 resumes on 2025-08-15. A new recurring childcare payment begins in the same month. The updated pay and deductions will appear from the next cycle. Payroll ref EMP-0010.",
       "expected": [
-        { "record_type": "salary_change", "amount": 2717, "currency": "EUR", "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "resumes_after_pause" },
+        { "record_type": "salary_first_confirmed", "amount": 2717, "currency": "EUR", "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": "increase", "scope": null, "is_duplicate_transfer": null, "category_hint": "salary", "note": "resumes_after_pause" },
         { "record_type": "recurring_expense_change", "amount": null, "currency": null, "percent": null, "date": "2025-08-15", "related_event_id": null, "status_hint": "confirmed", "direction": null, "scope": null, "is_duplicate_transfer": null, "category_hint": "childcare", "note": "new_recurring_expense_amount_unknown" }
-      ] },
+      ],
+      "note": "engine#63/8cc70f3: 'resumes' maps to Fact::IncomeStarts (re-anchors monthly cadence from first_date), same as salary_first_confirmed — not a plain salary_change." },
 
     { "message_id": "message_20", "language": "en", "record_type": "salary_change+one_time_adjustment",
       "text": "A quick update from the payroll team at Cedar Health. Your regular salary for the next payroll is EUR 1452. The same payroll includes a one-time arrears adjustment of EUR 653.40. Your next payslip will show the regular pay and any one-off adjustment separately. Payroll ref EMP-0020.",
