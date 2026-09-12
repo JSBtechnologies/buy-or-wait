@@ -234,3 +234,36 @@ fn request_44_scheduled_utility_projected_once() {
         assert!(doubles.is_empty(), "{} {:?} doubled by {:?}", s.category, s.date, doubles);
     }
 }
+
+/// RULES S6.1 (extraction #125): IncomeDateMoved re-anchors ALL later months, not only the
+/// next occurrence; a month-end move clamps per month.
+#[test]
+fn income_date_moved_reanchors_every_later_month() {
+    use super::ledger::{EvidenceRecord, EvidenceSource, Fact};
+    let run = |new_date: &str, rd: &str| {
+        let events = history(EventType::Income, "Payroll credit", "salary", Direction::Credit, 149000.0, 15, 1);
+        let rules = Rules::default();
+        let rates = Arc::new(RateTable::default());
+        let evidence = vec![EvidenceRecord {
+            record_id: "message_05#0".into(),
+            source: EvidenceSource::Message { source_type: "employer".into() },
+            observed_at: d("2025-07-29").and_hms_opt(9, 30, 0).unwrap(),
+            fact: Fact::IncomeDateMoved { category: "salary".into(), new_date: d(new_date) },
+        }];
+        let ledger = Ledger::build("INR", &events, &evidence, rates.as_ref(), &rules);
+        let streams = recurrence::detect(&ledger, d(rd), &rules);
+        let inputs = ForecastInputs {
+            ledger: &ledger,
+            streams: &streams,
+            opening_balance: Money::ZERO,
+            minimum_balance: Money::ZERO,
+            start: d(rd),
+            rates: rates.as_ref(),
+            rules: &rules,
+        };
+        let f = Forecast::build(&inputs, &[]);
+        f.flows.iter().filter(|x| x.category == "salary").map(|x| x.date).collect::<Vec<_>>()
+    };
+    assert_eq!(run("2025-08-23", "2025-08-05"), vec![d("2025-08-23"), d("2025-09-23"), d("2025-10-23")]);
+    assert_eq!(run("2025-08-31", "2025-08-05"), vec![d("2025-08-31"), d("2025-09-30"), d("2025-10-31")]);
+}
