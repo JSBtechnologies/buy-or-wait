@@ -43,6 +43,7 @@ pub struct DecisionFacts {
     pub requested_amount: Cents,
     pub desired_completion_date: NaiveDate,
     pub allows_partial_payment: bool,
+    pub accepted_methods: Vec<PaymentMethod>,
 
     // ---- position ----------------------------------------------------------------------
     pub starting_balance: Cents,
