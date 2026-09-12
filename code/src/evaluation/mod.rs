@@ -8,6 +8,7 @@ pub mod evidence_audit;
 pub mod evidence_consistency;
 pub mod explanation;
 pub mod hardcode_scan;
+pub mod image_agreement;
 pub mod invariants;
 pub mod ledger_gate;
 pub mod mirror;
