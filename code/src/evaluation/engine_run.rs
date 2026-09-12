@@ -285,11 +285,13 @@ mod tests {
                     Err(_) => crate::evaluation::OutputRow { request_id: r.id.clone(), ..Default::default() },
                 })
                 .collect();
-            crate::evaluation::scorer::score(&ds, &rows)
+            (crate::evaluation::scorer::score(&ds, &rows), rows)
         };
         let (pa, pb) = (std::env::var("VERIFIER_RULES_A").unwrap_or_default(), std::env::var("VERIFIER_RULES_B").unwrap_or_default());
-        let (a, b) = (run(&pa), run(&pb));
+        let ((a, rows_a), (b, rows_b)) = (run(&pa), run(&pb));
         println!("A={pa:?} B={pb:?}");
+        let changed = rows_a.iter().zip(&rows_b).filter(|(x, y)| x != y).count();
+        println!("ROWS CHANGED {changed}/{}{}", rows_a.len(), if changed == 0 { "  <- toggle had no effect on any sample row: check it is wired" } else { "" });
         for (name, sa, sb) in [("tuning", &a.tuning, &b.tuning), ("held-out", &a.heldout, &b.heldout)] {
             for f in crate::evaluation::scorer::FIELDS {
                 let (x, y) = (sa.matched.get(f).copied().unwrap_or(0), sb.matched.get(f).copied().unwrap_or(0));
