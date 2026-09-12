@@ -157,6 +157,8 @@ pub struct LedgerEntry {
     pub home_amount: Option<Cents>,
     /// Evidence record ids applied to this entry, in application order.
     pub applied_evidence: Vec<String>,
+    /// Settled refund that reversed this charge; such pairs are excluded from stream history.
+    pub reversed_by: Option<String>,
 }
 
 impl LedgerEntry {
@@ -215,6 +217,7 @@ impl Ledger {
                 amount_source: if e.amount.is_some() { AmountSource::Row } else { AmountSource::Missing },
                 home_amount: None,
                 applied_evidence: Vec::new(),
+                reversed_by: None,
                 event: e.clone(),
             });
         }
@@ -273,9 +276,25 @@ impl Ledger {
             let succ_id = succ.event.id.clone();
             let succ_dir = succ.event.direction;
             if let Some(pred) = self.get_mut(&pred_id) {
-                if pred.event.direction == succ_dir && pred.treatment.moves_cash() {
+                // Settled is terminal: a later pending "possible duplicate" never erases it.
+                if pred.event.direction == succ_dir
+                    && pred.event.status != Status::Settled
+                    && pred.treatment.moves_cash()
+                {
                     pred.treatment = CashTreatment::Excluded(ExclusionReason::SupersededBy(succ_id));
                 }
+            }
+        }
+        // A settled refund reverses its linked charge: neither is regular spending history.
+        let reversals: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter(|e| e.event.event_type == EventType::Refund && e.treatment == CashTreatment::Settled)
+            .filter_map(|e| e.event.linked_event_id.clone().map(|l| (l, e.event.id.clone())))
+            .collect();
+        for (charge_id, refund_id) in reversals {
+            if let Some(charge) = self.get_mut(&charge_id) {
+                charge.reversed_by = Some(refund_id);
             }
         }
     }
@@ -465,6 +484,7 @@ mod tests {
             ev("event_4", Status::Failed, Debit, DebtPayment, None),
             ev("event_5", Status::Scheduled, Debit, DebtPayment, Some("event_4")),
             ev("event_6", Status::Pending, Debit, Expense, None),
+            ev("event_7", Status::Pending, Debit, Expense, Some("event_2")),
         ];
         let evidence = vec![EvidenceRecord {
             record_id: "message_9#0".into(),
@@ -476,6 +496,7 @@ mod tests {
         let t = |id: &str| l.get(id).unwrap().treatment.clone();
         assert_eq!(t("event_1"), CashTreatment::Excluded(ExclusionReason::SupersededBy("event_2".into())));
         assert_eq!(t("event_2"), CashTreatment::Settled);
+        assert_eq!(t("event_7"), CashTreatment::Reserved);
         assert_eq!(t("event_3"), CashTreatment::Excluded(ExclusionReason::PendingCredit));
         assert_eq!(t("event_4"), CashTreatment::Excluded(ExclusionReason::Failed));
         assert_eq!(t("event_5"), CashTreatment::Scheduled);
