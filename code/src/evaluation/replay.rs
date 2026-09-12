@@ -71,7 +71,9 @@ pub fn replay(req: &Request, row: &OutputRow, fc: &ForecastSeries) -> Vec<Findin
     };
 
     // F1: every day of the horizon stays at or above the minimum after cumulative plan payments.
-    if let Ok(plan) = parse_plan(&row.payment_plan) {
+    // An empty plan pays nothing: a baseline that already dips below the minimum is a financial
+    // fact behind not_recommended, not a plan breach.
+    if let Some(plan) = parse_plan(&row.payment_plan).ok().filter(|p| !p.is_empty()) {
         let mut paid = 0.0;
         let mut next = 0;
         let mut worst: Option<(NaiveDate, f64)> = None;
@@ -173,6 +175,14 @@ mod tests {
 
         let late = row("40", "2024-01-01:40|2024-01-05:60", "2024-01-05");
         assert!(replay(&req(), &late, &fc).iter().any(|x| x.code == "F3_earliest_mismatch"));
+
+        // not_recommended over a baseline that already breaches the minimum is not a plan breach.
+        let dip = [90.0, 300.0];
+        let fc_dip = ForecastSeries { start: req().request_date, minimum: 100.0, baseline: &dip, with_changes: None };
+        let none = row("0", "none", "");
+        assert!(!replay(&req(), &none, &fc_dip).iter().any(|x| x.severity == Severity::Error));
+        let paid = row("0", "2024-01-02:1", "");
+        assert!(replay(&req(), &paid, &fc_dip).iter().any(|x| x.code == "F1_plan_breaches_minimum"));
 
         let wrong_start = ForecastSeries { start: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(), ..fc.clone() };
         assert!(replay(&req(), &ok, &wrong_start).iter().any(|x| x.code == "F0_series_start"));

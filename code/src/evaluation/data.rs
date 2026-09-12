@@ -150,7 +150,9 @@ pub struct Event {
     pub amount: Option<Cents>,
     pub currency: String,
     pub event_date: NaiveDate,
+    pub settlement_date: Option<NaiveDate>,
     pub status: String,
+    pub linked_event_id: Option<String>,
     pub flexibility: String,
     pub minimum_allowed_amount: Option<Cents>,
 }
@@ -165,6 +167,26 @@ pub struct PayOption {
     pub first_payment_date: NaiveDate,
     pub frequency_days: Option<u32>,
     pub total_payable: Cents,
+}
+
+impl Event {
+    pub fn cash_date(&self) -> NaiveDate {
+        self.settlement_date.unwrap_or(self.event_date)
+    }
+}
+
+/// `amount * rate` with the rate parsed as an exact decimal, rounded half away from zero to the cent.
+pub fn convert_exact(amount: Cents, rate: &str) -> Result<Cents> {
+    let (int, frac) = rate.split_once('.').unwrap_or((rate, ""));
+    if int.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("bad rate {rate:?}");
+    }
+    let mantissa: i128 = format!("{int}{frac}").parse()?;
+    let den = 10i128.pow(frac.len() as u32);
+    let num = amount as i128 * mantissa;
+    let (q, r) = (num / den, num % den);
+    let q = if 2 * r.abs() >= den { q + num.signum() } else { q };
+    Ok(q as i64)
 }
 
 impl PayOption {
@@ -187,6 +209,8 @@ pub struct Dataset {
     pub events: HashMap<String, Event>,
     pub events_by_user: HashMap<String, Vec<String>>,
     pub options: HashMap<String, Vec<PayOption>>,
+    /// (rate_date, from, to) -> rate as an exact decimal string.
+    pub rates: HashMap<(NaiveDate, String, String), String>,
     /// Filled only when the requests file has the output columns (sample_requests.csv).
     pub labels: Vec<LabelRow>,
 }
@@ -266,7 +290,15 @@ impl Dataset {
                 amount: if amount.is_empty() { None } else { Some(parse_cents(amount)?) },
                 currency: ev.get(r, "currency")?.to_string(),
                 event_date: parse_date(ev.get(r, "event_date")?)?,
+                settlement_date: match ev.get(r, "settlement_date")? {
+                    "" => None,
+                    d => Some(parse_date(d)?),
+                },
                 status: ev.get(r, "status")?.to_string(),
+                linked_event_id: match ev.get(r, "linked_event_id")? {
+                    "" => None,
+                    l => Some(l.to_string()),
+                },
                 flexibility: ev.get(r, "flexibility")?.to_string(),
                 minimum_allowed_amount: if min_allowed.is_empty() {
                     None
@@ -295,7 +327,20 @@ impl Dataset {
             options.entry(o.request_id.clone()).or_default().push(o);
         }
 
-        Ok(Dataset { requests, request_index, profiles, events, events_by_user, options, labels })
+        let fx = Table::read(&dataset_dir.join("exchange_rates.csv"))?;
+        let mut rates = HashMap::new();
+        for r in &fx.rows {
+            rates.insert(
+                (
+                    parse_date(fx.get(r, "rate_date")?)?,
+                    fx.get(r, "from_currency")?.to_string(),
+                    fx.get(r, "to_currency")?.to_string(),
+                ),
+                fx.get(r, "rate")?.to_string(),
+            );
+        }
+
+        Ok(Dataset { requests, request_index, profiles, events, events_by_user, options, rates, labels })
     }
 
     pub fn request(&self, request_id: &str) -> Option<&Request> {
@@ -321,6 +366,14 @@ mod tests {
         assert_eq!(fmt_cents_2dp(1084000), "10840");
         assert_eq!(fmt_cents_short(60330), "603.3");
         assert_eq!(fmt_cents_short(2350), "23.5");
+    }
+
+    #[test]
+    fn exact_fx() {
+        assert_eq!(convert_exact(100_00, "0.92").unwrap(), 92_00);
+        assert_eq!(convert_exact(696_00, "16250").unwrap(), 11_310_000_00);
+        assert_eq!(convert_exact(1, "0.5").unwrap(), 1); // half away from zero
+        assert!(convert_exact(1, "1e3").is_err());
     }
 
     #[test]
