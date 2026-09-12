@@ -183,3 +183,58 @@ alt_providers = [
   { provider = "baseten", pricing_usd_per_m_tokens = { input = 0.10, output = 0.50 }, context_length = 128072, supports_structured_output = true },
 ]
 notes = "Cheapest LLM candidate overall on deepinfra; many redundant live providers if deepinfra is degraded."
+
+# ---------------------------------------------------------------------------
+# Backup / fallback models (USER REQUEST, 2026-09-12). Separate from the
+# primary bake-off candidates above and does NOT change the primary
+# selection. These are frontier-class, more-expensive models to fall back to
+# ONLY when the primary model's output fails validation/reconciliation
+# (PLAN.md §2.10 invariants / §2.3 reconciliation), or the primary is marked
+# `unavailable` by the circuit breaker (repeated call failures) — never used
+# as a first choice, and never silently swapped in without that trigger.
+# Bake-off evidence for these (N=3 on the same gold subset) lives in
+# docs/bakeoff.md's "Backup models" section. The user decides whether/which
+# to wire in; ml-engineer does not pick.
+#
+# All three are live on the HF Inference Providers router — same HF_TOKEN,
+# no separate API key env var needed. A true out-of-catalog frontier model
+# (e.g. a proprietary API like GPT-5/Claude/Gemini, not on HF's router at
+# all) would need its own API key env var (OPENAI_API_KEY / ANTHROPIC_API_KEY
+# / GOOGLE_API_KEY) AND a second client implementation beyond hf.rs's
+# HF-router-only design (PLAN.md §2.11's single `HF_TOKEN` assumption) — a
+# real architecture change, not a models.toml addition, so not implemented.
+# ---------------------------------------------------------------------------
+
+[fallback]
+trigger = "primary output fails validation/reconciliation (engine/verifier), or primary is marked unavailable by the bake-off/production circuit breaker (repeated call failures) — never a routine first choice"
+non_hf_provider_note = "None of the three candidates below need a separate API key: all are live on the HF router under the existing HF_TOKEN. A non-HF frontier model (proprietary API) would need its own key env var and a second client, out of scope for this change."
+
+[[fallback.candidates]]
+id = "moonshotai/Kimi-K3"
+provider = "deepinfra"
+model_revision = "f831ab66814297da540d832a5235f8e904f29d06"
+role = "llm_and_vlm"
+context_length = 1048576
+pricing_usd_per_m_tokens = { input = 2.85, output = 14.25 }
+supports_structured_output = true
+notes = "Frontier-class multimodal (text+image) MoE flagship — the single most expensive candidate on the router we checked, but covers BOTH the LLM and VLM fallback role with one model. deepinfra cheapest of 4 live structured-output providers (together/fireworks-ai/baseten also live at $3/$15)."
+
+[[fallback.candidates]]
+id = "deepseek-ai/DeepSeek-V4-Pro-0813"
+provider = "deepinfra"
+model_revision = "72e1d3230f6c080a530b0a1d46f8eb4602340597"
+role = "llm"
+context_length = 1048576
+pricing_usd_per_m_tokens = { input = 1.30, output = 2.60 }
+supports_structured_output = true
+notes = "Text-only frontier tier from the same DeepSeek family as the primary LLM candidate (DeepSeek-V3.2) — known lineage, ~5x the primary's per-token cost. novita/baseten/together also live, no structured-output support on those; deepinfra is the only structured-output provider found."
+
+[[fallback.candidates]]
+id = "zai-org/GLM-5.3"
+provider = "deepinfra"
+model_revision = "aca966e4e02791568aa6a4ced368624b3d897f42"
+role = "llm"
+context_length = 1048576
+pricing_usd_per_m_tokens = { input = 1.20, output = 4.00 }
+supports_structured_output = true
+notes = "Text-only frontier alternative, different lineage from DeepSeek (diversifies the fallback away from a single vendor's outage risk). novita/together/baseten also live, structured-output present on novita/baseten/deepinfra."
