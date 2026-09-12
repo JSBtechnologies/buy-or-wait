@@ -86,6 +86,13 @@ pub struct MessageRecord {
     pub is_duplicate_transfer: Option<bool>,
     #[serde(default)]
     pub category_hint: Option<String>,
+    /// Stream selector for `income_ended` only (RULES S6.2 A4, lead-approved additive field
+    /// on `Fact::IncomeEnded`): identifies WHICH income stream ends when a user has more
+    /// than one in the same category, e.g. "Second household income". `None` ends every
+    /// stream of the category — never set this to the message's stated remaining amount or
+    /// any other field; it is a description substring, not a number.
+    #[serde(default)]
+    pub description_hint: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -131,6 +138,7 @@ fn blank_record(record_type: RecordType) -> MessageRecord {
         scope: None,
         is_duplicate_transfer: None,
         category_hint: None,
+        description_hint: None,
         note: None,
     }
 }
@@ -296,17 +304,44 @@ pub fn parse_known_skeleton(text: &str, sent_at: NaiveDate) -> Option<Vec<Messag
         return Some(vec![r]);
     }
 
-    // A4 (S6.2, household-partial income end): RecordType::IncomeEnded carries only
-    // `category`, not which of two same-category streams ended — emitting it risks ending
-    // the WRONG (or both) stream(s). Waits on a lead/engine decision for a field that can
-    // say which stream; never guess by emitting it anyway. Recognized-but-inert for now so
-    // it counts toward coverage without producing a wrong fact.
-    static RE_HOUSEHOLD_PARTIAL_EN: &str = r"One household employment record has ended\. The remaining confirmed monthly salary is ([A-Z]{2,4}) ([\d,]+(?:\.\d+)?)";
-    static RE_HOUSEHOLD_PARTIAL_ID: &str = r"Salah satu sumber pendapatan kerja rumah tangga telah berakhir\. Sisa gaji bulanan yang dikonfirmasi adalah ([A-Z]{2,4}) ([\d,]+(?:\.\d+)?)";
+    // A4 (S6.2, household-partial income end): engine a3ee0f8 added
+    // `Fact::IncomeEnded.description` so this can target ONE of two same-category streams.
+    // Analyst audit: same shape as user_13 ("Second household income" stream stopped for a
+    // missed occurrence) — the selector is that literal description across all 7 users
+    // (30 37 119 180 187 · 42 203). The message's stated "remaining confirmed monthly
+    // salary" is deliberately NOT applied here (RULES: it doesn't equal the primary
+    // stream's settled amount; keep settled history, conflict rule 3).
+    static RE_HOUSEHOLD_PARTIAL_EN: &str = r"One household employment record has ended\. The remaining confirmed monthly salary is [A-Z]{2,4} [\d,]+(?:\.\d+)?";
+    static RE_HOUSEHOLD_PARTIAL_ID: &str = r"Salah satu sumber pendapatan kerja rumah tangga telah berakhir\. Sisa gaji bulanan yang dikonfirmasi adalah [A-Z]{2,4} [\d,]+(?:\.\d+)?";
     if regex::Regex::new(RE_HOUSEHOLD_PARTIAL_EN).unwrap().is_match(text)
         || regex::Regex::new(RE_HOUSEHOLD_PARTIAL_ID).unwrap().is_match(text)
     {
-        return Some(Vec::new()); // A4: waits on a Fact/field that can target one stream
+        let mut r = blank_record(RecordType::IncomeEnded);
+        r.status_hint = Some(StatusHint::Ended);
+        r.category_hint = Some("salary".to_string());
+        r.description_hint = Some("Second household income".to_string());
+        r.note = Some("household_partial_end_never_apply_stated_remaining_amount".to_string());
+        return Some(vec![r]);
+    }
+
+    // A6 (S6.2, board decision.A6_invoice, user-approved via bus #105): an approved invoice
+    // payment with an expected settlement date IS counted — a confirmed one-time credit on
+    // its settlement date (Fact::OneTimeFlow via RecordType::OneTimeAdjustment, already
+    // wired). "The other submitted invoices are still awaiting approval" is filler and
+    // never becomes a fact.
+    static RE_INVOICE_EN: &str = r"client approved an invoice payment of ([A-Z]{2,4}) ([\d,]+(?:\.\d+)?)\. Settlement is expected on (\d{4}-\d{2}-\d{2})";
+    static RE_INVOICE_ID: &str = r"[Kk]lien menyetujui pembayaran faktur sebesar ([A-Z]{2,4}) ([\d,]+(?:\.\d+)?)\. Penyelesaian diperkirakan pada (\d{4}-\d{2}-\d{2})";
+    for re in [RE_INVOICE_EN, RE_INVOICE_ID] {
+        if let Some(c) = regex::Regex::new(re).unwrap().captures(text) {
+            let mut r = blank_record(RecordType::OneTimeAdjustment);
+            r.currency = Some(c[1].to_string());
+            r.amount = Some(amt(&c[2]));
+            r.date = Some(c[3].to_string());
+            r.status_hint = Some(StatusHint::Confirmed);
+            r.category_hint = Some("invoice_income".to_string());
+            r.note = Some("approved_invoice_credit_on_settlement_date".to_string());
+            return Some(vec![r]);
+        }
     }
 
     // A5 (S6.2): rent renewal +P% -> ExpenseAmountChange{percent}. Two English phrasings
@@ -685,6 +720,11 @@ pub fn to_evidence(
                 .as_deref()
                 .and_then(parse_date)
                 .unwrap_or_else(|| observed_at.date()),
+            // engine a3ee0f8 (RULES S6.2 A4, lead-approved additive field): None ends every
+            // stream of the category (A2/A3 full/seasonal employment end); Some(desc) ends
+            // only the matching secondary stream (A4 household-partial end) — never the
+            // message's stated remaining amount.
+            description: record.description_hint.clone(),
         },
         RecordType::OneTimeAdjustment => {
             let amount = record.amount?;
@@ -862,6 +902,57 @@ mod tests {
         )));
     }
 
+    /// A4 (analyst RULES.md S6.2, engine a3ee0f8): household-partial income-end messages
+    /// (e.g. message_42/user_58) target only the secondary stream via
+    /// `Fact::IncomeEnded.description`, and never apply the message's stated "remaining
+    /// confirmed monthly salary" figure.
+    #[test]
+    fn household_partial_end_targets_secondary_stream_only() {
+        let message = msg(
+            "message_42",
+            "user_58",
+            "2024-11-29T09:30:00Z",
+            "employer",
+            "Rincian penggajian Anda di Cedar Health telah berubah. Salah satu sumber pendapatan kerja rumah tangga telah berakhir. Sisa gaji bulanan yang dikonfirmasi adalah IDR 25840000. Pendapatan yang sudah berakhir harus dikeluarkan dari perkiraan berikutnya. Ref payroll EMP-0042.",
+        );
+        let records = parse_known_skeleton(&message.message_text, message.sent_at.date_naive())
+            .expect("message_42 skeleton");
+        assert_eq!(records.len(), 1);
+        let evidence = to_evidence(&message, 0, &records[0], "IDR").expect("expected a fact");
+        match evidence.fact {
+            Fact::IncomeEnded { category, description, .. } => {
+                assert_eq!(category, "salary");
+                assert_eq!(description.as_deref(), Some("Second household income"));
+            }
+            other => panic!("expected IncomeEnded, got {other:?}"),
+        }
+    }
+
+    /// A6 (board decision.A6_invoice): an approved invoice payment IS counted as a
+    /// `Fact::OneTimeFlow` credit on its settlement date.
+    #[test]
+    fn approved_invoice_payment_counts_as_one_time_credit() {
+        let message = msg(
+            "message_24",
+            "user_34",
+            "2024-11-23T09:30:00Z",
+            "service_provider",
+            "Hi, InvoiceLane here. The client approved an invoice payment of INR 196000. Settlement is expected on 2024-12-15; the other submitted invoices are still awaiting approval. Only invoices marked as confirmed should be included in the upcoming payout. Case ref SER-0024.",
+        );
+        let records = parse_known_skeleton(&message.message_text, message.sent_at.date_naive())
+            .expect("message_24 skeleton");
+        assert_eq!(records.len(), 1);
+        let evidence = to_evidence(&message, 0, &records[0], "INR").expect("expected a fact");
+        match evidence.fact {
+            Fact::OneTimeFlow { direction, amount, date, .. } => {
+                assert_eq!(direction, Direction::Credit);
+                assert_eq!(amount, Money::from_f64(196000.0));
+                assert_eq!(date, NaiveDate::from_ymd_opt(2024, 12, 15).unwrap());
+            }
+            other => panic!("expected OneTimeFlow, got {other:?}"),
+        }
+    }
+
     /// Rent +12% renewal messages (12/51/175, lead: engine#32/dd2402e) map to
     /// `Fact::ExpenseAmountChange` with `percent` set and `amount` left `None` — the model
     /// only ever states a percentage for this template, never an absolute new rent figure.
@@ -888,6 +979,7 @@ mod tests {
             scope: None,
             is_duplicate_transfer: None,
             category_hint: Some("rent".to_string()),
+            description_hint: None,
             note: Some("rent_up_12pct_next_payment_apply_to_existing_stream_amount".to_string()),
         };
         let evidence = to_evidence(&message, 0, &record, "INR").expect("expected a fact");
@@ -930,6 +1022,7 @@ mod tests {
             scope: None,
             is_duplicate_transfer: None,
             category_hint: Some("rent".to_string()),
+            description_hint: None,
             note: None,
         };
         assert!(to_evidence(&message, 0, &base, "INR").is_none()); // no amount/percent
@@ -988,6 +1081,7 @@ mod tests {
                 scope: None,
                 is_duplicate_transfer: Some(true),
                 category_hint: None,
+                description_hint: None,
                 note: Some("own_account_transfer_exclude_one_leg_from_cash_flow".into()),
             };
             assert!(
@@ -1022,6 +1116,7 @@ mod tests {
             scope: None,
             is_duplicate_transfer: None,
             category_hint: None,
+            description_hint: None,
             note: None,
         };
         assert!(to_evidence(&message, 0, &record, "EUR").is_none());
@@ -1044,6 +1139,7 @@ mod tests {
             scope: None,
             is_duplicate_transfer: None,
             category_hint: None,
+            description_hint: None,
             note: None,
         };
         assert!(to_evidence(&message, 0, &record, "EUR").is_some());

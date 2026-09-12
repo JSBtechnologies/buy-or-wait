@@ -10,7 +10,8 @@
     "fact": {
       "IncomeEnded": {
         "category": "salary",
-        "effective": "2024-03-06"
+        "effective": "2024-03-06",
+        "description": null
       }
     }
   }

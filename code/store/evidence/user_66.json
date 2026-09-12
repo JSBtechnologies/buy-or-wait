@@ -1,1 +1,20 @@
-[]
+[
+  {
+    "record_id": "message_49#0",
+    "source": {
+      "Message": {
+        "source_type": "service_provider"
+      }
+    },
+    "observed_at": "2026-03-29T09:30:00",
+    "fact": {
+      "OneTimeFlow": {
+        "direction": "Credit",
+        "category": "invoice_income",
+        "amount": 1160000000,
+        "currency": "INR",
+        "date": "2026-04-15"
+      }
+    }
+  }
+]
