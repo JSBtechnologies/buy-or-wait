@@ -50,6 +50,7 @@ mod tests {
             if only.is_some() {
                 for st in &d.streams.streams { println!("  stream {} {:?} amt {} last {}", st.id, st.cadence, st.projected_amount, st.last_date()); }
                 for f in &d.baseline.flows { println!("  flow {} {} {} {:?}", f.date, f.amount, f.category, f.source); }
+                for c in &d.facts.candidates { println!("  cand {} {:?}", c.label, c.outcome); }
                 println!("  expl: {}", r.decision_explanation);
             }
         }
