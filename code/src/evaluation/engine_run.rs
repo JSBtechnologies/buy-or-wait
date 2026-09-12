@@ -252,7 +252,17 @@ mod tests {
             };
             let (b, bl, wc, wl) = (d.baseline_series(), d.baseline_low_series(), d.with_changes_series(), d.with_changes_low_series());
             let fc = ForecastSeries { start: r.date, minimum: d.minimum_f64(), baseline: &b, baseline_low: Some(&bl), with_changes: wc.as_deref(), with_changes_low: wl.as_deref() };
-            if std::env::var("VERIFIER_ONLY").map(|o| o == r.id).unwrap_or(false) {
+            if std::env::var("VERIFIER_ONLY").map(|o| o.split(',').any(|x| x == r.id)).unwrap_or(false) {
+                for f in &d.baseline.flows {
+                    if let FlowSource::Evidence { record_id } = &f.source {
+                        println!("EVFLOW {} {} {} {} {}", r.id, record_id, f.date, f.category, f.amount.to_f64());
+                    }
+                }
+                for f in d.baseline.flows.iter().filter(|f| f.amount.0 > 0) {
+                    if !matches!(f.source, FlowSource::Evidence { .. }) {
+                        println!("CREDIT {} {:?} {} {} {}", r.id, f.source, f.date, f.category, f.amount.to_f64());
+                    }
+                }
                 let head = crate::evaluation::replay::headroom_from(&b, &bl, d.minimum_f64());
                 let trough = bl.iter().cloned().fold(f64::INFINITY, f64::min);
                 println!("DETAIL {} min_low_headroom={:.2} headroom_today={:.2} requested={}", r.id, trough - d.minimum_f64(), head[0], r.amount);
