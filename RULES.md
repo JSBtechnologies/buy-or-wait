@@ -163,6 +163,41 @@ plan_is_safe(pays): same simulation with each payment as a debit on its date; re
 
 ---
 
+## S4. request_text [EXACT, all 275 requests checked — inputs only]
+
+- Every currency amount in `request_text` equals `requested_amount` (request_43 uses Indonesian `43.339.000` separators — same value). Every date in the text equals `desired_completion_date`; 137 texts have no date. No text contains instruction-like content.
+- Phrases like "split the payment", "use installments", "pay now or wait" are template filler and do **not** correlate with `allows_partial_payment` or the user's methods (request_140: "split the payment" with allows_partial=false, methods=installments).
+- **Conclusion: request_text carries no information the columns lack. Batch mode sends it to no model (0 tokens).**
+
+## S5. Facts the engine needs from extraction
+
+Only facts that change a forecast item. Everything else in a message is ignored. Each fact below is exercised by a tuning label (§S3.4 table shows the resulting schedule).
+
+| fact type | fields | tuning example → engine effect |
+|---|---|---|
+| SalaryAmountChange | new_amount, effective_date | message_01 (user_02) 42,750,000 from 2025-08-15 → projected salary from that date; message_04 (user_06) temporary 1,037.52 "continues for the next payroll"; message_06 (user_08) next salary 1,422.85 |
+| SalaryDateChange | new_date (then monthly on that day) | message_05 (user_07) 2024-09-23 → salary on 23rd, E 2024-10-23 |
+| IncomeEnded | stream/employer, (date) | message_09 (user_12) seasonal contract ended → no income |
+| SalaryResumes / FirstSalary | amount, date | message_10 (user_14) 2,717 from 2025-08-15; message_11 (user_15) 1,661 on 2026-01-15 |
+| UnconfirmedIncome (bonus, commission, payout pending) | kind | message_03 (user_04) quarterly bonus pending; message_08 (user_11) commissions not approved (base 23,256,000 stays the projected salary — see note); message_07 (user_10) gig payout pending → **never count** |
+| RecurringExpenseChange | category/stream, percent or amount, effective (next occurrence) | message_12 (user_16) rent +12% from next payment: 57,100 → 63,952 on 2023-09-01 |
+| NewRecurringExpense | category, amount (required), first_date | message_10 (user_14) childcare "begins in the same month" **with no amount → cannot be counted** (do not invent) |
+| OwnAccountTransfer | the matching debit/credit pair | message_13 (user_18): pair is excluded from spend history; no forecast effect in tuning |
+| PayslipComposition | regular vs one-time | message_02 (user_03): payslip shows regular pay and one-time adjustment separately → the one-time part is not a salary stream |
+
+Note on message_08 (user_11): "confirmed base salary IDR 38,760,000" conflicts with five settled 23,256,000 base-salary rows. Using 23,256,000 gives safe within 0.9% of the label; 38,760,000 only changes E-side numbers after 2025-05-15. Keep settled history as the amount unless the message states an effective date (conflict rule 3 "settled over estimate"). [FIT]
+
+Images (blank-amount events). Selector by linked event:
+| image | event | figure to use | effect |
+|---|---|---|---|
+| image_01 | user_03 event_253 "August 2019 net salary" (settled, history) | Net Pay 4,365,000 (equals the regular salary; not Total Earnings 4,780,800) | confirms salary stream amount; B0 already includes it |
+| image_02 | user_16 event_1442 "Outstanding rent balance" (scheduled 2023-08-16) | **Balance Due 100,000** (not Total 2,00,000, not Amount Received 1,00,000) | −100,000 on 2023-08-16; request_16 stays affordable_now |
+| image_03 | user_17 event_1545 "Bulk groceries and pantry purchase" (settled, history) | Cash Paid 41,272 | history only; **exclude this one-off bulk row from the groceries estimator** (including it moves request_17 safe from −0.3% to −1.3%) |
+
+Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
+
+---
+
 ## S1. Plan candidates, eligibility, selection, status/method mapping
 
 ### S1.1 Candidate generation [EXACT on 01–18]
