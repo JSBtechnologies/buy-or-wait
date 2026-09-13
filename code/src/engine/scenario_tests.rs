@@ -661,6 +661,26 @@ fn unverified_foreign_row_converted_with_dated_rate_or_rejected() {
     assert!(event_flows(&f).is_empty());
 }
 
+/// request_16: a rent +12% change scales the rent cycle (stream and the scheduled cycle row)
+/// but never a one-off scheduled "Outstanding rent balance" beside it.
+#[test]
+fn rent_percent_change_skips_one_off_scheduled_balance() {
+    use Direction::*;
+    let mut events = history(EventType::Expense, "Monthly rent", "rent", Debit, 57100.0, 1, 1);
+    events.push(ev(9, EventType::Expense, "Outstanding rent balance", "rent", Debit, 100_000.0, "2025-08-11", Status::Scheduled));
+    events[4].settlement_date = Some(d("2025-08-16"));
+    events.push(ev(10, EventType::Expense, "Monthly rent", "rent", Debit, 57100.0, "2025-09-01", Status::Scheduled));
+    let change = EvidenceRecord {
+        record_id: "message_12#0".into(),
+        source: EvidenceSource::Message { source_type: "service_provider".into() },
+        observed_at: d("2025-08-01").and_hms_opt(9, 30, 0).unwrap(),
+        fact: Fact::ExpenseAmountChange { category: "rent".into(), amount: None, percent: Some(12.0), currency: None, effective: None },
+    };
+    let (_, f) = build_with(&events, &[change], "2025-08-12", &RateTable::default());
+    let rent: Vec<(NaiveDate, Money)> = f.flows.iter().filter(|x| x.category == "rent" && x.date <= d("2025-09-30")).map(|x| (x.date, x.amount)).collect();
+    assert_eq!(rent, vec![(d("2025-08-16"), -Money::from_units(100_000)), (d("2025-09-01"), -Money::from_units(63_952))]);
+}
+
 #[test]
 fn image_07_dual_totals_recorded() {
     let rates = RateTable::default();
