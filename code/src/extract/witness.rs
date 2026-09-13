@@ -133,6 +133,13 @@ pub enum WitnessKind {
     AmountInWords,
     RepeatedFinalLabel,
     CutoffAfterExceedsWitnessedBefore,
+    /// User ruling `ruling.total_or_witnessed_sum` point 2 (image_06): no total field was
+    /// readable at all, but the sum of printed line items/charges is independently
+    /// corroborated by an amount-in-words value (within rounding).
+    LineItemSumWitnessedByWords,
+    /// Same fallback, corroborated instead by another printed final-label-family field
+    /// equal to the sum (never the sum's own field -- that would be self-witnessed).
+    LineItemSumWitnessedByLabel,
 }
 
 impl WitnessKind {
@@ -147,6 +154,8 @@ impl WitnessKind {
             WitnessKind::AmountInWords => "amount_in_words",
             WitnessKind::RepeatedFinalLabel => "repeated_final_label",
             WitnessKind::CutoffAfterExceedsWitnessedBefore => "cutoff_after_exceeds_witnessed_before",
+            WitnessKind::LineItemSumWitnessedByWords => "line_item_sum_witnessed_by_words",
+            WitnessKind::LineItemSumWitnessedByLabel => "line_item_sum_witnessed_by_label",
         }
     }
 }
@@ -190,6 +199,33 @@ fn final_label_fields(figures: &ImageFigures, scope: FinalLabelScope) -> Vec<(&'
             ("net_pay", figures.net_pay),
         ],
     }
+}
+
+/// `final_label_fields` PLUS `subtotal`/`amount_paid`, for POSITIVE repeated-label matching
+/// only -- `final_label_contradicts` never calls this, so a disagreeing subtotal or amount
+/// paid still never blocks `target` (module doc on `IGNORED_LABELS`/`AMOUNT_PAID_KEYWORDS` in
+/// `extract::labels`, and image_11: `amount_paid = 0` legitimately differs from `target =
+/// 3,650`). A printed subtotal or amount actually paid that happens to EQUAL `target` is
+/// genuine independent corroboration (user ruling `ruling.total_or_witnessed_sum` point 4:
+/// "Item Total" == "Total paid" for image_13 with no delivery fee, "Net Amount" == "Cash Paid"
+/// for image_03).
+///
+/// `subtotal` is excluded when `target` IS the bare subtotal (`target_is_bare_subtotal`) --
+/// otherwise a cropped page's `total` duplicated straight from `subtotal` (image_04) would
+/// count as "2 matches" against itself (subtotal + the duplicate), exactly the degenerate case
+/// that guard exists to block.
+fn repeat_witness_family_fields(
+    figures: &ImageFigures,
+    target: f64,
+    tolerance: f64,
+    scope: FinalLabelScope,
+) -> Vec<(&'static str, Option<f64>)> {
+    let mut fields = final_label_fields(figures, scope);
+    if !target_is_bare_subtotal(figures, target, tolerance, scope) {
+        fields.push(("subtotal", figures.subtotal));
+    }
+    fields.push(("amount_paid", figures.amount_paid));
+    fields
 }
 
 /// True when `target` is exactly the page's own `subtotal` (bus topic `bakeoff` #6, lead
@@ -282,10 +318,11 @@ pub fn find_witness(
     }
     // The same final amount repeated under a second final label (e.g. image_11: Total Bill
     // Amount = Amount Payable = Balance, all 3,650; image_07: Total 8,528.10 rounds to Grand
-    // Total 8,528) -- needs at least two DISTINCT final-label fields to actually equal the
-    // target, not just one. `computed` surfaces a genuinely different corroborating value when
-    // one exists, else the corroborating value is identical to `target`.
-    let matches: Vec<f64> = final_label_fields(figures, scope)
+    // Total 8,528; image_03: Net Amount = Cash Paid; image_13: Total paid = Item Total, no
+    // delivery fee) -- needs at least two DISTINCT final-label-FAMILY fields to actually equal
+    // the target, not just one. `computed` surfaces a genuinely different corroborating value
+    // when one exists, else the corroborating value is identical to `target`.
+    let matches: Vec<f64> = repeat_witness_family_fields(figures, target, tolerance, scope)
         .into_iter()
         .filter_map(|(_, v)| v)
         .filter(|v| approx_eq(*v, target, tolerance))
@@ -324,6 +361,33 @@ pub fn final_label_contradicts(
     final_label_fields(figures, scope)
         .into_iter()
         .find_map(|(name, v)| v.filter(|v| !approx_eq(*v, target, tolerance)).map(|v| (name, v)))
+}
+
+/// User ruling `ruling.total_or_witnessed_sum` point 2: when `extract::images::select` finds
+/// NO final-label field readable at all (image_06 -- no total/grand total/amount paid/balance
+/// due/amount due anywhere on the page), fall back to the sum of whatever line items/charges
+/// were printed, accepted ONLY when an INDEPENDENT witness corroborates that sum -- never
+/// self-witnessed (the sum can't prove itself). The accepted value is the WITNESS's own
+/// figure, not necessarily the raw sum (image_06: words say 1,995, the items sum to 1,994.99 --
+/// accept 1,995, the printed witness). Tries `amount_in_words` first, then any
+/// `repeat_witness_family_fields` value that happens to equal the sum.
+pub fn witnessed_line_item_sum(figures: &ImageFigures, scope: FinalLabelScope, tolerance: f64) -> Option<(f64, WitnessKind)> {
+    if figures.line_items.is_empty() && figures.charges_breakdown.is_empty() {
+        return None;
+    }
+    let sum: f64 = figures.line_items.iter().sum::<f64>() + figures.charges_breakdown.iter().sum::<f64>();
+
+    if let Some(words) = figures.amount_in_words.as_deref() {
+        if let Some(words_value) = words_to_number(words) {
+            if approx_eq(words_value, sum, tolerance) {
+                return Some((words_value, WitnessKind::LineItemSumWitnessedByWords));
+            }
+        }
+    }
+    repeat_witness_family_fields(figures, sum, tolerance, scope)
+        .into_iter()
+        .find_map(|(_, v)| v.filter(|v| approx_eq(*v, sum, tolerance)))
+        .map(|v| (v, WitnessKind::LineItemSumWitnessedByLabel))
 }
 
 #[cfg(test)]

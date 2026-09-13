@@ -1339,11 +1339,6 @@ pub fn resolve_blank_amount_ocr(
         ocr_notes: notes,
     };
 
-    let Some(amount) = select(&figures, event) else {
-        prov.ocr_notes.push("no_final_label".to_string());
-        return outcome("fail_closed", vec![prov], None);
-    };
-
     let scope = match event.status {
         Status::Pending | Status::Scheduled if figures.due_cutoff_date.is_some() => {
             witness::FinalLabelScope::CutoffResolved
@@ -1351,7 +1346,25 @@ pub fn resolve_blank_amount_ocr(
         Status::Pending | Status::Scheduled => witness::FinalLabelScope::RemainingOwed,
         _ => witness::FinalLabelScope::Whole,
     };
-    let witness_hit = witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
+
+    let (amount, fallback_witness) = match select(&figures, event) {
+        Some(amount) => (amount, None),
+        None => {
+            // User ruling `ruling.total_or_witnessed_sum` point 2: no total field is readable
+            // at all -- fall back to a witnessed line-item/charges sum before failing closed.
+            match witness::witnessed_line_item_sum(&figures, scope, ROUNDING_TOLERANCE_2TERM) {
+                Some((amount, kind)) => (amount, Some(kind)),
+                None => {
+                    prov.ocr_notes.push("no_final_label".to_string());
+                    return outcome("fail_closed", vec![prov], None);
+                }
+            }
+        }
+    };
+
+    let witness_hit = fallback_witness
+        .map(|kind| (kind, amount))
+        .or_else(|| witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope));
     let contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
 
     prov.witness = witness_hit.map(|(kind, _)| kind.label().to_string());

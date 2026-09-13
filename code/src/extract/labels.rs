@@ -11,12 +11,17 @@ use crate::extract::normalize;
 use crate::extract::ocr_parse::LabeledValue;
 use crate::extract::witness;
 
-/// Labels that never contribute a figure at all (fleet/specs/ocr_vllm_pipeline.md A3):
-/// cash tendered/change are not the expense amount (analyst audit #184, image_12), "payments"
-/// on an account-summary table is a running-ledger line rather than this bill's own paid
-/// amount, and a bare "due date" (no till/by/before/after qualifier) is not a resolvable
-/// cutoff (module doc below).
-const IGNORED_LABELS: &[&str] = &["cash paid", "cash", "tendered", "change", "payments", "due date"];
+/// Labels that never contribute a figure at all (fleet/specs/ocr_vllm_pipeline.md A3): a bare
+/// "cash"/"tendered" is cash TENDERED, which can legitimately exceed the amount owed (analyst
+/// audit #184, image_12: $40.00 tendered against a $33.50 total) -- never the expense amount
+/// or a usable witness. "payments" on an account-summary table is a running-ledger line rather
+/// than this bill's own paid amount, and a bare "due date" (no till/by/before/after qualifier)
+/// is not a resolvable cutoff (module doc below). "Cash Paid" is deliberately NOT here (user
+/// ruling `ruling.total_or_witnessed_sum` point 4, image_03): unlike bare "cash"/"tendered",
+/// it states an exact amount paid and can serve as `amount_paid` -- excluded from
+/// `final_label_contradicts` already (module doc, `extract::witness`) so it still never
+/// contradicts a genuinely different total, only ever corroborates a matching one.
+const IGNORED_LABELS: &[&str] = &["cash", "tendered", "change", "payments", "due date"];
 
 const GRAND_TOTAL_KEYWORDS: &[&str] = &["grand total"];
 const TOTAL_KEYWORDS: &[&str] = &[
@@ -28,7 +33,8 @@ const TOTAL_KEYWORDS: &[&str] = &[
     "total paid",
     "total amount received",
 ];
-const AMOUNT_PAID_KEYWORDS: &[&str] = &["amount received", "total paid", "total amount received", "amount paid"];
+const AMOUNT_PAID_KEYWORDS: &[&str] =
+    &["amount received", "total paid", "total amount received", "amount paid", "cash paid"];
 const BALANCE_DUE_KEYWORDS: &[&str] = &["balance due", "balance"];
 const AMOUNT_DUE_KEYWORDS: &[&str] = &["amount payable", "amount due"];
 const SUBTOTAL_KEYWORDS: &[&str] = &["sub total", "subtotal", "item bill", "item total", "taxable value"];
@@ -126,7 +132,11 @@ pub fn figures_from_rows(rows: &[LabeledValue], anchor_date: NaiveDate) -> (Imag
 
     for row in rows {
         let label_words = words(&row.label);
-        if label_words.is_empty() || IGNORED_LABELS.iter().any(|k| matches_any(&label_words, &[k])) {
+        // EXACT match, never `contains_phrase`: a bare "Cash" is genuinely ambiguous cash
+        // tendered (ignore), but "Cash Paid" (2 words) states an exact amount paid and must
+        // reach AMOUNT_PAID_KEYWORDS below -- a contains-style check would wrongly ignore it
+        // too, since its own words happen to include "cash".
+        if label_words.is_empty() || IGNORED_LABELS.iter().any(|k| label_words == words(k)) {
             continue;
         }
 
@@ -227,6 +237,15 @@ pub fn figures_from_rows(rows: &[LabeledValue], anchor_date: NaiveDate) -> (Imag
             mapped = true;
         }
         if !mapped {
+            // User ruling `ruling.total_or_witnessed_sum` point 2: when no total field is
+            // readable at all, `extract::images` falls back to summing whatever line items
+            // were printed, accepted only when an independent witness (amount-in-words, or
+            // another printed label) corroborates the sum -- never self-witnessed. An
+            // unmapped numeric row (an item price, a per-line charge) is exactly that
+            // candidate pool; a reference number/ID that happens to parse as an amount is
+            // still harmless here, since it only ever contributes to a sum that must then be
+            // independently corroborated to matter at all.
+            figures.line_items.push(amount);
             notes.push(format!("unmapped:{}={}", row.label, amount));
         }
     }
