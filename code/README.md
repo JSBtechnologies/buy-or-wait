@@ -1,9 +1,11 @@
 # Buy or Wait? — solution
 
-A deterministic Rust engine decides every request; language models (via the Hugging
-Face Inference Providers router) only turn messages and images into typed, grounded
-facts before the engine runs. See `../PLAN.md` and `../RULES.md` for the design and the
-reverse-engineered numeric rules.
+A deterministic Rust engine decides every request. Receipt images are OCR'd once at
+ingestion by `baidu/Unlimited-OCR` (self-hosted vLLM) and cached; Rust maps the printed
+labels to figures and accepts a figure only through a witness gate (or fails closed).
+Messages are parsed deterministically and grounded against their text. See
+`docs/ARCHITECTURE.md` (with `docs/architecture.pdf`) for setup, approach and architecture, and
+`../RULES.md` for the reverse-engineered numeric rules.
 
 ## Prerequisites
 
