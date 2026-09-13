@@ -750,3 +750,235 @@ Verdict:
 - 31 requests change under `from_request` only. By construction, the result there depends only on occurrences placed at rd + 2…10, which is the excluded 02 shape. If the held-out E gain lives in those 31, E2 will not keep it; the A/B decides.
 
 Hand-off: engine adds `VAR_LONG_PHASE = mid_step` (patch `{"VAR_LONG_PHASE":"mid_step"}`, first = min(last + step, rd + ceil(step/2)) for step ≥ var_long_min_step). The verifier runs ONE held-out A/B of A+D+E2 vs A+D.
+
+---
+
+## S9. Verbatim image fixtures (dev-only; never runtime data)
+
+Hand transcription of all 16 PNGs in `dataset/media/images/` (analyst read of the pixels, 2026-09-13). These are **test fixtures only** for `normalize.rs`, `witness.rs` and the witness gate. Never load them at runtime, never key logic on an image id (hardcode_scan must still pass).
+
+Conventions:
+- Backticked strings are exactly as printed. `\n` marks a line wrap inside one cell; `|` separates the Rs. and Ps. boxes on the handwritten page.
+- `→` gives the normalized value. Labels are quoted as printed (including typos and crops).
+- Witness names are `extract::witness::WitnessKind::label()` on ml-engineer `12488dd`: `line_item_sum`, `subtotal_plus_charges`, `subtotal_plus_tax`, `gross_minus_deductions`, `paid_plus_balance`, `total_minus_paid`, `amount_in_words`, `repeated_final_label`, `cutoff_after_exceeds_witnessed_before`. Rounding tolerance is `WITNESS_TOLERANCE = 1.0`.
+- **Final printed amount is truth** (S5.2): a breakdown that sums to F is a witness; one that doesn't is a read note, never a rejection.
+- [HW] = handwritten, best read.
+- Arithmetic below was checked with Python `Decimal`.
+
+| image | event (status, cur) | outcome | witnesses that prove F |
+|---|---|---|---|
+| 01 | event_253 salary, settled, IDR | accept **4,365,000** | gross_minus_deductions, amount_in_words, repeated (transfer line) |
+| 02 | event_1442 rent, **scheduled**, INR | accept **100,000** | total_minus_paid |
+| 03 | event_1545 groceries, settled, INR | accept **41,272** | line_item_sum, repeated (Net Amount) |
+| 04 | event_1700 groceries, settled, INR | **fail closed** | none (only a subtotal is visible) |
+| 05 | event_1786 utilities, **pending**, INR | accept **822.05** | cutoff_after_exceeds_witnessed_before |
+| 06 | event_3051 groceries, settled, INR | accept **1,995** | amount_in_words (lines sum 1,994.99: note only) |
+| 07 | event_3231 dining, settled, INR | accept **8,528** | repeated_final_label within tolerance (Total 8,528.10), subtotal_plus_tax within tolerance |
+| 08 | event_4535 housing, settled, INR | accept **15,339** | line_item_sum, amount_in_words |
+| 09 | event_5170 utilities, settled, INR | accept **723** | line_item_sum, amount_in_words |
+| 10 | event_6033 groceries, **pending**, INR | accept **79,679.26** | subtotal_plus_tax, amount_in_words, repeated_final_label |
+| 11 | event_6859 healthcare, **scheduled**, INR | accept **3,650** | repeated_final_label, line_item_sum (provisional bill); breakup 3,150: note only |
+| 12 | event_7307 transport, settled, **USD** | accept **33.50 USD** | subtotal_plus_charges; paid − change = total |
+| 13 | event_7941 shopping, settled, INR | accept **2,298** | line_item_sum, repeated (Item Total) |
+| 14 | event_9421 healthcare, settled, INR [HW] | accept **4,543** | line_item_sum |
+| 15 | event_9806 transport, settled, INR | accept **9,968** | subtotal_plus_tax, line_item_sum |
+| 16 | event_10521 transport, settled, INR | accept **393.22** | subtotal_plus_tax, amount_in_words |
+
+### S9.01 image_01 — payslip, event_253 (credit, settled, IDR, 2019-08-31)
+- Selector: income → net pay.
+- Final: `Net Pay` `: IDR` `4,365,000` → 4365000. It is repeated in `Transferred to :Bank Central Asia - 2582373290 - M NURHUDA SY : IDR 4,365,000`.
+- Witnesses:
+  - gross_minus_deductions: `Total Earnings` `4,780,800` − `Total Deductions` `415,800` = 4365000.
+  - amount_in_words: `Four Million Three Hundred Sixty Five Thousand Rupiahs` → 4365000.
+- Breakdown:
+  - Earnings `4,500,000` `90,000` `166,500` `10,800` `13,500` sum to `Subtotal Earnings` `4,780,800`.
+  - Deductions `90,000` `45,000` `166,500` `90,000` `10,800` `13,500` sum to `Subtotal Deductions` `415,800`.
+  - `Tax Allowance`, `Tax Borne by Company`, `Tax Penalty Borne By Company`, `Tax`, `Tax Penalty` are each `0`.
+- Decoys: 4,780,800; 415,800; `Tax Ref No` `: 899763619907000`; `Employee No.` `: 19050378`; account `2582373290`; percents `2%` `1%` `3.7%` `0.24%` `0.3%`; `Tax Status` `: TK/0`.
+- Dates: `PAY SLIP Aug-2019` (a period, not a cash date); `Printed on: 2 Sep 2019 09:35 PM`.
+
+### S9.02 image_02 — rent receipt, event_1442 (debit, **scheduled**, INR, event 2023-08-11, settles 2023-08-16)
+- Final: `Balance Due:` `1,00,000.00` → 100000 (Indian lakh grouping).
+- Other figures:
+  - `Total Amount to be Receiv` (label cropped at the cell edge) `2,00,000.00` → 200000.
+  - `Amount Received:` `1,00,000.00` → 100000.
+- Witnesses:
+  - total_minus_paid: 200000 − 100000 = 100000.
+  - The lines `Rent & Maintanance` `1,80,000.00` + `Water Charges:` `5,000.00` + `Rental Tax:` `5,000.00` + `Electrical Charges:` `10,000.00` = 200000. That proves the total, not F.
+- Words: the `Amount in Words` box is **empty**. The body text `…to sum of Rupees 2,00,000` is cropped at the right edge; it is numeric, not words.
+- Decoys:
+  - the 10× lakh misread 1000000 (S7.3);
+  - 200000;
+  - `Receipt No.` `9453`; `Phone No.` `9999999000`;
+  - PINs `560102` `560076`; `150/2`;
+  - note text `Rs.5000` and `1 Lakh` (cropped to `Lakl`).
+- Dates: `11/08/23` → 2023-08-11 (day-first; matches the event date); `April 2022 to September 2022` (a period).
+
+### S9.03 image_03 — thermal bill, event_1545 (debit, settled, INR, 2026-02-27)
+- Final: `Cash Paid:` `41272.00` → 41272. Repeated as `Net Amount:` `41272.0`.
+- Witness line_item_sum: `Amt` `5800.00` `750.00` `13920.00` `4800.00` `2500.00` `2152.00` `750.00` `540.00` `1690.00` `7290.00` `1080.00` = 41272.
+- Decoys:
+  - `Bill No:1125000158`; `9342823271`; `Bangalore -560095`; `Items/Qty:11/76`;
+  - MRP/SP unit prices `1160.00` `750.00` `480.00` `2500.00` `269.00` `250.00` `270.00` `338.00` `810.00` `360.00`;
+  - qty `5PC` `29PC`; `GSTIN: 29ALCPJ4001H1ZI`.
+- Dates: `27/02/2026` → 2026-02-27; `16:10 PM`.
+
+### S9.04 image_04 — delivery app screenshot, event_1700 (debit, settled, INR, 2024-09-03)
+- **No final label is visible.** `Item Bill` `₹2854.00` is a subtotal label, not final.
+- line_item_sum `₹95.0` `₹531.0` `₹0` `₹186.0` `₹122.0` `₹464.0` `₹184.0` `₹144.0` `₹75.0` `₹366.0` `₹190.0` `₹121.0` `₹376.0` = 2854. It proves the item bill only.
+- The next row below `Item Bill` (a delivery fee line) is cropped mid-glyph.
+- Decoys: 2854 as the event amount; `13 items`; qty `1 x` `2 x` `3 x`; `20G`, `13G`.
+- **Outcome: fail closed.** History only, excluded from the estimator, never 0. Accepting 2854 is a false accept.
+
+### S9.05 image_05 — telecom account summary, event_1786 (debit, **pending**, INR, event 2026-02-06, settles 2026-02-09)
+- Cutoff pair, both printed:
+  - `Amount due till` / `06-Feb-2026` `=` `704.05`;
+  - `Amount due after` / `06-Feb-2026` `=` `822.05`.
+- `Total (₹)` `704.05` is this month's charges.
+- Witnesses for the by-cutoff 704.05:
+  - `Rentals` `580.65` + `Usage charges` `16.00` + `Taxes` `107.40` = 704.05;
+  - amount_in_words `Total : Seven Hundred Four Rupees and Five Paise Only` → 704.05;
+  - `Previous balance` `3,543.54` − `Payments` `3,543.54` + `This month's charges` `704.05` = 704.05.
+- F = 822.05 via cutoff_after_exceeds_witnessed_before:
+  - 2 reads agree on 822.05 and on cutoff 2026-02-06;
+  - the cash date 2026-02-09 is after the cutoff;
+  - 822.05 > the witnessed 704.05 (late fee 118.00).
+  - Scope `CutoffResolved`: `Total (₹)` 704.05 is not a contradiction.
+- Decoys: 704.05 (the v1 trap); `3,543.54`; `amount(₹)` header.
+- Dates: `06-Feb-2026` → 2026-02-06.
+
+### S9.06 image_06 — GST tax invoice, event_3051 (debit, settled, INR, 2026-01-06)
+- Final: `Total` row `1995.00` → 1995.
+- Witness amount_in_words: `One Thousand And Nine Hundred And Ninety-Five Rupees And Zero Paisa Only` → 1995.
+- Breakdown (**note only, must not reject**):
+  - `Total` column `565.00` `3.13` `552.00` `3.06` `289.00` `1.60` `289.00` `1.60` `289.00` `1.60` sums to **1994.99**;
+  - that is 0.01 short of F, inside `WITNESS_TOLERANCE`, so line_item_sum may also pass.
+- Tax columns: CGST (INR) and SGST (INR) lines `13.45` `0.07` `13.14` `0.07` `6.88` `0.04` `6.88` `0.04` `6.88` `0.04` sum to the printed `47.49` each.
+- Decoys:
+  - UPCs wrapped one triple per line: `890\n614\n389\n049\n7`, `890\n614\n389\n047\n3`, `890\n614\n389\n048\n0`, `890\n614\n389\n052\n7`;
+  - `MRP` `310.00`; `Discount` `27.50` `34.00` `21.00`; `Taxable Value` `538.10` `2.98` `525.71` `2.91` `275.24` `1.53`;
+  - Qty total `7`; percents `2.50`;
+  - `(HSN-\n18069010)`; `FSSAI License Number` `10018064001545`;
+  - `GSTIN` `29AAFCG9846E1Z7`; `CIN` `U74140HR2015FTC055568`.
+
+### S9.07 image_07 — restaurant tax invoice, event_3231 (debit, settled, INR, 2025-10-29)
+- Finals:
+  - `Grand Total (RS) : 8528` → **8528** (ruling);
+  - `Total :` `8528.10`, a second final label. |8528 − 8528.10| ≤ 1 makes it corroboration, not a contradiction.
+- Witnesses:
+  - `SubTotal :` `8122.00` + `SGST 2.50 % :` `203.05` + `CGST 2.50 % :` `203.05` = 8528.10, and round(8528.10) = 8528;
+  - `Amount` lines `2900.00` `450.00` `2490.00` `1800.00` `310.00` `30.00` `96.00` `46.00` = 8122.
+- Record 8528.10 as `computed` in `Fact::AmountWitness`.
+- Decoys:
+  - `TEL:080-40996000,65316000`; `GSTIN-29AACFA1961A1ZY`; `FSSAI No- 11217334001482`;
+  - `BillNo : 10`; `Token No : 1`; `Table : P1`; `Covers : 1`;
+  - header `NAGARJUNA 1984 KMR` (the source of the `KMR` currency misread, S7.3);
+  - rates `580.0` `90.0` `415.0` `60.0` `155.0` `15.0` `12.0` `23.0`; qty `30.0`.
+- Dates: `29-10-2025 12:12 PM` → 2025-10-29.
+
+### S9.08 image_08 — maintenance receipt, event_4535 (debit, settled, INR, 2026-07-24)
+- Final: `Total Amount Received` `₹  15,339.00` → 15339.
+- Witnesses:
+  - line_item_sum `Amount (₹)` `13,880.00` + `1,050.00` + `409.00` = 15339 (`Charged Amount(₹)` repeats the same three);
+  - amount_in_words `In Words: Rupees Fifteen Thousand Three Hundred Thirty Nine Only`.
+- Decoys:
+  - `Convenience Fee` `: Rs 0.00`;
+  - `(1720.0 SQFT) *` and `(8.07 per SQFT for 3 Month(s))`;
+  - `Invoice No.` `6455`; `(Inv No - 6455)`;
+  - `Transaction ID` `: 0ec470dedc1c455ab42f58e9c7729305`.
+- Dates: charge `24-07-2026` → 2026-07-24; due `30-08-2026`; `April to June-\n2026` (a period).
+
+### S9.09 image_09 — water bill receipt, event_5170 (debit, settled, INR, 2026-06-07)
+- Final: `Total Amount Received` `₹  723.00` → 723.
+- Witnesses:
+  - line_item_sum: the single line `723.00` (Charged Amount and Amount columns);
+  - amount_in_words `In Words: Rupees Seven Hundred Twenty Three Only`.
+- Decoys: `Convenience Fee` `: Rs 0.00`; `Invoice No.` `6320`; `Transaction ID` `: 39350810ed9045da91798478b89ca561`.
+- Dates:
+  - charge `07-06-2026` → 2026-06-07 (day-first; both parts ≤ 12, confirmed by the event date);
+  - due `02-07-2026`;
+  - `Jan to March 2026` (a period).
+
+### S9.10 image_10 — grocery tax invoice (two stitched pages), event_6033 (debit, **pending**, INR, event 2024-06-03, settles 2024-06-10)
+- Finals: `Balance Due` `₹79,679.26` → 79679.26. `Total` `₹79,679.26` repeats it.
+- Witnesses:
+  - subtotal_plus_tax: `Sub Total` `72,045.00` + `CGST2.5 (2.5%)` `1,513.13` + `SGST2.5 (2.5%)` `1,513.13` + `CGST20 (20%)` `2,304.00` + `SGST20 (20%)` `2,304.00` = 79679.26.
+  - line_item_sum of the 22 `Amount` lines = 72045, proving the subtotal: `1,425.00` `1,000.00` `6,480.00` `6,480.00` `480.00` `2,250.00` `9,600.00` `1,920.00` `2,880.00` `480.00` `2,400.00` `2,250.00` `400.00` `3,120.00` `4,520.00` `4,320.00` `4,800.00` `4,800.00` `4,800.00` `3,720.00` `2,680.00` `1,240.00`.
+  - amount_in_words `Indian Rupee Seventy-Nine Thousand Six Hundred Seventy-Nine and\nTwenty-Six Paise Only` → 79679.26.
+  - Tax check: the 2.5% CGST `Amt` lines sum to 1,513.13; the 20% lines `1,920.00` + `384.00` = 2,304.00.
+- Decoys:
+  - any single tax line (`1,513.13`, `2,304.00`); 72,045;
+  - wrapped HSN `1904101\n0`, `1905321\n1`, `2106909\n9`, `1806901\n0`;
+  - qty `240.00\nml`, `15.00\ng`, `12.00\npcs`;
+  - rates `95.00` `113.00` `335.00`; percents `2.5%` `20%`.
+
+### S9.11 image_11 — hospital provisional bill, event_6859 (debit, **scheduled**, INR, event 2023-01-19, settles 2023-01-23)
+- Finals, all three → **3650**: `Total Bill Amount: 3650.00`, `Amount Payable: 3650.00`, `Balance: 3650.00`.
+- `Amount Paid: 0.00` and `Paid amount in words : Zero` are the paid amount, **not** F (amount_paid is excluded from final labels).
+- Witnesses:
+  - repeated_final_label (three distinct final labels equal);
+  - line_item_sum on `PROVISIONAL BILL`: `Room & Nursing Charges` `1650.00` + `OT Charges` `1000.00` + `Professional Fees` `1000.00` = 3650;
+  - total_minus_paid: 3650.00 − 0.00 = 3650.00.
+- `DETAILED BREAKUP` (**note only, never rejects, never in the explanation**):
+  - `Room/Bed Charges` `250.00`, `Subtotal:` `250.00`.
+  - `Nursing Charges` `250.00` `100.00` `50.00` `1000.00`, `Subtotal:` `1400.00`.
+  - `OT Charges` `1000.00`, `Subtotal:` `1000.00`.
+  - `Professional Fees` `500.00` with **no Subtotal row** (page likely cut off).
+  - Sum 3150 ≠ 3650.
+- Decoys:
+  - `Primary Code` `100000` `300000` `500000` (six-digit codes in the amount rows);
+  - line codes `100000` `102001` `102003` `102004` `102007` `301001`;
+  - `Ph: 08208064299`; `Contact No: 9403265989`; PINs `411056` `411051`;
+  - `Reg. No. DR86486`; `Admission No :000001`; `Patient UID: 1`; `Age: 22 years`;
+  - rates `200.00` `100.00` `50.00` `1000.00` `500.00`; units `1 1/4`.
+- Dates:
+  - `Date: 19-Jan-2023` → 2023-01-19;
+  - `Admission Date: 18-Jan-2023, 12:19 PM`;
+  - breakup `18-01-23 12:19 PM`, `19-01-23 12:54 PM`, `19-01-23 12:19 PM`, `18-01-23 12:22 PM`;
+  - `Discharge Date: -- / -- / --` (no date).
+
+### S9.12 image_12 — taxi receipt, event_7307 (debit, settled, **USD**, 2025-10-01)
+- Finals: `Total:` `$33,50` → 33.50 (comma decimal). `Subtotal:` `$33,50` equals it (a subtotal, not final).
+- Witnesses:
+  - subtotal_plus_charges: `Ride Distance: 12,3 miles` `$28,50` + `Airport Surcharge` `$5,00` = 33.50, with `Tax:` `$0,00`;
+  - cash tendered: `Cash Paid:` `$40,00` − `Change:` `$6,50` = 33.50.
+- Decoys:
+  - `$40,00` → 40.00 (amount_paid gross of change; **never F**); `$6,50`;
+  - comma-decimal non-money `12,3 mi` / `12,3 miles`;
+  - `#CC-8923`; `#142`; `Taxi License #TC-5567`; `Dispatch: (555) 567-8901`; `24/7 Service`;
+  - barcode `892320251001`.
+- Dates: `01/10/2025 21:45` → 2025-10-01 (day-first; confirmed by the event date).
+- FX: `exchange_rates.csv` 2025-10-01 USD→INR `83.33`. The engine converts per S2.2.
+
+### S9.13 image_13 — order summary, event_7941 (debit, settled, INR, 2026-04-03)
+- Finals: `Total paid` `₹2,298` → 2298 (`Incl. taxes and delivery`). `Item Total (2 items)` `₹2,298` equals it.
+- Witness line_item_sum: `₹699` + `₹1,599` = 2298; `Delivery` `Free`.
+- Decoys: `1 unit`; `(2 items)`.
+
+### S9.14 image_14 [HW] — pharmacy bill, event_9421 (debit, settled, INR, 2025-11-02)
+- Final: `TOTAL` `4543|00` → 4543.00. Rs. and Ps. are separate boxes: never `454300`.
+- Witness line_item_sum, `AMOUNT Rs.|Ps.`: `1500|00` `724|00` `796|00` `550|00` `303|00` `670|00` = 4543.
+  - The last line is overwritten; `670` is the best read and the only value that sums.
+- Decoys: qty `2` `2` `1` `2` `2`; `E & O.E`; the Ps. column read into the number.
+- No printed date.
+
+### S9.15 image_15 — airline GST invoice, event_9806 (debit, settled, INR, 2026-06-07)
+- Final: `Grand Total` row, `Total(Incl\nTaxes)` column `9,968.00` → 9968.
+- Witnesses:
+  - line_item_sum: `Air Travel and\nrelated charges` `9,580.00` + `Airport Charges` `388.00` = 9968;
+  - subtotal_plus_tax: Grand Total `Total` `9,512.0\n0` + CGST `228.00` + SGST/UGST `228.00` + IGST `0.00` + CESS `0.00` = 9968.
+- Supporting identities:
+  - `Taxable Value` `9,124.0\n0` + `NonTaxab\nle/Exempt\ned Value` `388.00` = `9,512.0\n0`;
+  - row 1: `9,124.00` + `228.00` + `228.00` = `9,580.00`.
+- Decoys: `9,580.00`; `9,512.0\n0`; `9,124.0\n0`; `SAC\nCode` `996425`; `Flight No : 6E - 861`; tax % `2.50` `0.00` `0`; `2017-18`; `sub-rule (4) of rule 48`; `110001`.
+- Currency: `Currency : INR`.
+- Dates: `Date  :  07-Jun-2026` → 2026-06-07.
+
+### S9.16 image_16 — EV charging invoice, event_10521 (debit, settled, INR, 2026-09-03)
+- Final: `Total` `393.22`.
+- Witnesses:
+  - subtotal_plus_tax: `AMOUNT` `333.24` + `CGST 9 %` `29.99` + `SGST 9 %` `29.99` = 393.22;
+  - amount_in_words `AMOUNT IN WORDS : Three Hundred and Ninety Three Rupees And Twenty Two Paise Only` → 393.22.
+- `Session Fee` and `Idle Fee` are `-`: absent, not 0.
+- Decoys: `HSN CODE` `996749`; `12.58 kWh`; `26.49 /kWh`; `CHARGE POINT: 1110`; `00:15:26\n(HH:MM:SS)`; `9 %`.
+- Dates: `03/09/2026, 12:35:10 am` → 2026-09-03 (day-first; confirmed by the event date).
