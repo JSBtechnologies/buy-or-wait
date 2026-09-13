@@ -338,6 +338,56 @@ mod tests {
         }
     }
 
+    /// Label-free attribution on the evaluation set: VERIFIER_RULES_STEPS is `;`-separated JSON
+    /// patches (empty = Rules::default()); for each consecutive pair prints every evaluation row
+    /// whose output changes, with the fields and status/method transitions. Evaluation rows only.
+    #[test]
+    #[ignore]
+    fn rule_row_attribution() {
+        let Ok(steps) = std::env::var("VERIFIER_RULES_STEPS") else { return };
+        let steps: Vec<&str> = steps.split(';').collect();
+        let inp = inputs();
+        let eval = eval_requests();
+        let rows: Vec<Vec<Option<crate::evaluation::OutputRow>>> = steps
+            .iter()
+            .map(|p| {
+                let rules = rules_with(p);
+                eval.iter().map(|r| decide_with(&inp, r, rules.clone()).ok().map(|d| (&d.row).into())).collect()
+            })
+            .collect();
+        for w in 1..steps.len() {
+            println!("STEP {:?} -> {:?}", steps[w - 1], steps[w]);
+            for (i, r) in eval.iter().enumerate() {
+                let (Some(x), Some(y)) = (&rows[w - 1][i], &rows[w][i]) else {
+                    println!("ROW {} engine_error {} -> {}", r.id, rows[w - 1][i].is_none(), rows[w][i].is_none());
+                    continue;
+                };
+                if x == y {
+                    continue;
+                }
+                let mut fields = Vec::new();
+                for (f, a, b) in [
+                    ("amount", &x.amount_safe_to_pay, &y.amount_safe_to_pay),
+                    ("status", &x.affordability_status, &y.affordability_status),
+                    ("method", &x.recommended_payment_method, &y.recommended_payment_method),
+                    ("plan", &x.payment_plan, &y.payment_plan),
+                    ("earliest", &x.earliest_date_for_full_payment, &y.earliest_date_for_full_payment),
+                    ("changes", &x.spending_changes_needed, &y.spending_changes_needed),
+                    ("explanation", &x.decision_explanation, &y.decision_explanation),
+                ] {
+                    if a != b {
+                        fields.push(f);
+                    }
+                }
+                println!(
+                    "ROW {} fields={fields:?} status {}->{} method {}->{} amount {}->{} earliest {:?}->{:?}",
+                    r.id, x.affordability_status, y.affordability_status, x.recommended_payment_method, y.recommended_payment_method,
+                    x.amount_safe_to_pay, y.amount_safe_to_pay, x.earliest_date_for_full_payment, y.earliest_date_for_full_payment
+                );
+            }
+        }
+    }
+
     /// Overfit guard: VERIFIER_RULES_A / VERIFIER_RULES_B are JSON patches over Rules::default().
     /// Prints aggregate per-field counts for both splits and the B−A delta. No per-request detail.
     #[test]
