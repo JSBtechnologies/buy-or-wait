@@ -246,7 +246,7 @@ impl Ledger {
         }
         ledger.reindex();
         ledger.resolve_lifecycles();
-        ledger.apply_evidence(evidence);
+        ledger.apply_evidence(evidence, rates);
         ledger.convert_amounts(rates);
         ledger
     }
@@ -339,7 +339,7 @@ impl Ledger {
     /// Apply event-level facts per the conflict order: explicit cancellation/settlement/
     /// amendment beats anything else; among equals the newer record wins (applied last).
     /// Forecast-level facts are kept as adjustments.
-    fn apply_evidence(&mut self, evidence: &[EvidenceRecord]) {
+    fn apply_evidence(&mut self, evidence: &[EvidenceRecord], rates: &dyn RateProvider) {
         let mut ordered: Vec<&EvidenceRecord> = evidence.iter().collect();
         ordered.sort_by(|a, b| {
             (a.fact.is_explicit(), a.observed_at, &a.record_id)
@@ -347,7 +347,12 @@ impl Ledger {
         });
         for rec in ordered {
             let Some(event_id) = rec.fact.event_id() else {
-                self.adjustments.push(rec.clone());
+                // Accuracy first (board decision.accuracy_first): a forecast-level fact that
+                // cannot be applied exactly is rejected and recorded, never half-applied.
+                match validate_adjustment(&rec.fact, &self.home_currency, rates) {
+                    Ok(()) => self.adjustments.push(rec.clone()),
+                    Err(reason) => self.reject(rec, reason),
+                }
                 continue;
             };
             let Some(i) = self.index.get(event_id).copied() else {
@@ -385,6 +390,61 @@ impl Ledger {
             }
         }
         self.issues.extend(issues);
+    }
+}
+
+/// Checks a forecast-level fact can be applied exactly: positive amounts, a sane percentage,
+/// exactly one of amount/percent, a non-empty category, and a currency that converts to home.
+pub fn validate_adjustment(fact: &Fact, home: &str, rates: &dyn RateProvider) -> Result<(), String> {
+    let positive = |a: &Money| if *a > Money::ZERO { Ok(()) } else { Err(format!("non-positive amount {a}")) };
+    let convertible = |c: &str| {
+        let far = NaiveDate::from_ymd_opt(9999, 12, 31).expect("valid date");
+        if c == home || rates.rate(far, c, home).is_some() || rates.rate(far, home, c).is_some() {
+            Ok(())
+        } else {
+            Err(format!("no {c}->{home} rate"))
+        }
+    };
+    let category = |c: &str| if c.trim().is_empty() { Err("empty category".to_string()) } else { Ok(()) };
+    match fact {
+        Fact::IncomeAmountChange { category: c, amount, currency, .. }
+        | Fact::IncomeStarts { category: c, amount, currency, .. }
+        | Fact::NextIncomeAmount { category: c, amount, currency, .. } => {
+            category(c)?;
+            positive(amount)?;
+            convertible(currency)
+        }
+        Fact::NewRecurringExpense { category: c, amount, currency, every_days, .. } => {
+            category(c)?;
+            positive(amount)?;
+            if *every_days == Some(0) {
+                return Err("zero-day interval".into());
+            }
+            convertible(currency)
+        }
+        Fact::OneTimeFlow { direction, category: c, amount, currency, .. } => {
+            category(c)?;
+            if *direction == Direction::NonCash {
+                return Err("non-cash one-time flow".into());
+            }
+            positive(amount)?;
+            convertible(currency)
+        }
+        Fact::ExpenseAmountChange { category: c, amount, percent, currency, .. } => {
+            category(c)?;
+            match (amount, percent) {
+                (Some(a), None) => {
+                    positive(a)?;
+                    convertible(currency.as_deref().unwrap_or(home))
+                }
+                (None, Some(p)) if p.is_finite() && *p > -100.0 && *p <= 1000.0 => Ok(()),
+                (None, Some(p)) => Err(format!("implausible percent {p}")),
+                _ => Err("needs exactly one of amount/percent".into()),
+            }
+        }
+        Fact::IncomeDateMoved { category: c, .. } | Fact::IncomeEnded { category: c, .. } => category(c),
+        Fact::Unconfirmed { .. } => Ok(()),
+        _ => Err("event-level fact without an event id".into()),
     }
 }
 
