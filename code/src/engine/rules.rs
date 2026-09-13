@@ -383,7 +383,8 @@ impl Default for Rules {
             seeded_salary_stream: true,
             final_payroll_stops_income: true,
             variable_skip_days: 2,
-            var_long_phase: VarLongPhase::LastSettled,
+            // User decision (lead): RULES E2 default on.
+            var_long_phase: VarLongPhase::MidStep,
             var_long_min_step: 21,
             drop_late_plans: true,
             ignore_payments_after_horizon: true,
