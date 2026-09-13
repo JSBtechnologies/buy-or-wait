@@ -28,7 +28,7 @@ pub use replay::ForecastSeries;
 const USAGE: &str = "usage:
   validate --output FILE [--dataset DIR] [--requests FILE]   contract check (default requests: DIR/requests.csv)
   score    --output FILE [--dataset DIR] [--reveal-heldout]  contract check + field scores vs DIR/sample_requests.csv
-  hardcode [--code DIR] [--dataset DIR]                      scan DIR/src/{engine,extract} for record ids, label/gold/image figures
+  hardcode [--code DIR] [--dataset DIR] [--rules RULES.md]                      scan DIR/src/{engine,extract} for record ids, label/gold/image figures
   selftest [--dataset DIR]                                   run the validator over the sample labels themselves
   signoff  --output FILE --usage FILE [--rerun FILE] [--dataset DIR]
                                                              ship gate: contract, usage report, secrets, injection text, byte-identical rerun";
@@ -43,6 +43,7 @@ pub fn cli(args: &[String]) -> Result<i32> {
     let mut usage = None;
     let mut rerun = None;
     let mut code_dir = None;
+    let mut rules = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -53,6 +54,7 @@ pub fn cli(args: &[String]) -> Result<i32> {
             "--usage" => usage = it.next().map(PathBuf::from),
             "--rerun" => rerun = it.next().map(PathBuf::from),
             "--code" => code_dir = it.next().map(PathBuf::from),
+            "--rules" => rules = it.next().map(PathBuf::from),
             c if cmd.is_none() && !c.starts_with("--") => cmd = Some(c.to_string()),
             other => bail!("unexpected argument {other:?}\n{USAGE}"),
         }
@@ -83,7 +85,7 @@ pub fn cli(args: &[String]) -> Result<i32> {
             let code_dir = code_dir.unwrap_or_else(|| PathBuf::from("."));
             let code_dir = std::fs::canonicalize(&code_dir).unwrap_or(code_dir);
             let root = code_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".."));
-            let f = hardcode_scan::scan(&code_dir, &dataset, Some(&root.join("docs/gold_subset.json")), Some(&root.join("RULES.md")))?;
+            let f = hardcode_scan::scan(&code_dir, &dataset, Some(&root.join("docs/gold_subset.json")), Some(&rules.unwrap_or_else(|| root.join("RULES.md"))))?;
             for x in &f {
                 println!("{x}");
             }
