@@ -147,6 +147,10 @@ pub enum VarLongPhase {
     /// For step >= `var_long_min_step`: first occurrence at rd + IV_SKIP_DAYS, then every step.
     #[serde(alias = "from_request")]
     FromRequest,
+    /// E2: for step >= `var_long_min_step`: first = min(last + step, rd + ceil(step / 2)), then
+    /// every step; IV_SKIP_DAYS still applies.
+    #[serde(alias = "mid_step")]
+    MidStep,
 }
 
 /// RULES S8.3 `SCHEDULED_REPLACE_SCOPE` (verifier class D).

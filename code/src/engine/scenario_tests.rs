@@ -417,6 +417,13 @@ fn var_long_phase_from_request_restarts_at_request_date() {
     assert_eq!(dates(&Rules::default())[0], d("2025-08-23"));
     let rules: Rules = serde_json::from_str(r#"{"VAR_LONG_PHASE":"from_request"}"#).unwrap();
     assert_eq!(dates(&rules), vec![d("2025-08-03"), d("2025-08-31"), d("2025-09-28"), d("2025-10-26")]);
+    // E2 mid_step: history next (08-23) is later than rd + ceil(28/2) = 08-15, so 08-15.
+    let mid: Rules = serde_json::from_str(r#"{"VAR_LONG_PHASE":"mid_step"}"#).unwrap();
+    assert_eq!(dates(&mid), vec![d("2025-08-15"), d("2025-09-12"), d("2025-10-10")]);
+    // ... and keeps the history phase when it is earlier (rd 08-20: 08-23 < 08-20 + 14).
+    let later: Vec<NaiveDate> =
+        forecast_with(&events, "2025-08-20", &mid).flows.iter().filter(|f| f.category == "transport").map(|f| f.date).collect();
+    assert_eq!(later[0], d("2025-08-23"));
     // Below the minimum step the phase is unchanged.
     let short: Rules = serde_json::from_str(r#"{"VAR_LONG_PHASE":"from_request","var_long_min_step":29}"#).unwrap();
     assert_eq!(dates(&short)[0], d("2025-08-23"));
