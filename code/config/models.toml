@@ -68,6 +68,25 @@ format = "png"
 encoding = "base64_data_url"   # data:image/png;base64,...
 
 # ---------------------------------------------------------------------------
+# OCR ingestion (fleet/specs/ocr_vllm_pipeline.md, work item B3). Owner:
+# integrator. Documents the running config; runtime values come entirely
+# from `OcrConfig::from_env()` (code/src/extract/ocr.rs) reading
+# `OCR_BASE_URL` (required), `OCR_MODEL`/`OCR_API_KEY` (optional, default
+# model below) -- this section is a human-readable record, not parsed by
+# the loader, so it can never drift the pipeline out of sync with itself.
+# Replaces the Qwen/gemma fixed-key image reads as the default image path;
+# that path stays compiled but inactive unless `[selected].vlm_primary` is
+# also set (ml-engineer work item A4).
+# ---------------------------------------------------------------------------
+[ocr]
+model = "baidu/Unlimited-OCR"
+prompt = "<image>document parsing."
+max_tokens = 8192
+page_scale = 2.0                # 2x upscale (Lanczos3), skipped when a page's shorter side is already >= upscale_min_side_px
+upscale_min_side_px = 600
+xargs = { ngram_size = 35, window_size = 128 }  # vllm_xargs, anti-runaway decoding params
+
+# ---------------------------------------------------------------------------
 # VLM candidates (image -> typed figure schema, §2.3)
 # ---------------------------------------------------------------------------
 

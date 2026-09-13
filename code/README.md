@@ -12,6 +12,11 @@ reverse-engineered numeric rules.
   bake-off (`bakeoff`) and any future live extraction calls. Never commit this value;
   it is read from the environment only. Not required to build, or to run the batch
   pipeline once the processed-data store is fully populated.
+- `OCR_BASE_URL` (required for live OCR ingestion; see "OCR ingestion" below),
+  optionally `OCR_MODEL` (default `baidu/Unlimited-OCR`) and `OCR_API_KEY`. These can
+  also go in a `.env` file next to this README or at the repo root (`KEY=VALUE` per
+  line, `#` comments ok) — loaded automatically, never overriding a variable already
+  set in the environment. `.env` is gitignored; never commit it.
 - `../dataset/` present as shipped (this crate reads it with relative paths, so always
   run commands from this `code/` directory).
 
@@ -54,6 +59,26 @@ Defaults: reads `../dataset/requests.csv`, writes `../output.csv`, and writes
 CARGO_TARGET_DIR=target cargo run --release -- --cold
 CARGO_TARGET_DIR=target cargo run --release -- --requests ../dataset/sample_requests.csv --out /tmp/sample_out.csv
 ```
+
+## OCR ingestion
+
+Every image in `../dataset/images.csv` is OCR'd at the start of the batch pipeline and
+cached at `store/ocr/<image_id>/` (cache-first; `--cold` forces a re-OCR). This replaces
+the earlier fixed-key VLM image reads (`fleet/specs/ocr_vllm_pipeline.md`); that path
+stays compiled but inactive unless `[selected].vlm_primary` is also set.
+
+Serving is a vLLM OpenAI-compatible endpoint — the POC runs on a RunPod H100:
+
+```bash
+docker run --rm --gpus all --network host --ipc host vllm/vllm-openai:unlimited-ocr baidu/Unlimited-OCR \
+  --trust-remote-code \
+  --logits_processors vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor \
+  --no-enable-prefix-caching --mm-processor-cache-gb 0
+```
+
+Point `OCR_BASE_URL` at it (e.g. `https://<pod>-8000.proxy.runpod.net/v1`). Without it
+set, ingestion is skipped (not a hard error) and the batch pipeline still runs on
+whatever is already cached.
 
 ## Verify
 

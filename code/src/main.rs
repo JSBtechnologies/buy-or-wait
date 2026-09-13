@@ -13,6 +13,7 @@ use buyorwait::evaluation::{Finding, ForecastSeries, InvariantViolation, Invaria
 use buyorwait::extract::intake;
 use buyorwait::extract::messages::{deterministic_evidence, llm_evidence};
 use buyorwait::extract::model_config::ModelsConfig;
+use buyorwait::extract::ocr::{OcrClient, OcrConfig};
 use buyorwait::extract::prompts::{self, PromptSet};
 use buyorwait::extract::{images, retrieval};
 use buyorwait::hf::{self, HfClient};
@@ -23,6 +24,7 @@ use chrono::NaiveDate;
 use serde::Deserialize;
 
 fn main() -> anyhow::Result<ExitCode> {
+    load_dotenv();
     let args: Vec<String> = env::args().collect();
 
     // `buyorwait verify <args>` delegates straight to the verifier's own CLI (validate/score/
@@ -102,6 +104,43 @@ fn main() -> anyhow::Result<ExitCode> {
     };
     processed_store.save("_meta", "last_run", &serde_json::json!({ "cold": cold }))?;
 
+    // OCR ingestion (fleet/specs/ocr_vllm_pipeline.md, work item B): users upload receipts
+    // before asking questions, so every image in dataset/images.csv is OCR'd up front here
+    // and cached at store/ocr/<image_id>/page_<n>.md; requests then read that cache (once
+    // extraction/ml-engineer publish the resolve-from-cache entry point in extract::images --
+    // not wired yet, see below). `--cold` forces re-OCR, same as the other caches above.
+    // Skipped (not a hard error) when OCR isn't configured this run, e.g. `OCR_BASE_URL`
+    // unset while `blocker.ocr_endpoint` is still open -- the batch pipeline stays runnable
+    // without it.
+    let ocr_cache_dir = store_root.join("ocr");
+    let mut ocr_results: HashMap<String, buyorwait::extract::ocr::OcrResult> = HashMap::new();
+    let mut ocr_usage: Vec<buyorwait::extract::ocr::OcrUsage> = Vec::new();
+    match OcrConfig::from_env() {
+        Ok(ocr_config) => match OcrClient::new(ocr_config, ocr_cache_dir) {
+            Ok(ocr_client) => {
+                let mut ocr_ok = 0usize;
+                let mut ocr_err = 0usize;
+                for image in &images {
+                    let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+                    match ocr_client.ingest(&image.image_id, &image_path, cold) {
+                        Ok(result) => {
+                            ocr_ok += 1;
+                            ocr_usage.extend(result.pages.iter().map(|p| p.usage.clone()));
+                            ocr_results.insert(image.image_id.clone(), result);
+                        }
+                        Err(e) => {
+                            ocr_err += 1;
+                            eprintln!("ocr: {} failed: {e:#}", image.image_id);
+                        }
+                    }
+                }
+                eprintln!("ocr: ingested {ocr_ok} images ({ocr_err} failed)");
+            }
+            Err(e) => eprintln!("ocr: configured but client init failed, skipping ingest ({e:#})"),
+        },
+        Err(e) => eprintln!("ocr: not configured this run, skipping ingest ({e:#})"),
+    }
+
     // Which models (if any) to call live this run. With `[selected]` absent from
     // config/models.toml (the state before the user picks, PLAN.md Phase 2d),
     // vlm_primary()/llm_primary() are both None and the whole model path below stays
@@ -152,6 +191,7 @@ fn main() -> anyhow::Result<ExitCode> {
         cold,
         image_prompt: image_prompt.as_ref(),
         message_prompt: message_prompt.as_ref(),
+        ocr_results: &ocr_results,
     };
 
     let rates = Arc::new(RateTable::from_model(&rates));
@@ -220,6 +260,7 @@ fn main() -> anyhow::Result<ExitCode> {
         &pricing,
         requests.len(),
     )?;
+    append_ocr_usage_report(Path::new("evaluation/usage_report.md"), &ocr_usage)?;
 
     eprintln!("model cache stats: {:?}", model_cache.stats());
 
@@ -323,6 +364,11 @@ struct ModelContext<'a> {
     cold: bool,
     image_prompt: Option<&'a PromptSet>,
     message_prompt: Option<&'a PromptSet>,
+    /// OCR results cached at ingestion (fleet/specs/ocr_vllm_pipeline.md), keyed by
+    /// `image_id`. Populated independent of `[selected]` -- OCR is the default image path,
+    /// not gated behind a chosen VLM -- and empty (never absent) when OCR isn't configured
+    /// this run.
+    ocr_results: &'a HashMap<String, buyorwait::extract::ocr::OcrResult>,
 }
 
 /// One user's session, bound and decided for one request (PLAN.md §2.5: one session per
@@ -350,26 +396,34 @@ fn decide_one(
     let home_currency = session.profile().home_currency.clone();
     let mut facts = deterministic_evidence(&evidence.messages, &home_currency);
 
-    if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
-        if model_ctx.config.vlm_primary().is_some() {
-            let image_max_dim_px = model_ctx.config.image_max_dim_px();
-            let history: Vec<Event> = events
-                .iter()
-                .filter(|e| e.user_id == request.user_id)
-                .filter_map(|e| Event::from_model(e).ok())
-                .collect();
-            for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
-                let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
-                    continue;
-                };
+    // Blank-amount image resolution (fleet/specs/ocr_vllm_pipeline.md work item B2): OCR,
+    // cached at ingestion and keyed by image_id, is the default path -- a deterministic
+    // reader + witness gate, no live call here. The legacy Qwen/gemma fixed-key VLM path
+    // stays compiled (ml-engineer work item A4) but only runs as a fallback when OCR has no
+    // cached read for this image AND a VLM is explicitly selected in `[selected]`.
+    for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
+        let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
+            continue;
+        };
+        let typed_event = match Event::from_model(event) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("image: skipping {}: {e:#}", event.event_id);
+                continue;
+            }
+        };
+
+        let resolution = if let Some(ocr_result) = model_ctx.ocr_results.get(&image.image_id) {
+            Some(images::resolve_blank_amount_ocr(ocr_result, &image.image_id, &typed_event))
+        } else if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
+            if model_ctx.config.vlm_primary().is_some() {
+                let image_max_dim_px = model_ctx.config.image_max_dim_px();
                 let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
-                let typed_event = match Event::from_model(event) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("vlm: skipping {}: {e:#}", event.event_id);
-                        continue;
-                    }
-                };
+                let history: Vec<Event> = events
+                    .iter()
+                    .filter(|e| e.user_id == request.user_id)
+                    .filter_map(|e| Event::from_model(e).ok())
+                    .collect();
                 // resolve_blank_amount dispatches on config.vlm_mode() (escalate vs.
                 // two-model agreement) internally now, per extraction's decision.vlm_setup.
                 match images::resolve_blank_amount(
@@ -384,58 +438,67 @@ fn decide_one(
                     &typed_event,
                     &history,
                 ) {
-                    Ok(resolution) => {
-                        let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {
-                            Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
-                            _ => None,
-                        });
-                        // Blocker #205 (verifier board:verify.image_agreement): persist every
-                        // attempted read's provenance, independent of whether it contributed to
-                        // the final evidence, so the agreement outcome is auditable. Runtime
-                        // store only (code/store/, gitignored), never shipped.
-                        let reads: Vec<serde_json::Value> = resolution
-                            .reads
-                            .iter()
-                            .map(|r| {
-                                let cutoff = (r.due_date.is_some()
-                                    || r.before_amount.is_some()
-                                    || r.after_amount.is_some())
-                                .then(|| {
-                                    serde_json::json!({
-                                        "due_date": r.due_date,
-                                        "before_amount": r.before_amount,
-                                        "after_amount": r.after_amount,
-                                    })
-                                });
-                                serde_json::json!({
-                                    "role": r.role,
-                                    "model_id": r.model_id,
-                                    "model_revision": r.model_revision,
-                                    "max_dim_px": r.max_dim_px,
-                                    "reconciled": r.reconciled,
-                                    "selected_amount": r.selected_amount,
-                                    "cutoff": cutoff,
-                                })
-                            })
-                            .collect();
-                        let provenance = serde_json::json!({
-                            "image_id": image.image_id,
-                            "event_id": typed_event.id,
-                            "class": resolution.class.clone().unwrap_or_default(),
-                            "reads": reads,
-                            "outcome": resolution.outcome,
-                            "accepted_amount": accepted_amount,
-                        });
-                        if let Err(e) = processed_store.save("image_reads", &image.image_id, &provenance) {
-                            eprintln!("vlm: failed to persist provenance for {}: {e:#}", image.image_id);
-                        }
-                        if let Some(record) = resolution.evidence {
-                            facts.push(record);
-                        }
+                    Ok(resolution) => Some(resolution),
+                    Err(e) => {
+                        eprintln!("vlm: {} failed: {e:#}", image.image_id);
+                        None
                     }
-                    Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
                 }
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        let Some(resolution) = resolution else { continue };
+        let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {
+            Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
+            _ => None,
+        });
+        // Blocker #205 (verifier board:verify.image_agreement): persist every attempted
+        // read's provenance, independent of whether it contributed to the final evidence, so
+        // the agreement outcome is auditable. Runtime store only (code/store/, gitignored),
+        // never shipped.
+        let reads: Vec<serde_json::Value> = resolution
+            .reads
+            .iter()
+            .map(|r| {
+                let cutoff = (r.due_date.is_some() || r.before_amount.is_some() || r.after_amount.is_some())
+                    .then(|| {
+                        serde_json::json!({
+                            "due_date": r.due_date,
+                            "before_amount": r.before_amount,
+                            "after_amount": r.after_amount,
+                        })
+                    });
+                serde_json::json!({
+                    "role": r.role,
+                    "model_id": r.model_id,
+                    "model_revision": r.model_revision,
+                    "max_dim_px": r.max_dim_px,
+                    "reconciled": r.reconciled,
+                    "selected_amount": r.selected_amount,
+                    "cutoff": cutoff,
+                    "witness": r.witness,
+                    "ocr_notes": r.ocr_notes,
+                })
+            })
+            .collect();
+        let provenance = serde_json::json!({
+            "image_id": image.image_id,
+            "event_id": typed_event.id,
+            "class": resolution.class.clone().unwrap_or_default(),
+            "mode": resolution.mode,
+            "reads": reads,
+            "outcome": resolution.outcome,
+            "accepted_amount": accepted_amount,
+        });
+        if let Err(e) = processed_store.save("image_reads", &image.image_id, &provenance) {
+            eprintln!("image: failed to persist provenance for {}: {e:#}", image.image_id);
+        }
+        if let Some(record) = resolution.evidence {
+            facts.push(record);
         }
     }
 
@@ -486,6 +549,64 @@ fn decide_one(
     };
     let outcome = invariants.assert_row(&decision.row, &forecast);
     Ok((decision.row, outcome))
+}
+
+/// Loads `KEY=VALUE` lines from a `.env` file into the process environment (e.g.
+/// `OCR_BASE_URL`, per the lead's ruling on bus `integrate`), without overriding a variable
+/// already set -- an explicit `OCR_BASE_URL=... cargo run` still wins. Checks `.env` (the
+/// usual cwd when running from `code/`) then `../.env` (repo root). Never required: silently
+/// does nothing if neither exists. Hand-rolled rather than a `dotenv` crate dependency -- a
+/// handful of lines, no new Cargo.toml surface.
+fn load_dotenv() {
+    for path in [Path::new(".env"), Path::new("../.env")] {
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            if env::var_os(key).is_none() {
+                env::set_var(key, value);
+            }
+        }
+        return;
+    }
+}
+
+/// Appends an OCR section to `evaluation/usage_report.md` (fleet/specs/ocr_vllm_pipeline.md
+/// work item B4): calls, tokens, and an estimated cost. The HF/LLM path above is priced per
+/// token (`hf::Pricing`); the OCR endpoint is a self-hosted RunPod H100, priced by wall time
+/// instead, so this is a separate section rather than forcing it through `hf::Usage`.
+/// **Assumption, stated explicitly**: $2.69/hr, a commonly quoted RunPod H100 SXM secure-
+/// cloud on-demand rate as of this run -- adjust `H100_HOURLY_USD` if the actual pod's rate
+/// differs.
+fn append_ocr_usage_report(path: &Path, usage: &[buyorwait::extract::ocr::OcrUsage]) -> anyhow::Result<()> {
+    const H100_HOURLY_USD: f64 = 2.69;
+    let calls = usage.iter().filter(|u| !u.cache_hit).count();
+    let cache_hits = usage.iter().filter(|u| u.cache_hit).count();
+    let prompt_tokens: u64 = usage.iter().map(|u| u.prompt_tokens).sum();
+    let completion_tokens: u64 = usage.iter().map(|u| u.completion_tokens).sum();
+    let wall_seconds: f64 = usage.iter().map(|u| u.seconds).sum();
+    let cost_usd = (wall_seconds / 3600.0) * H100_HOURLY_USD;
+    let section = format!(
+        "\n## OCR ingestion (fleet/specs/ocr_vllm_pipeline.md)\n\n\
+         - Model: baidu/Unlimited-OCR (self-hosted vLLM, RunPod H100)\n\
+         - Pages OCR'd live: {calls} (cache hits: {cache_hits})\n\
+         - Prompt tokens: {prompt_tokens}\n\
+         - Completion tokens: {completion_tokens}\n\
+         - Total tokens: {}\n\
+         - Wall time: {wall_seconds:.2}s\n\
+         - Estimated cost: ${cost_usd:.6} (assumption: ${H100_HOURLY_USD:.2}/hr H100, wall-time \
+           billed -- not per-token pricing; verify against the actual RunPod rate)\n",
+        prompt_tokens + completion_tokens,
+    );
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    use std::io::Write;
+    file.write_all(section.as_bytes())?;
+    Ok(())
 }
 
 /// Reads `config/models.toml`'s candidate pricing into the map `hf::write_usage_report`
