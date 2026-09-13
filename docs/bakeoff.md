@@ -203,6 +203,34 @@ evidence.** The user has a parked non-HF option (board
 decision.claude_backup) if a guarantee-grade fallback is needed sooner
 than credits can be restored and Kimi-K2.6 retested.
 
+### User-suggested candidate: `PaddlePaddle/PaddleOCR-VL-1.6`
+
+Checked with **zero credits spent** (HF router `/v1/models` list + Hub
+model card only, no inference calls):
+
+1. **Not live on the HF router at all** — a fresh 143-model list has zero
+   `paddle*` entries. Fails gate criterion 5 outright (needs ≥2 live
+   providers; has 0).
+2. **What it outputs:** Hub tags — `image-text-to-text`, `conversational`,
+   `document-parse`, `layout`, `table`, `formula`, `chart`, `seal`,
+   `spotting` — built on an ERNIE4.5 base with a chat template. This is a
+   document-**understanding** VLM (layout/table/formula-aware), not a
+   raw-OCR-text-only model; it likely *can* be prompted directly for our
+   JSON figure schema the same way the other VLM candidates are, though
+   this is unverified (no test run). If it turns out to be closer to
+   plain-OCR in practice, the lead's suggested pattern still applies: OCR
+   transcribes, a deterministic Rust parser pulls labeled figures, then
+   `select()`/`reconciles()` run exactly as they do today — no VLM-in-the-
+   loop hallucination risk on the figures themselves.
+3. **License:** `apache-2.0`. **Pinned revision:**
+   `c5630abae1d940eafe0697512a0325494b02ab42`.
+
+Since it's absent from the router: local inference is excluded by PLAN.md
+(§2.11: no local inference), so the only path to using it would be an HF
+Inference Endpoint — a separate, dedicated deployment, still billed
+against the same (currently depleted) HF account, not a way around the
+credit exhaustion above.
+
 ### Gate results: LLM role (secondary — msg_86 only in production)
 
 | Model | Live providers | Field accuracy (47 labeled) | Valid-JSON@N=3 | Notes |
