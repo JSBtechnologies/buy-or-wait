@@ -505,4 +505,95 @@ Actionable = changes a forecast item. Counts are EN / ID.
 
 message_86 also contains "employer has confirmed a USD 1296 salary credit for 15 September 2026", which is N2 (it equals the settled stream).
 
-**Priority for extraction:** (1) fix the S6.1 mappings for the leave (10 msgs), resumes (8) and date-moved (7) families, which break tuning 08, 14 and 07; (2) add regexes for A1, A2, A3, A5; (3) a new Fact or field for A4 (stream-specific end, e.g. `IncomeEnded{category, description_hint}`); (4) lead decision on A6.
+**Priority for extraction (S6):** (1) fix the S6.1 mappings for the leave (10 msgs), resumes (8) and date-moved (7) families, which break tuning 08, 14 and 07; (2) add regexes for A1, A2, A3, A5; (3) a new Fact or field for A4 (stream-specific end, e.g. `IncomeEnded{category, description_hint}`); (4) lead decision on A6.
+
+
+---
+
+## S7. Normalization inputs: every surface form actually present (for extraction `normalize.rs` tests)
+
+Enumerated by scratch scans (no labels used): all 215 `messages.csv` texts, all 275 `request_text` values, and every cached raw model read across agent stores (deduped: 177 raw texts, 126 image-figure objects). Also the page text quoted verbatim inside Kimi-K3 reasoning transcripts (57 raws). Shapes replace digits with `9`. Counts are occurrences.
+
+### S7.1 Messages (EN + ID): clean, unambiguous
+
+| lang | currency token | amount shapes (count, example) |
+|---|---|---|
+| EN | EUR | `9999` 18 (2717), `9999.99` 7 (1037.52), `999` 7 (924), `999.99` 3 (653.40) |
+| EN | USD | `9999` 11 (2988), `999` 4 (828), `9999.99` 3 (2177.28), `999.99` 2 (530.40) |
+| EN | INR | `999999` 19 (196000), `99999` 6 (69000) |
+| EN | ZAR | `99999` 15 (54120) |
+| ID | IDR | `99999999` 20 (42750000), `9999999` 2 (9490500) |
+| ID | USD | `999` 1 (696) |
+
+- No thousands separators anywhere in messages. The decimal separator is always `.` (EN and ID). No `Rp`, `Rs`, `₹`, `€` or `$` symbols appear; currency is always the ISO code followed by one space.
+- Dates: `YYYY-MM-DD` (EN 59, ID 13) and `D Month YYYY` with an English month (EN 4, e.g. `24 July 2026`, `3 September 2026`). No Indonesian month names, no slash dates.
+- Other numerics that must NOT parse as money: percents `12%` (7); refs `AAA-9999` such as `EMP-0001`, `BAN-0013`, `SER-0035`, `MER-0064`, `FIN-0017` (215); times `12:35 a.m.`; place numbers (`Charge Point 1110`); a year at sentence end (`2026.`).
+
+### S7.2 request_text (not model input, listed for completeness)
+
+| lang | currency | shapes |
+|---|---|---|
+| EN | IDR | `99,999,999` 46 (46,018,000), `9,999,999` 8 |
+| EN | INR | `999,999` 41 (197,400), `99,999` 26: western grouping, **no lakh** |
+| EN | ZAR | `99,999` 45, `9,999` 4, `999,999` 2 |
+| EN | EUR / USD | `9,999.99`, `999.99`, `9,999`, `999` |
+| **ID** | **IDR** | **`99.999.999` 1 (`43.339.000`): dot thousands separator** |
+
+- Dates are `D Month YYYY` / `DD Month YYYY` (137), with English month names even in the Indonesian text (`15 November 2024`).
+
+### S7.3 Cached model reads (JSON values)
+
+- Numeric fields arrive as JSON numbers (int or float), except the v1 due-date fields. `amount_due_before_date` came back as a string ×7 and `amount_due_after_date` as a string ×4, holding the dates `2026-02-06` / `06-Feb-2026` (the v1 schema bug). No thousands-separated numeric strings were emitted.
+- `currency` strings: `INR` 59, `₹` 15, `IDR` 15, `USD` 7, `Rupees` 5, `Rs.` 3, `RS` 3, `Rs` 3, `"null"` (string) 3, `PHP` 2, `$` 1, `KMR` 1, `PKR` 1, `Amount` 1. `PHP`/`KMR`/`PKR`/`Amount` are misreads of INR/USD pages. The string `"null"` must map to absent.
+- Date strings: `document_date` is `YYYY-MM-DD` (83). `period_label` is free text (`Aug-2019`, `April 2022 to September 2022`, `Jan to March 2026`, `April to June-2026`), with junk also landing there (`This month's charges`, `CHARGED ON`, an amount written in words).
+- `doc_type` strings: `invoice` 25, `receipt` 19, `Rent Receipt` 11, `PROVISIONAL BILL` 10, `payslip` 9, `Bill of Supply` 9, `Receipt` 8, `bill` 7, `PAY SLIP` 7, `TAX INVOICE` 4, `account summary` 4, `delivery_summary` 4, `Delivery Summary` 2, `Invoice` 2, `INVOICE` 1, `delivery summary` 1, `airline ticket` 1, `order details` 1, `order_summary` 1.
+- **Scale misreads from lakh grouping (the ambiguity actually happened):** image_02 prints Indian lakh grouping (`2,00,000.00`, `1,80,000.00`, `1,00,000.00`). Two reads came back 10× too large:
+  - Qwen3-VL-235B: `total 2000000, amount_paid 1000000, balance_due 1000000`
+  - Qwen3-VL-30B: `amount_paid 1000000, balance_due 1000000`
+  
+  Both are internally consistent (paid + balance = total), so reconciliation accepts them. A single 235B read would select **1,000,000 instead of the true 100,000** on a cash-moving row. Only a disagreeing second reader catches it.
+- Raw-text integrity: 45 of 57 Kimi-K3 raws are reasoning prose with no final JSON object (unparseable, probably `max_tokens` truncation). 36 Qwen3.5-397B, 11 Kimi-K2.6 and 1 GLM-5.3 raws are empty strings.
+
+### S7.4 Page surface forms (page text quoted in model transcripts, plus the analyst read of all 16 images)
+
+| form | examples | ambiguity |
+|---|---|---|
+| Indian lakh grouping | `2,00,000.00`, `1,80,000.00`, `1,00,000.00`; shape `9,99,999.99` ×34 | `x,xx,xxx` must not be read as a western million |
+| western grouping | `4,500,000`, `166,500`, `79,679.26`, `9,968.00`, `3,543.54` | — |
+| **comma decimal** | image_12 receipt prints `$28,50`, `$5,00`, `$33,50`, `$40,00`, `$6,50` | `33,50` = 33.50, not 3,350: on this page a comma followed by exactly 2 digits after `$` is the decimal separator |
+| rupee/paise columns | image_14 handwritten `4543 00`, `1500 00` (separate Rs. and Ps. columns) | `4543 00` = 4543.00, not 454300 |
+| symbol prefix | `₹95.0`, `₹2854.00`, `₹1,599`, `$28.50`, `Rs.5000`, `Rs 0.00`, `IDR 90,000` | no space / space / dot after `Rs` |
+| one-decimal amounts | `41272.0`, `95.0`, `580.0` | — |
+| two totals differing by rounding | `8,528.10` and `8528` on the same page | tolerance ≤ 1 unit (S5) |
+| line-wrapped numbers | image_15 `9,124.0` / `0` and `9,512.0` / `0` split across lines | — |
+| amounts in words | `Four Million Three Hundred Sixty Five Thousand Rupiahs`, `Rupees Fifteen Thousand Three Hundred Thirty Nine Only`, `Seventy-Nine Thousand Six Hundred Seventy-Nine and Twenty-Six Paise` | cross-check only |
+| numbers that are not money | phones `08208064299`, `9403265989`; tax ref / GSTIN `899763619907000`; FSSAI `11217334001482`; UPC `8906143890487`; transaction ids `39350810…`; PIN codes `411056`, `560095` | 6–15 digit ids must never become amounts |
+
+**Dates on pages**, each resolved against the linked event date:
+
+| form | example | resolution |
+|---|---|---|
+| `DD-Mon-YYYY` | `06-Feb-2026`, `19-Jan-2023`, `07-Jun-2026` | unambiguous |
+| `DD/MM/YY` | image_02 `11/08/23` | event 2023-08-11 → **day first** (month first would give 2023-11-08) |
+| `DD/MM/YYYY` | image_12 `01/10/2025` (event 2025-10-01); image_16 `03/09/2026, 12:35:10 am` (event 2026-09-03); image_03 `27/02/2026` | **day first** on every page; `01/10` and `03/09` can only be resolved by the event date |
+| `DD-MM-YYYY` | image_07 `29-10-2025`; image_08 `24-07-2026` (due `30-08-2026`); image_09 `07-06-2026` (due `02-07-2026`) | day first; `07-06-2026` = 7 June (event 2026-06-07) |
+| `DD-MM-YY` | image_11 `18-01-23 12:19 PM` | day first |
+| `D Mon YYYY` | image_01 `Printed on: 2 Sep 2019 09:35 PM` | — |
+| `Mon-YYYY` | `PAY SLIP Aug-2019` | a period, not a cash date |
+
+**Required normalize.rs test cases (each taken from a real input above):**
+
+- Amounts:
+  - `2,00,000.00`→200000; `1,80,000.00`→180000; `9,99,999.99`→999999.99
+  - `4,500,000`→4500000; `79,679.26`→79679.26
+  - `43.339.000` (IDR, Indonesian text)→43339000
+  - `$33,50`→33.50 (comma decimal); `4543 00` (Rs/Ps columns)→4543.00
+  - prefixed forms `₹2854.00`, `Rs.5000`, `Rs 0.00`, `IDR 90,000`
+  - `8528` ≈ `8528.10` within 1.0
+- Currency:
+  - `₹` / `Rs.` / `RS` / `Rupees` → INR; `$` → USD
+  - `"null"` / `Amount` → absent
+  - `PHP` / `KMR` / `PKR` on an INR event → mismatch (reject), never a silent remap
+- Dates: `11/08/23`→2023-08-11; `01/10/2025`→2025-10-01; `03/09/2026`→2026-09-03; `07-06-2026`→2026-06-07; `06-Feb-2026`→2026-02-06.
+- Not amounts: `08208064299`, `899763619907000`, `EMP-0001`.
+- Ambiguous day/month rule: for a slash or dash date where both parts are ≤ 12, prefer day-first (all 16 pages are day-first) and confirm it against the linked event date. If they disagree, leave the date unresolved (a flagged missing value beats a wrong one, `decision.accuracy_first`).
