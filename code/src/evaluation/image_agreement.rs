@@ -203,6 +203,26 @@ pub struct Read {
     pub before_amount: Option<f64>,
     #[serde(default)]
     pub after_amount: Option<f64>,
+    /// Every other field of the read, kept so a renamed cutoff field cannot silently switch
+    /// the due-date rule off (IA13).
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Read fields the gate knows that are not cutoff inputs.
+const KNOWN_NON_CUTOFF_FIELDS: [&str; 3] = ["currency", "error", "prompt_version"];
+
+/// Unknown read fields that look like due-date / cutoff inputs.
+fn unmapped_cutoff_fields(r: &Read) -> Vec<String> {
+    r.extra
+        .keys()
+        .filter(|k| !KNOWN_NON_CUTOFF_FIELDS.contains(&k.as_str()))
+        .filter(|k| {
+            let l = k.to_lowercase();
+            ["due", "cutoff", "before", "after", "deadline"].iter().any(|w| l.contains(w))
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +422,12 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
                 out.push(fail(&p.image_id, "IA10_class_mismatch", format!("provenance class {:?} but routing table gives {} for {event_id}", p.class, class.name)));
             }
             let reader_models: Vec<&str> = class.readers.iter().map(|r| r.model.as_str()).collect();
+            for r in &p.reads {
+                let unmapped = unmapped_cutoff_fields(r);
+                if !unmapped.is_empty() {
+                    out.push(fail(&p.image_id, "IA13_unmapped_cutoff_field", format!("{} read carries cutoff-like fields {unmapped:?} the gate does not map: the due-date rule would be skipped; update the gate for the prompt/schema change", r.model_id)));
+                }
+            }
             for r in &p.reads {
                 let routed = class.readers.iter().find(|s| s.role == r.role && s.model == r.model_id).or(class.tiebreak.as_ref().filter(|t| t.model == r.model_id));
                 match routed {
@@ -616,6 +642,14 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
         let v = run("i", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "no_agreement", None), CONFIG);
         assert!(errors(&v).is_empty() && v.contains(&("IA6_outcome_mismatch", Severity::Warn)), "{v:?}");
+
+        // A renamed cutoff field (e.g. a prompt v2 schema) must not silently disable the cutoff rule.
+        let mut q = read("vlm_primary", Q, 1024, 400, true, Some(120.75));
+        q["cutoff_date"] = json!("2026-02-06");
+        q["amount_due_after_cutoff"] = json!(150.25);
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
+        let e = errors(&run("r", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        assert!(e.contains(&"IA13_unmapped_cutoff_field"), "{e:?}");
 
         // Wrong class recorded.
         let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
