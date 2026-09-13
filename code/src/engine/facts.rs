@@ -4,6 +4,7 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+use super::ledger::{AmountWitnessRecord, UnverifiedReserve};
 use super::money::Money;
 use super::plans::{DropReason, RankKey};
 use super::types::{AffordabilityStatus, Payment, PaymentMethod};
@@ -97,6 +98,14 @@ pub struct DecisionFacts {
     /// Blank-amount rows with no accepted image figure (baseline v0): never zero, excluded
     /// from cash and stream estimators, listed here by event id.
     pub missing_amounts: Vec<String>,
+    /// Failed-closed image figures reserved conservatively (largest validated read) against
+    /// a blank pending/scheduled debit. The event stays in `missing_amounts` (amount unproven).
+    #[serde(default)]
+    pub unverified_reserve: Vec<UnverifiedReserve>,
+    /// Accepted image figures with their recomputed witness total (image_07: 8,528 printed
+    /// Grand Total paid, 8,528.10 summed).
+    #[serde(default)]
+    pub amount_witnesses: Vec<AmountWitnessRecord>,
     pub ledger_issues: Vec<String>,
     pub rejected_evidence: Vec<String>,
     pub applied_evidence: Vec<String>,

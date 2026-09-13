@@ -114,8 +114,10 @@ impl Forecast {
 
         // Reserved pending debits.
         let mut reserved_total = Money::ZERO;
+        // A blank row whose image failed closed holds its largest validated read instead
+        // of vanishing (image accuracy plan §4); a blank row with no read stays skipped.
         for e in inp.ledger.reserved() {
-            let Some(a) = e.home_amount else { continue };
+            let Some(a) = e.home_amount.or_else(|| inp.ledger.unverified_home(&e.event.id)) else { continue };
             let date = if rules.reserve_pending_on_request_date { start } else { e.cash_date.max(start) };
             reserved_total += a;
             flows.push(Flow {
@@ -130,16 +132,18 @@ impl Forecast {
         let scheduled: Vec<&LedgerEntry> = inp
             .ledger
             .scheduled()
-            .filter(|e| e.home_amount.is_some())
+            .filter(|e| e.home_amount.is_some() || inp.ledger.unverified_home(&e.event.id).is_some())
             .filter(|e| !(rules.ignore_scheduled_before_request_date && e.cash_date < start))
             .collect();
         for e in &scheduled {
             if e.cash_date > end {
                 continue;
             }
+            // An unverified reserve is always a debit.
+            let amount = e.signed_home_amount().or_else(|| inp.ledger.unverified_home(&e.event.id).map(|a| -a));
             flows.push(Flow {
                 date: e.cash_date.max(start),
-                amount: e.signed_home_amount().unwrap(),
+                amount: amount.expect("filtered to rows with an amount or reserve"),
                 category: e.event.category.clone(),
                 source: FlowSource::Scheduled { event_id: e.event.id.clone() },
             });
@@ -182,7 +186,7 @@ impl Forecast {
                         e.event.category == stream.category
                             && e.event.direction == stream.direction
                             && (e.cash_date - *d).num_days().abs() <= rules.scheduled_replacement_window_days
-                            && replaces_in_scope(e, stream, rules)
+                            && replaces_in_scope(e, e.home_amount.or_else(|| inp.ledger.unverified_home(&e.event.id)), stream, rules)
                     })
                 });
             }
@@ -428,14 +432,15 @@ pub fn debit_kind(f: &Flow, streams: &[Stream]) -> DebitKind {
 
 /// RULES S8.3 `SCHEDULED_REPLACE_SCOPE`: whether a scheduled row in a stream's window may
 /// replace that stream's projected occurrence.
-fn replaces_in_scope(e: &LedgerEntry, stream: &Stream, rules: &Rules) -> bool {
+/// `home_amount` is the row's amount, or its unverified reserve.
+fn replaces_in_scope(e: &LedgerEntry, home_amount: Option<Money>, stream: &Stream, rules: &Rules) -> bool {
     match rules.scheduled_replace_scope {
         ScheduledReplaceScope::CategoryWindow => true,
         ScheduledReplaceScope::LifecycleOrAmount => {
             if e.event.direction != Direction::Debit || e.event.linked_event_id.is_some() {
                 return true;
             }
-            let (Some(a), est) = (e.home_amount, stream.projected_amount) else { return false };
+            let (Some(a), est) = (home_amount, stream.projected_amount) else { return false };
             (a - est).abs().0 as i128 * 100 <= est.abs().0 as i128 * rules.scheduled_replace_amount_pct as i128
         }
     }

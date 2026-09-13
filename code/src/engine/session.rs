@@ -261,6 +261,8 @@ impl Session {
                 .filter(|e| e.amount_source == AmountSource::Missing)
                 .map(|e| e.event.id.clone())
                 .collect(),
+            unverified_reserve: self.ledger.unverified.values().cloned().collect(),
+            amount_witnesses: self.ledger.witnesses.clone(),
             ledger_issues: self.ledger.issues.iter().map(issue_text).collect(),
             rejected_evidence: self.ledger.rejected.iter().map(|r| format!("{}: {}", r.record_id, r.reason)).collect(),
             applied_evidence: self
