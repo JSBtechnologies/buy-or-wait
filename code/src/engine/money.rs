@@ -35,6 +35,10 @@ impl Money {
         self.0 as f64 / SCALE as f64
     }
 
+    pub fn abs(self) -> Money {
+        Money(self.0.abs())
+    }
+
     pub fn max(self, other: Money) -> Money {
         if self >= other { self } else { other }
     }
