@@ -226,8 +226,8 @@ notes = "Cheapest LLM candidate overall on deepinfra; many redundant live provid
 
 [fallback]
 trigger = "primary output fails validation/reconciliation (engine/verifier), or primary is marked unavailable by the bake-off/production circuit breaker (repeated call failures) — never a routine first choice"
-activation_note = "This table is a candidate catalog only. Activation is via a top-level [selected] table's vlm_fallback/llm_fallback keys (see comment block above), set only once the user picks — [selected] does not exist in this file yet."
-non_hf_provider_note = "None of the three candidates below need a separate API key: all are live on the HF router under the existing HF_TOKEN. A non-HF frontier model (proprietary API) would need its own key env var and a second client, out of scope for this change."
+activation_note = "This table is a candidate catalog only. Activation is via a top-level [selected] table's vlm_fallback/llm_fallback keys (see comment block above)."
+non_hf_provider_note = "The three HF-router candidates below (Kimi-K3, DeepSeek-V4-Pro-0813, GLM-5.3) need no separate API key -- all live under the existing HF_TOKEN. claude-opus-5 below is the one exception: it needs its own ANTHROPIC_API_KEY env var (never logged) and a second client (code/src/anthropic.rs), built specifically because the HF router account's monthly credits were exhausted mid-bake-off (docs/bakeoff.md 'Backup models') and Kimi-K3 failed the backup gate anyway."
 
 [[fallback.candidates]]
 id = "moonshotai/Kimi-K3"
@@ -259,6 +259,15 @@ pricing_usd_per_m_tokens = { input = 1.20, output = 4.00 }
 supports_structured_output = true
 notes = "Text-only frontier alternative, different lineage from DeepSeek (diversifies the fallback away from a single vendor's outage risk). novita/together/baseten also live, structured-output present on novita/baseten/deepinfra."
 
+[[fallback.candidates]]
+id = "claude-opus-5"
+provider = "anthropic"                              # NOT an HF router provider slug -- routed to code/src/anthropic.rs, not hf.rs
+model_revision = "claude-opus-5"                    # Anthropic model strings are the version pin; no separate commit-hash revision system like HF Hub
+role = "vlm"
+pricing_usd_per_m_tokens = { input = 5.00, output = 25.00 }
+supports_structured_output = true                   # output_config.format.json_schema (code/src/anthropic.rs)
+notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed the backup gate (docs/bakeoff.md) and the HF router account's credits were exhausted. Needs ANTHROPIC_API_KEY only, not HF credits. Adaptive thinking is on by default on Opus 5 and counts toward output tokens/max_tokens (same failure class as Kimi-K3's reasoning-token truncation if max_tokens is too tight) -- routed at max_tokens=4000 in [vlm_routing] below. Gate-test pending (7 labeled + 4 cash images, N=5); not yet confirmed passing."
+
 # ---------------------------------------------------------------------------
 # USER DECISION (board decision.vlm_setup, 2026-09-12): VLM picked, LLM still
 # undecided (msg_86 only in production — see docs/bakeoff.md "LLM candidates").
@@ -285,9 +294,11 @@ notes = "Text-only frontier alternative, different lineage from DeepSeek (divers
 [selected]
 vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
 vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px (see schema-gap note above)
-vlm_fallback = "moonshotai/Kimi-K3"                  # from [[fallback.candidates]] -- FAILS the backup gate (docs/bakeoff.md "Backup models"); left as-is per lead's instruction to hold [selected] unannounced until credits are back and verifier/analyst confirm the replacement
+vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (fails the backup gate, docs/bakeoff.md "Backup models"), claude-opus-5 IN (from [[fallback.candidates]], code/src/anthropic.rs -- needs only ANTHROPIC_API_KEY, not HF credits). Gate test pending (Step 4 of board decision.claude_backup); still held un-announced per the lead until verifier/analyst confirm.
 vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
 image_max_dim_px = 1024
+llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai, per user decision
+llm_fallback = "deepseek-ai/DeepSeek-V4-Pro-0813"    # deepinfra, from [[fallback.candidates]] -- passed its backup-gate check (docs/bakeoff.md)
 
 # ---------------------------------------------------------------------------
 # Per-event-class VLM reader routing (extraction 32c17d5, board decision
@@ -313,10 +324,14 @@ image_max_dim_px = 1024
 # analyst's pre-audit (board:verify.image_agree_preaudit) found it drops
 # due-date fields on that document shape 4/4, silently falling back to the
 # pre-cutoff amount even when the correct, later, larger figure applies
-# (image_05) -- so that class routes to vlm_fallback (Kimi-K3) instead. Note
-# this pairing depends on vlm_fallback passing the backup gate above, which
-# it currently does not; the class is written to match extraction's
-# Default exactly and needs revisiting once a passing fallback is chosen.
+# (image_05) -- so that class routes to vlm_fallback instead. Board decision
+# .vlm_routing_v2: Kimi-K3 OUT (failed the backup gate), claude-opus-5 IN
+# (role resolves via [selected].vlm_fallback above, updated to match).
+# claude-opus-5's max_tokens=4000 follows the lead's spec (adaptive thinking
+# is on by default on Opus 5 and counts toward output, same class of problem
+# as Kimi-K3's reasoning-token truncation); max_dim_px=1024 is a default
+# match to vlm_primary, not yet screened for claude-opus-5 specifically --
+# a known gap, same as Kimi-K3's was.
 # ---------------------------------------------------------------------------
 
 [vlm_routing]
@@ -339,7 +354,7 @@ statuses = ["pending", "scheduled"]
 categories = []
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
-  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 1500 },
+  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 },
 ]
 
 [[vlm_routing.classes]]
