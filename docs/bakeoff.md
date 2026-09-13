@@ -203,6 +203,47 @@ evidence.** The user has a parked non-HF option (board
 decision.claude_backup) if a guarantee-grade fallback is needed sooner
 than credits can be restored and Kimi-K2.6 retested.
 
+### Update: claude-opus-5 CLEARS THE GATE (fresh test, 7 labeled images, N=5)
+
+After 3 rounds of fixing real live schema errors (type-array+enum
+rejection; the 16-nullable-field union cap; finally "Schema is too
+complex" even after both fixes — resolved by dropping
+`output_config.format` entirely per the lead and using the same
+prompt-only JSON path every HF-router candidate already uses):
+
+| Model | Provider | Res. | Field accuracy (7 labeled) | Valid-JSON@N=5 | Selected-fig. accuracy | Selected-fig. stability | Reconciliation | Avg in/out tok | p50 latency | Cost/item | Cost/full-run (16 img) |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| claude-opus-5 | anthropic | 1024 | **90.6%** (best of any VLM tested) | 100.0% | 83.3% (5/6, tied with best primary) | 100.0% | **83.3%** (best of any VLM tested) | 1378/462 | 5564ms | $0.01843 | $0.2950 |
+
+Every gate criterion checked so far: **valid-JSON 100% ✅, selected-figure
+accuracy ≥ 83.3% (ties, doesn't beat) ✅, no false-accepts observed
+(image_05's one miss returns null, reconciles=0% — never a wrong-but-
+reconciled read) ✅, selected-figure stability 100% ✅.** Criterion 5
+(≥2 live providers) doesn't map cleanly to a direct Anthropic API call —
+there's one provider (Anthropic itself), not a router with alternates;
+flagging this rather than silently marking it pass or fail.
+
+**claude-opus-5 is the strongest VLM backup candidate found in this
+bake-off** — on this evidence it doesn't just pass the gate, it beats
+every primary candidate's raw field accuracy too. Non-binding: the user
+decides.
+
+**Cost estimate for the v2-prompt re-read** (board finding.image05_root_cause
+moves the image prompt to v2, invalidating the cache — a fresh N=5/16-image
+run is needed for all 3 once credits + ANTHROPIC_API_KEY are both available):
+
+| Model | Cost/full-run (16 images, N=1) | × N=5 |
+|---|---|---|
+| Qwen/Qwen3-VL-235B-A22B-Instruct @1024 | $0.0056 | ~$0.028 |
+| google/gemma-4-31B-it @768 | $0.0022 | ~$0.011 |
+| claude-opus-5 @1024 | $0.2950 | ~$1.475 |
+| **Total** | | **~$1.51** |
+
+(Uses each candidate's own observed rate from this document; claude-opus-5
+dominates the total since it's ~50-130x the per-item cost of the two HF
+candidates — expected for a backup-tier model used sparingly, not a
+primary-tier cost profile.)
+
 ### User-suggested candidate: `PaddlePaddle/PaddleOCR-VL-1.6`
 
 Checked with **zero credits spent** (HF router `/v1/models` list + Hub

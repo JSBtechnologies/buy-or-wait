@@ -578,11 +578,9 @@ fn image_call(
         seed: cfg.seed,
         max_tokens: cfg.max_tokens_vlm,
         json_response: candidate.supports_structured_output,
-        json_schema: if is_anthropic && candidate.supports_structured_output {
-            Some(buyorwait::anthropic::image_figures_json_schema())
-        } else {
-            None
-        },
+        // Claude no longer receives a structured-output schema (lead
+        // directive, extraction #281): prompt-only JSON for every backend.
+        json_schema: None,
     };
     // Rescore mode (--rescore-from-cache): read the existing cache, never
     // call the router/API. Used to re-run select()/reconciles() against
