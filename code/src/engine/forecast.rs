@@ -250,6 +250,34 @@ impl Forecast {
         }
     }
 
+    /// Flows that produce the trough, grouped by component (see `DecisionFacts::trough_drivers`).
+    pub fn trough_drivers(&self) -> Vec<super::facts::TroughDriver> {
+        use std::collections::BTreeMap;
+        let (_, tdate) = self.trough();
+        let mut groups: BTreeMap<(String, String, String), (Money, usize)> = BTreeMap::new();
+        for f in &self.flows {
+            let counts = f.date < tdate || (f.date == tdate && f.amount < Money::ZERO);
+            if f.date < self.start || !counts {
+                continue;
+            }
+            let (kind, component) = match &f.source {
+                FlowSource::Reserved { event_id } => ("reserved", event_id.clone()),
+                FlowSource::Scheduled { event_id } => ("scheduled", event_id.clone()),
+                FlowSource::Stream { stream_id } => ("stream", stream_id.clone()),
+                FlowSource::Evidence { record_id } => ("evidence", record_id.clone()),
+            };
+            let e = groups.entry((kind.to_string(), component, f.category.clone())).or_insert((Money::ZERO, 0));
+            e.0 += f.amount;
+            e.1 += 1;
+        }
+        let mut out: Vec<super::facts::TroughDriver> = groups
+            .into_iter()
+            .map(|((kind, component, category), (total, occurrences))| super::facts::TroughDriver { kind, component, category, total, occurrences })
+            .collect();
+        out.sort_by(|a, b| b.total.abs().cmp(&a.total.abs()).then(a.component.cmp(&b.component)));
+        out
+    }
+
     pub fn horizon_end(&self) -> NaiveDate {
         self.start + Duration::days(self.balance.len() as i64 - 1)
     }

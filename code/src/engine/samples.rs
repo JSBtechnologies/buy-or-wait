@@ -103,6 +103,8 @@ mod tests {
             match session.decide(&r.request_id, r.request_date, &RequestSpec::from_model(r), &opts) {
                 Ok(d) => {
                     *dist.entry(format!("{}/{}", d.row.affordability_status, d.row.recommended_payment_method)).or_default() += 1;
+                    let drivers: crate::engine::money::Money = d.facts.trough_drivers.iter().map(|t| t.total).sum();
+                    assert_eq!(d.facts.starting_balance + drivers, d.facts.trough_balance, "{} trough drivers do not reconcile", r.request_id);
                     if !d.facts.missing_amounts.is_empty() {
                         issues += 1;
                         let rows: Vec<String> = d.facts.missing_amounts.iter().map(|id| {

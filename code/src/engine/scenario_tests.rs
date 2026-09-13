@@ -295,3 +295,20 @@ fn malformed_forecast_facts_are_rejected_not_applied() {
     assert_eq!(kept, vec!["ok"]);
     assert_eq!(rejected, vec!["both", "no_rate", "nocat", "pct", "zero"]);
 }
+
+/// Trough drivers reconcile: starting balance + drivers == trough, and the trough day's
+/// credit (salary) is excluded because the trough is that day's pre-credit low.
+#[test]
+fn trough_drivers_reconcile_to_the_trough() {
+    let mut events = history(EventType::Income, "Payroll credit", "salary", Direction::Credit, 5000.0, 15, 1);
+    events.extend(history(EventType::Expense, "Monthly rent", "rent", Direction::Debit, 3000.0, 3, 11));
+    events.extend(history(EventType::Expense, "Clinic payment", "healthcare", Direction::Debit, 800.0, 15, 21));
+    let f = forecast_for(&events, "2025-08-01");
+    let (trough, tdate) = f.trough();
+    let drivers = f.trough_drivers();
+    let total: Money = drivers.iter().map(|d| d.total).sum();
+    assert_eq!(f.opening_balance + total, trough);
+    assert_eq!(tdate, d("2025-08-15"));
+    assert!(drivers.iter().all(|d| d.category != "salary"));
+    assert_eq!(drivers[0].category, "rent");
+}
