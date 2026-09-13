@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use buyorwait::engine::ledger::Fact;
 use buyorwait::engine::session::Session;
 use buyorwait::engine::types::{Event, PaymentOption, RateTable, RequestSpec};
 use buyorwait::engine::Rules;
@@ -268,8 +269,55 @@ fn decide_one(
                     model_ctx.config,
                     &typed_event,
                 ) {
-                    Ok(Some(record)) => facts.push(record),
-                    Ok(None) => {}
+                    Ok(resolution) => {
+                        let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {
+                            Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
+                            _ => None,
+                        });
+                        // Blocker #205 (verifier board:verify.image_agreement): persist every
+                        // attempted read's provenance, independent of whether it contributed to
+                        // the final evidence, so the agreement outcome is auditable. Runtime
+                        // store only (code/store/, gitignored), never shipped.
+                        let reads: Vec<serde_json::Value> = resolution
+                            .reads
+                            .iter()
+                            .map(|r| {
+                                let cutoff = (r.due_date.is_some()
+                                    || r.before_amount.is_some()
+                                    || r.after_amount.is_some())
+                                .then(|| {
+                                    serde_json::json!({
+                                        "due_date": r.due_date,
+                                        "before_amount": r.before_amount,
+                                        "after_amount": r.after_amount,
+                                    })
+                                });
+                                serde_json::json!({
+                                    "role": r.role,
+                                    "model_id": r.model_id,
+                                    "model_revision": r.model_revision,
+                                    "max_dim_px": r.max_dim_px,
+                                    "reconciled": r.reconciled,
+                                    "selected_amount": r.selected_amount,
+                                    "cutoff": cutoff,
+                                })
+                            })
+                            .collect();
+                        let provenance = serde_json::json!({
+                            "image_id": image.image_id,
+                            "event_id": typed_event.id,
+                            "class": resolution.class.clone().unwrap_or_default(),
+                            "reads": reads,
+                            "outcome": resolution.outcome,
+                            "accepted_amount": accepted_amount,
+                        });
+                        if let Err(e) = processed_store.save("image_reads", &image.image_id, &provenance) {
+                            eprintln!("vlm: failed to persist provenance for {}: {e:#}", image.image_id);
+                        }
+                        if let Some(record) = resolution.evidence {
+                            facts.push(record);
+                        }
+                    }
                     Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
                 }
             }
