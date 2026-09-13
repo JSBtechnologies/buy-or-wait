@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
 use crate::engine::money::Money;
 use crate::engine::types::{Event, EventType, Status};
-use crate::extract::model_config::{CandidateConfig, DecodingConfig};
+use crate::extract::model_config::{CandidateConfig, DecodingConfig, ModelsConfig, VlmMode};
 use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
 use crate::hf::{ContentPart, HfClient, ModelCall};
@@ -262,7 +262,15 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
     // partial payment / balance-owed scenario).
     if let (Some(paid), Some(total)) = (figures.amount_paid, figures.total) {
         any_ran = true;
-        if paid + ROUNDING_TOLERANCE_2TERM >= total {
+        // analyst audit #200 FA1 (image_02): the paid>=total "cash tendered, change given"
+        // shortcut falsely accepted a misread where paid (1,000,000) trivially exceeded
+        // total but the page also printed a real, non-zero balance_due -- i.e. this was
+        // actually an outstanding-balance scenario, not a fully-paid-with-change one. The
+        // shortcut now requires balance_due to be absent or ~0 (nothing left owing) AND
+        // paid to stay within a plausible cash-tendered range (under 2x total -- change
+        // given is normally a fraction of the total, never several times it).
+        let balance_clears = figures.balance_due.map_or(true, |b| b.abs() <= ROUNDING_TOLERANCE_2TERM);
+        if paid + ROUNDING_TOLERANCE_2TERM >= total && balance_clears && paid < 2.0 * total {
             any_passed = true;
         } else if let Some(bal) = figures.balance_due {
             if close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
@@ -319,24 +327,30 @@ fn normalize_currency(raw: &str) -> String {
     }
 }
 
+/// Reconcile + select a figure and resolve its currency, without building an
+/// `EvidenceRecord` yet — shared by the single-reader path (`to_evidence`) and the
+/// two-model agreement path (`resolve_blank_amount_agreement`), which needs the raw
+/// `(amount, currency)` from each reader before deciding whether to trust either one.
+fn selected_figure(figures: &ImageFigures, event: &Event) -> Option<(f64, String)> {
+    if !reconciles(figures, event) {
+        return None;
+    }
+    let amount = select(figures, event)?;
+    let currency = figures.currency.clone().unwrap_or_else(|| event.currency.clone());
+    Some((amount, currency))
+}
+
 /// Select, reconcile, and convert one image's transcription into a `Fact::EventAmount`.
 /// `None` when reconciliation fails or the needed figure is genuinely not on the page —
 /// the caller (store/preprocessing) is expected to escalate to a second read before giving
 /// up, per `code/prompts/image_transcription.v1.md`.
 pub fn to_evidence(image_id: &str, figures: &ImageFigures, event: &Event) -> Option<EvidenceRecord> {
-    if !reconciles(figures, event) {
-        return None;
-    }
-    let amount = select(figures, event)?;
+    let (amount, currency) = selected_figure(figures, event)?;
     Some(EvidenceRecord {
         record_id: image_id.to_string(),
         source: EvidenceSource::Image,
         observed_at: event.event_date.and_hms_opt(0, 0, 0)?,
-        fact: Fact::EventAmount {
-            event_id: event.id.clone(),
-            amount: Money::from_f64(amount),
-            currency: figures.currency.clone().unwrap_or_else(|| event.currency.clone()),
-        },
+        fact: Fact::EventAmount { event_id: event.id.clone(), amount: Money::from_f64(amount), currency },
     })
 }
 
@@ -387,17 +401,62 @@ fn call_vlm(
     Ok(serde_json::from_value(value)?)
 }
 
-/// End-to-end resolution for one blank-amount event with a linked image (PLAN.md §2.3):
-/// downscale, transcribe with the primary VLM, select + reconcile; on a reconciliation
-/// failure (or a malformed/unparseable reply), escalate once to the second configured
-/// model — a fresh read, not a retry of the same call — and try again. Still failing, or no
-/// escalation model configured: `None`. Never a guess, never a zero.
+/// End-to-end resolution for one blank-amount event with a linked image (PLAN.md §2.3,
+/// user decision `decision.vlm_setup`). Dispatches on `config.vlm_mode()`:
+/// - `Escalate`: the original primary -> escalation -> fallback chain, accepting the first
+///   reconciling read.
+/// - `Agreement`: two independent readers (chosen by `config.readers_for(event)`'s
+///   deterministic event-class routing) must select the same amount before it's trusted;
+///   `vlm_fallback` tiebreaks on disagreement or a missing reader.
 ///
-/// `vlm_primary`/`vlm_escalation` come from `ModelsConfig::vlm_primary()` /
-/// `vlm_escalation()` (`code/config/models.toml`'s `[selected]` table, PLAN.md Phase 2d) —
-/// when the user has not picked yet, the caller simply does not call this function; the
-/// model path is inactive by construction, not by a special case here.
+/// When the user has not picked a model yet (`[selected]` absent from
+/// `config/models.toml`), the caller simply does not call this function; the model path is
+/// inactive by construction, not by a special case here.
 pub fn resolve_blank_amount(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    image_max_dim_px: u32,
+    image_path: &Path,
+    image_id: &str,
+    config: &ModelsConfig,
+    event: &Event,
+) -> anyhow::Result<Option<EvidenceRecord>> {
+    match config.vlm_mode() {
+        VlmMode::Escalate => resolve_blank_amount_escalate(
+            client,
+            cold,
+            prompt,
+            &config.decoding,
+            image_max_dim_px,
+            image_path,
+            image_id,
+            config.vlm_primary(),
+            config.vlm_escalation(),
+            config.vlm_fallback(),
+            event,
+        ),
+        VlmMode::Agreement => resolve_blank_amount_agreement(
+            client,
+            cold,
+            prompt,
+            &config.decoding,
+            image_max_dim_px,
+            image_path,
+            image_id,
+            config,
+            event,
+        ),
+    }
+}
+
+/// The original chain: downscale, transcribe with the primary VLM, select + reconcile; on
+/// a reconciliation failure (or a malformed/unparseable reply), escalate once to the second
+/// configured model — a fresh read, not a retry of the same call — and try again, then the
+/// backup frontier model. Still failing, or nothing configured beyond primary: `None`.
+/// Never a guess, never a zero.
+#[allow(clippy::too_many_arguments)]
+fn resolve_blank_amount_escalate(
     client: &HfClient,
     cold: bool,
     prompt: &PromptSet,
@@ -405,15 +464,12 @@ pub fn resolve_blank_amount(
     image_max_dim_px: u32,
     image_path: &Path,
     image_id: &str,
-    vlm_primary: &CandidateConfig,
+    vlm_primary: Option<&CandidateConfig>,
     vlm_escalation: Option<&CandidateConfig>,
-    // User-requested backup frontier model (board decision, PLAN.md Phase 2d): tried after
-    // `vlm_escalation` also fails to reconcile, or when an earlier candidate's call itself
-    // errored (network/provider outage) rather than just producing a bad reconcile — both
-    // cases already collapse to `attempt` returning `Ok(None)` below.
     vlm_fallback: Option<&CandidateConfig>,
     event: &Event,
 ) -> anyhow::Result<Option<EvidenceRecord>> {
+    let Some(vlm_primary) = vlm_primary else { return Ok(None) };
     let image_b64 = downscale_and_encode(image_path, image_max_dim_px)?;
 
     let attempt = |candidate: &CandidateConfig| -> anyhow::Result<Option<EvidenceRecord>> {
@@ -432,6 +488,122 @@ pub fn resolve_blank_amount(
         }
     }
     Ok(None)
+}
+
+fn read_candidate(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    candidate: &CandidateConfig,
+    image_b64: &str,
+    image_id: &str,
+    event: &Event,
+) -> Option<(f64, String)> {
+    match call_vlm(client, cold, prompt, decoding, candidate, image_b64) {
+        Ok(figures) => selected_figure(&figures, event),
+        Err(e) => {
+            eprintln!("vlm: {image_id} via {}: {e:#}", candidate.id);
+            None
+        }
+    }
+}
+
+fn build_evidence(
+    image_id: &str,
+    event: &Event,
+    amount: f64,
+    currency: String,
+    agreeing_roles: &[&str],
+) -> EvidenceRecord {
+    EvidenceRecord {
+        // Provenance records which reader role(s) actually agreed on this figure (user
+        // decision `decision.vlm_setup`: "record which models agreed in the evidence
+        // record"). `record_id` is free-form provenance text, not a `Fact` field, so this
+        // needs no engine-side change.
+        record_id: format!("{image_id}#agree:{}", agreeing_roles.join("+")),
+        source: EvidenceSource::Image,
+        observed_at: event
+            .event_date
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_else(|| event.event_date.and_hms_opt(12, 0, 0).unwrap()),
+        fact: Fact::EventAmount { event_id: event.id.clone(), amount: Money::from_f64(amount), currency },
+    }
+}
+
+/// Two-model agreement (user decision `decision.vlm_setup`, board:verify.image_agree_preaudit):
+/// `config.readers_for(event)` routes this event's class (income/payslip, pending/scheduled
+/// bill, or settled expense/receipt — from `event_type`/`status`/`category`, never the
+/// model's own `doc_type`) to a pair of reader roles. Both read the image independently;
+/// if their selected amounts agree (within the documented rounding tolerance), that figure
+/// is trusted. On disagreement, or when one reader is missing/unreconciled, `vlm_fallback`
+/// tiebreaks: with one prior read, fallback must match it; with two that disagreed,
+/// fallback must match one of them; with neither having reconciled at all, fallback's own
+/// reconciling read is the only evidence available and is accepted alone. Any case fallback
+/// cannot resolve: `None` — never a guess.
+fn resolve_blank_amount_agreement(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    image_max_dim_px: u32,
+    image_path: &Path,
+    image_id: &str,
+    config: &ModelsConfig,
+    event: &Event,
+) -> anyhow::Result<Option<EvidenceRecord>> {
+    let Some((role_a, candidate_a, role_b, candidate_b)) = config.readers_for(event) else {
+        return Ok(None);
+    };
+    let image_b64 = downscale_and_encode(image_path, image_max_dim_px)?;
+
+    let read_a = read_candidate(client, cold, prompt, decoding, candidate_a, &image_b64, image_id, event);
+    let read_b = read_candidate(client, cold, prompt, decoding, candidate_b, &image_b64, image_id, event);
+
+    if let (Some((amt_a, cur_a)), Some((amt_b, _))) = (&read_a, &read_b) {
+        if close(*amt_a, *amt_b, ROUNDING_TOLERANCE_2TERM) {
+            return Ok(Some(build_evidence(image_id, event, *amt_a, cur_a.clone(), &[role_a, role_b])));
+        }
+    }
+
+    // Disagreement, or one/both readers missing/unreconciled: tiebreak with vlm_fallback.
+    let Some(fallback) = config.vlm_fallback() else { return Ok(None) };
+    let Some((amt_fb, cur_fb)) =
+        read_candidate(client, cold, prompt, decoding, fallback, &image_b64, image_id, event)
+    else {
+        return Ok(None);
+    };
+
+    match (&read_a, &read_b) {
+        (Some((amt_a, _)), Some((amt_b, _))) => {
+            if close(amt_fb, *amt_a, ROUNDING_TOLERANCE_2TERM) {
+                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_a, "vlm_fallback"])))
+            } else if close(amt_fb, *amt_b, ROUNDING_TOLERANCE_2TERM) {
+                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_b, "vlm_fallback"])))
+            } else {
+                Ok(None) // all three disagree -- never guess which is right
+            }
+        }
+        (Some((amt_a, _)), None) => {
+            if close(amt_fb, *amt_a, ROUNDING_TOLERANCE_2TERM) {
+                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_a, "vlm_fallback"])))
+            } else {
+                Ok(None)
+            }
+        }
+        (None, Some((amt_b, _))) => {
+            if close(amt_fb, *amt_b, ROUNDING_TOLERANCE_2TERM) {
+                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_b, "vlm_fallback"])))
+            } else {
+                Ok(None)
+            }
+        }
+        (None, None) => {
+            // Nothing to tiebreak against: fallback's own reconciling read is the only
+            // evidence available this run.
+            Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &["vlm_fallback"])))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -756,12 +928,12 @@ mod tests {
     #[test]
     #[ignore]
     fn resolve_blank_amount_image_01_live() {
-        let cfg = crate::extract::model_config::ModelsConfig::load(Path::new("config/models.toml"))
+        let cfg = ModelsConfig::load(Path::new("config/models.toml"))
             .expect("config/models.toml should parse");
-        let Some(vlm_primary) = cfg.vlm_primary() else {
+        if cfg.vlm_primary().is_none() {
             eprintln!("skipping: config/models.toml [selected].vlm_primary not set yet");
             return;
-        };
+        }
         let prompt = crate::extract::prompts::load(
             Path::new("prompts/image_transcription.v1.md"),
             "User prompt template",
@@ -773,13 +945,10 @@ mod tests {
             &client,
             false,
             &prompt,
-            &cfg.decoding,
             cfg.image_max_dim_px(),
             Path::new("../dataset/media/images/image_01.png"),
             "image_01",
-            vlm_primary,
-            cfg.vlm_escalation(),
-            cfg.vlm_fallback(),
+            &cfg,
             &event,
         )
         .expect("call should not error")
