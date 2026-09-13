@@ -1347,24 +1347,32 @@ pub fn resolve_blank_amount_ocr(
         _ => witness::FinalLabelScope::Whole,
     };
 
-    let (amount, fallback_witness) = match select(&figures, event) {
-        Some(amount) => (amount, None),
-        None => {
-            // User ruling `ruling.total_or_witnessed_sum` point 2: no total field is readable
-            // at all -- fall back to a witnessed line-item/charges sum before failing closed.
-            match witness::witnessed_line_item_sum(&figures, scope, ROUNDING_TOLERANCE_2TERM) {
-                Some((amount, kind)) => (amount, Some(kind)),
+    let selected = select(&figures, event);
+    if selected.is_none() {
+        prov.ocr_notes.push("no_final_label".to_string());
+    }
+
+    // User ruling `ruling.total_or_witnessed_sum` point 2: when no total field is readable
+    // at all, OR the printed total field select() found has no witness of its own (e.g. a
+    // parse artifact from a merged multi-column row), fall back to a witnessed line-item/
+    // charges sum before failing closed. Never lets the sum override a *witnessed* printed
+    // total -- only steps in when the primary candidate can't stand on its own.
+    let primary_witness = selected
+        .and_then(|amount| witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope).map(|hit| (amount, hit)));
+
+    let (amount, witness_hit) = match primary_witness {
+        Some((amount, hit)) => (amount, Some(hit)),
+        None => match witness::witnessed_line_item_sum(&figures, scope, ROUNDING_TOLERANCE_2TERM) {
+            Some((sum_amount, kind)) => (sum_amount, Some((kind, sum_amount))),
+            None => match selected {
+                Some(amount) => (amount, None),
                 None => {
-                    prov.ocr_notes.push("no_final_label".to_string());
                     return outcome("fail_closed", vec![prov], None);
                 }
-            }
-        }
+            },
+        },
     };
 
-    let witness_hit = fallback_witness
-        .map(|kind| (kind, amount))
-        .or_else(|| witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope));
     let contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
 
     prov.witness = witness_hit.map(|(kind, _)| kind.label().to_string());
