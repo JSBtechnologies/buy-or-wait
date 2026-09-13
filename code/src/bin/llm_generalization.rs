@@ -58,7 +58,7 @@ fn deepseek_fallback() -> CandidateConfig {
 }
 
 fn decoding() -> DecodingConfig {
-    DecodingConfig { temperature: 0.0, seed: 42, max_tokens_vlm: 1, max_tokens_llm: 4000 }
+    DecodingConfig { temperature: 0.0, seed: 42, max_tokens_llm: 4000 }
 }
 
 #[derive(Debug, Deserialize)]

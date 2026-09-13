@@ -60,9 +60,8 @@ pub struct ModelCall {
     pub max_tokens: u32,
     pub json_response: bool,
     /// Strict JSON Schema for structured output, when the backend needs the
-    /// actual schema rather than just "respond in JSON" (e.g. Anthropic's
-    /// `output_config.format.schema` — `crate::anthropic`). `None` for
-    /// backends that only need `json_response` as a boolean flag (HF's
+    /// actual schema rather than just "respond in JSON". `None` for backends
+    /// that only need `json_response` as a boolean flag (HF's
     /// `response_format: {"type": "json_object"}`).
     pub json_schema: Option<serde_json::Value>,
 }
@@ -125,9 +124,8 @@ fn content_hash(call: &ModelCall) -> String {
 }
 
 /// `sha256(content_hash + model_id + model_revision + prompt_version)` (PLAN.md
-/// §2.11). Shared by every backend (`HfClient`, `crate::anthropic::AnthropicClient`)
-/// so a call routed to a different provider for the same logical model/prompt
-/// still gets its own cache entry, and the formula never drifts between them.
+/// §2.11), so a call routed to a different provider for the same logical
+/// model/prompt still gets its own cache entry, and the formula never drifts.
 pub(crate) fn cache_key_for(call: &ModelCall) -> String {
     let content_hash = content_hash(call);
     let mut hasher = Sha256::new();
