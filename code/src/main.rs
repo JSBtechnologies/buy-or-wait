@@ -10,6 +10,7 @@ use buyorwait::engine::session::Session;
 use buyorwait::engine::types::{Event, PaymentOption, RateTable, RequestSpec};
 use buyorwait::engine::Rules;
 use buyorwait::evaluation::{Finding, ForecastSeries, InvariantViolation, Invariants};
+use buyorwait::extract::intake;
 use buyorwait::extract::messages::{deterministic_evidence, llm_evidence};
 use buyorwait::extract::model_config::ModelsConfig;
 use buyorwait::extract::prompts::{self, PromptSet};
@@ -18,6 +19,7 @@ use buyorwait::hf::{self, HfClient};
 use buyorwait::model;
 use buyorwait::store::cache::DiskCache;
 use buyorwait::store::processed::ProcessedStore;
+use chrono::NaiveDate;
 use serde::Deserialize;
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -28,6 +30,15 @@ fn main() -> anyhow::Result<ExitCode> {
     if args.get(1).map(String::as_str) == Some("verify") {
         let code = buyorwait::evaluation::cli(&args[2..])?;
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
+    }
+
+    // `buyorwait ask --user <id> --text "..."` is the interactive mode of PLAN.md §2.6: the
+    // request arrives as free text instead of `requests.csv` columns, so it goes through
+    // `extract::intake::parse_request_text` to build the same `RequestSpec` batch mode builds
+    // from columns. Not part of the graded batch pipeline above (never touches `output.csv`),
+    // and never runs with `[selected]` absent since it has no non-model path to a `RequestSpec`.
+    if args.get(1).map(String::as_str) == Some("ask") {
+        return run_ask(&args[2..]);
     }
 
     let mut cold = false;
@@ -211,6 +222,93 @@ fn main() -> anyhow::Result<ExitCode> {
     )?;
 
     eprintln!("model cache stats: {:?}", model_cache.stats());
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Interactive-mode entry point (PLAN.md §2.6): `buyorwait ask --user <id> --text "..." [--date
+/// YYYY-MM-DD]`. Requires an active `[selected]` `llm_primary` in `config/models.toml` --
+/// unlike batch mode, free text has no columns to fall back to, so with no model selected this
+/// prints a clear message instead of guessing a field.
+fn run_ask(args: &[String]) -> anyhow::Result<ExitCode> {
+    let mut user_id: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut date: Option<NaiveDate> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--user" => {
+                user_id = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--user needs a value"))?,
+                );
+            }
+            "--text" => {
+                text = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--text needs a value"))?,
+                );
+            }
+            "--date" => {
+                let s = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--date needs a value"))?;
+                date = Some(
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .map_err(|e| anyhow::anyhow!("--date {s:?}: {e}"))?,
+                );
+            }
+            other => anyhow::bail!("unexpected argument {other:?} (usage: ask --user <id> --text \"...\" [--date YYYY-MM-DD])"),
+        }
+    }
+    let user_id = user_id.ok_or_else(|| anyhow::anyhow!("ask needs --user <id>"))?;
+    let text = text.ok_or_else(|| anyhow::anyhow!("ask needs --text \"...\""))?;
+    let request_date = date.unwrap_or_else(|| chrono::Local::now().date_naive());
+
+    let dataset_dir = Path::new("../dataset");
+    let profiles = model::load_financial_profiles(dataset_dir.join("financial_profiles.csv"))?;
+    let events = model::load_financial_events(dataset_dir.join("financial_events.csv"))?;
+    let rates = model::load_exchange_rates(dataset_dir.join("exchange_rates.csv"))?;
+    let rates = Arc::new(RateTable::from_model(&rates));
+
+    let models_config = ModelsConfig::load(Path::new("config/models.toml"))?;
+    let Some(llm_primary) = models_config.llm_primary() else {
+        anyhow::bail!(
+            "interactive mode needs an active `[selected]` llm_primary in config/models.toml; \
+             none is configured yet (see PLAN.md §2.6 and board decision.selected_activation_question) -- \
+             batch mode (`cargo run --release`) is unaffected, it never needs a model for intake"
+        );
+    };
+    let client = HfClient::new()?;
+    let prompt = prompts::load(
+        Path::new("prompts/request_text_extraction.v1.md"),
+        "User prompt template",
+    )?;
+
+    let Some(spec) = intake::parse_request_text(&client, false, &prompt, &models_config.decoding, llm_primary, &text)?
+    else {
+        eprintln!(
+            "could not ground amount, deadline, and type in the request text -- \
+             refusing to guess a decision-affecting default"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let session = Session::from_model(&user_id, &profiles, &events, rates, Rules::default())?;
+    // No `request_payment_options.csv` row exists for an ad hoc text request, so only the
+    // full-payment/wait/spending-change candidates (PLAN.md §2.8) are considered; no
+    // installment option can be offered.
+    let decision = session.decide("ask", request_date, &spec, &[])?;
+    let row = decision.row;
+    println!("amount_safe_to_pay: {}", row.amount_safe_to_pay);
+    println!("affordability_status: {}", row.affordability_status);
+    println!("recommended_payment_method: {}", row.recommended_payment_method);
+    println!("payment_plan: {}", row.payment_plan);
+    println!("earliest_date_for_full_payment: {}", row.earliest_date_for_full_payment);
+    println!("spending_changes_needed: {}", row.spending_changes_needed);
+    println!("decision_explanation: {}", row.decision_explanation);
 
     Ok(ExitCode::SUCCESS)
 }
