@@ -73,9 +73,23 @@ pub struct Selected {
     /// Candidate id from `[[candidates.llm]]` for a backup frontier model, tried when
     /// `llm_primary`'s call fails or its reply doesn't parse into valid records.
     pub llm_fallback: Option<String>,
+    /// Candidate id from `[[candidates.llm]]` for interactive `ask` intake only (free text ->
+    /// request JSON). Kept separate from `llm_primary` so enabling ask mode never turns on the
+    /// message-extraction model path in the batch pipeline.
+    pub intake_llm: Option<String>,
 }
 
 impl ModelsConfig {
+    /// The model `ask` uses to turn free text into a request: `[selected].intake_llm`, else
+    /// `llm_primary`.
+    pub fn intake_llm(&self) -> Option<&CandidateConfig> {
+        self.selected
+            .intake_llm
+            .as_deref()
+            .and_then(|id| self.find_llm(id))
+            .or_else(|| self.llm_primary())
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))

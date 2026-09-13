@@ -454,6 +454,17 @@ Point `OCR_BASE_URL` at it (e.g. `https://<pod>-8000.proxy.runpod.net/v1`). With
 set, ingestion is skipped (not a hard error) and the batch pipeline still runs on
 whatever is already cached.
 
+### Interactive ask mode (free text)
+
+`ask` turns a free-text question into the same request structure with **Qwen/Qwen3-235B-A22B-Instruct-2507** (via the Hugging Face router; set `HF_TOKEN`), then applies the **same evidence as batch**: this user's messages (deterministic parse + grounding) and this user's receipt figures from the OCR cache (witness gate). It is enabled by `[selected] intake_llm` in `config/models.toml`, which is kept separate from `llm_primary`, so batch message extraction stays model-free and `output.csv` is unchanged.
+
+```bash
+CARGO_TARGET_DIR=target cargo run --release -- ask --user user_64 --date 2024-06-04   --text "Can I buy a new sofa for 63,700 rupees? I need it by 16 August 2024 and I can't split the payment."
+# ask: image_10 -> event_6033 79679.26 INR (witness_accept)
+# amount_safe_to_pay: 0 | not_affordable | not_recommended   (identical to the batch row for request_64)
+```
+Ad hoc questions have no `request_payment_options.csv` row, so installments are not offered in ask mode. If the amount, deadline or request type can't be grounded in the text, it refuses to answer rather than guessing.
+
 ### Verify
 
 The verifier's contract/invariant/scoring checks are reachable as a subcommand of the

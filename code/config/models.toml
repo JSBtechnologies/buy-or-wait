@@ -140,3 +140,8 @@ alt_providers = [
 ]
 notes = "Cheapest LLM candidate overall on deepinfra; many redundant live providers if deepinfra is degraded."
 
+
+# Interactive ask mode only: free-text request -> request JSON (extract::intake).
+# Separate from llm_primary, so the batch pipeline stays model-free for messages.
+[selected]
+intake_llm = "Qwen/Qwen3-235B-A22B-Instruct-2507"

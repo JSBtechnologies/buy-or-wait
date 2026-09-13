@@ -56,10 +56,17 @@ pub fn parse_request_text(
         if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
     let value = parse_json_reply(&response.raw_text)?;
     let fields: RequestTextFields = serde_json::from_value(value)?;
+    let deadline_ok = fields.deadline.as_deref().is_some_and(|d| parse_deadline(d).is_some());
+    if fields.amount.is_none() || !deadline_ok || fields.request_type.is_none() {
+        eprintln!(
+            "intake: ungrounded fields -- amount={:?} deadline={:?} type={:?}",
+            fields.amount, fields.deadline, fields.request_type
+        );
+    }
 
     let spec = (|| {
         let amount = fields.amount?;
-        let deadline = chrono::NaiveDate::parse_from_str(fields.deadline.as_deref()?, "%Y-%m-%d").ok()?;
+        let deadline = parse_deadline(fields.deadline.as_deref()?)?;
         let request_type = fields.request_type?;
         Some(RequestSpec {
             amount: Money::from_f64(amount),
@@ -70,4 +77,30 @@ pub fn parse_request_text(
     })();
 
     Ok(spec)
+}
+
+/// Deadline as the model returned it: ISO `YYYY-MM-DD` first, then an unambiguous written date
+/// ("13 February 2023", "13 Feb 2023", "February 13, 2023"). Numeric day/month forms are not
+/// guessed here -- an ambiguous date stays ungrounded.
+fn parse_deadline(raw: &str) -> Option<chrono::NaiveDate> {
+    let s = raw.trim();
+    ["%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%d-%b-%Y"]
+        .iter()
+        .find_map(|f| chrono::NaiveDate::parse_from_str(s, f).ok())
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::parse_deadline;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn written_and_iso_deadlines_parse_but_numeric_day_month_does_not() {
+        let d = NaiveDate::from_ymd_opt(2023, 2, 13);
+        assert_eq!(parse_deadline("2023-02-13"), d);
+        assert_eq!(parse_deadline("13 February 2023"), d);
+        assert_eq!(parse_deadline("13 Feb 2023"), d);
+        assert_eq!(parse_deadline("February 13, 2023"), d);
+        assert_eq!(parse_deadline("13/02/2023"), None);
+    }
 }

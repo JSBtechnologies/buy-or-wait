@@ -326,10 +326,9 @@ fn run_ask(args: &[String]) -> anyhow::Result<ExitCode> {
     let rates = Arc::new(RateTable::from_model(&rates));
 
     let models_config = ModelsConfig::load(Path::new("config/models.toml"))?;
-    let Some(llm_primary) = models_config.llm_primary() else {
+    let Some(llm_primary) = models_config.intake_llm() else {
         anyhow::bail!(
-            "interactive mode needs an active `[selected]` llm_primary in config/models.toml; \
-             none is configured yet (see PLAN.md §2.6 and board decision.selected_activation_question) -- \
+            "interactive mode needs `[selected] intake_llm` (or llm_primary) in config/models.toml -- \
              batch mode (`cargo run --release`) is unaffected, it never needs a model for intake"
         );
     };
@@ -348,7 +347,51 @@ fn run_ask(args: &[String]) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     };
 
-    let session = Session::from_model(&user_id, &profiles, &events, rates, Rules::default())?;
+    let mut session = Session::from_model(&user_id, &profiles, &events, rates, Rules::default())?;
+
+    // Same evidence as batch `decide_one`: this user's messages (deterministic parse +
+    // grounding) and this user's blank-amount receipt figures from the OCR cache (witness
+    // gate). Without it an ad hoc answer would ignore e.g. a pending bill read from an image
+    // and come out over-optimistic.
+    let messages = model::load_messages(dataset_dir.join("messages.csv"))?;
+    let images_csv = model::load_images(dataset_dir.join("images.csv"))?;
+    let evidence = retrieval::for_user(&user_id, request_date, &messages, &[]);
+    let home_currency = session.profile().home_currency.clone();
+    let mut facts = deterministic_evidence(&evidence.messages, &home_currency);
+    let message_facts = facts.len();
+    let user_images: Vec<&model::Image> = images_csv.iter().filter(|i| i.user_id == user_id).collect();
+    if !user_images.is_empty() {
+        match OcrConfig::from_env().and_then(|c| OcrClient::new(c, Path::new("store").join("ocr"))) {
+            Ok(ocr_client) => {
+                for event in events.iter().filter(|e| e.user_id == user_id && e.amount.is_none()) {
+                    let Some(image) = user_images.iter().find(|i| i.related_event_id == event.event_id) else {
+                        continue;
+                    };
+                    let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+                    let (Ok(ocr_result), Ok(typed_event)) =
+                        (ocr_client.ingest(&image.image_id, &image_path, false), Event::from_model(event))
+                    else {
+                        eprintln!("ask: {} could not be read from the OCR cache/endpoint; amount stays missing", image.image_id);
+                        continue;
+                    };
+                    let resolution = images::resolve_blank_amount_ocr(&ocr_result, &image.image_id, &typed_event);
+                    match &resolution.evidence {
+                        Some(record) => {
+                            if let Fact::EventAmount { amount, currency, .. } = &record.fact {
+                                eprintln!("ask: {} -> {} {} {} ({})", image.image_id, event.event_id, amount.to_f64(), currency, resolution.outcome);
+                            }
+                            facts.push(record.clone());
+                        }
+                        None => eprintln!("ask: {} -> {} fail_closed", image.image_id, event.event_id),
+                    }
+                }
+            }
+            Err(e) => eprintln!("ask: OCR not configured ({e:#}); image amounts stay missing"),
+        }
+    }
+    eprintln!("ask: applied {} message facts + {} image facts", message_facts, facts.len() - message_facts);
+    session.apply_evidence(facts);
+
     // No `request_payment_options.csv` row exists for an ad hoc text request, so only the
     // full-payment/wait/spending-change candidates (PLAN.md §2.8) are considered; no
     // installment option can be offered.
