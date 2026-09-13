@@ -666,6 +666,7 @@ pub fn extract_batch(
         seed: decoding.seed,
         max_tokens: decoding.max_tokens_llm,
         json_response: candidate.supports_structured_output,
+        json_schema: None,
     };
     let response =
         if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };

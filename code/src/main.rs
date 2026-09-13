@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use buyorwait::anthropic::AnthropicClient;
 use buyorwait::engine::ledger::Fact;
 use buyorwait::engine::session::Session;
 use buyorwait::engine::types::{Event, PaymentOption, RateTable, RequestSpec};
@@ -119,6 +120,10 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         None
     };
+    // Backup frontier model for the VLM agreement tiebreak (decision.claude_backup). Also
+    // only constructed when a model is actually selected; ANTHROPIC_API_KEY may be unset
+    // even then, in which case the tiebreak path is simply unavailable this run.
+    let anthropic_client: Option<AnthropicClient> = if use_models { AnthropicClient::new().ok() } else { None };
     let image_prompt = if models_config.vlm_primary().is_some() && hf_client.is_some() {
         Some(prompts::load(Path::new("prompts/image_transcription.v1.md"), "User prompt template")?)
     } else {
@@ -132,6 +137,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let model_ctx = ModelContext {
         config: &models_config,
         client: hf_client.as_ref(),
+        anthropic: anthropic_client.as_ref(),
         cold,
         image_prompt: image_prompt.as_ref(),
         message_prompt: message_prompt.as_ref(),
@@ -193,7 +199,10 @@ fn main() -> anyhow::Result<ExitCode> {
     // into `decide_one`); `write_usage_report` still renders every required section with
     // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
     let pricing = load_pricing(Path::new("config/models.toml"))?;
-    let usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
+    let mut usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
+    if let Some(client) = anthropic_client.as_ref() {
+        usage_records.extend(client.usage_records());
+    }
     hf::write_usage_report(
         Path::new("evaluation/usage_report.md"),
         &usage_records,
@@ -212,6 +221,7 @@ fn main() -> anyhow::Result<ExitCode> {
 struct ModelContext<'a> {
     config: &'a ModelsConfig,
     client: Option<&'a HfClient>,
+    anthropic: Option<&'a AnthropicClient>,
     cold: bool,
     image_prompt: Option<&'a PromptSet>,
     message_prompt: Option<&'a PromptSet>,
@@ -261,6 +271,7 @@ fn decide_one(
                 // two-model agreement) internally now, per extraction's decision.vlm_setup.
                 match images::resolve_blank_amount(
                     client,
+                    model_ctx.anthropic,
                     model_ctx.cold,
                     prompt,
                     image_max_dim_px,

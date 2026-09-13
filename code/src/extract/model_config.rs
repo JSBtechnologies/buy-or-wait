@@ -137,7 +137,16 @@ pub struct VlmRouteClass {
     /// Event categories ("salary", "rent", ...). Empty = any.
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Exactly two primary readers.
     pub readers: Vec<ReaderSpec>,
+    /// The tiebreak reader, called only on disagreement (or a missing/unreconciled primary
+    /// read). User decision `decision.tiebreak_distinct` (analyst audit #215/#219): MUST be
+    /// a distinct role from both `readers` entries -- a class whose tiebreak is one of its
+    /// own primary readers lets that single model "tiebreak" against its own cached answer
+    /// and decide alone (the image_05 false-accept: Kimi read 704.05, Kimi-as-its-own-
+    /// tiebreak matched it 5/5). Enforced at `ModelsConfig::load()` (hard error), not at
+    /// call time, so a misconfigured class can never silently self-tiebreak.
+    pub tiebreak: ReaderSpec,
 }
 
 /// One reader slot in a route class: a role key plus its OWN resolution/token budget
@@ -189,9 +198,26 @@ pub struct ReaderPick<'a> {
 pub struct VlmRoutingConfig {
     #[serde(default)]
     pub default_class: Option<String>,
+    /// Rounding tolerance (currency units) for cross-model agreement/tiebreak matching in
+    /// `extract::images`'s `resolve_blank_amount_agreement` -- how close two readers' (or a
+    /// reader and the tiebreak's) selected amounts must be to count as a match. Distinct
+    /// from `images::ROUNDING_TOLERANCE_2TERM`, which is a fixed accounting-precision
+    /// constant for a document's OWN internal arithmetic (subtotal+tax=total); this one
+    /// governs how strict cross-model agreement is, so it is user/config tunable but capped:
+    /// verifier gate #250 and board decision `decision.accuracy_first` (0 false accepts is a
+    /// hard sign-off gate) require it never exceed the documented default of 1.0 -- a looser
+    /// tolerance would accept more disagreeing reads as "agreeing". Enforced at
+    /// `ModelsConfig::load()` (hard error), defaults to 1.0 when unset.
+    #[serde(default)]
+    pub tolerance: Option<f64>,
     #[serde(default)]
     pub classes: Vec<VlmRouteClass>,
 }
+
+/// Default/maximum cross-model agreement tolerance (verifier gate #250,
+/// `decision.accuracy_first`): 0.5 currency units per side, so two independently rounded
+/// reads of the same figure can still agree.
+const MAX_AGREEMENT_TOLERANCE: f64 = 1.0;
 
 /// Built-in routing (user decision `decision.vlm_setup`): a linked event classifies as
 /// deterministic income/payslip, pending-or-scheduled bill, or settled expense/receipt —
@@ -214,6 +240,7 @@ impl Default for VlmRoutingConfig {
         // preamble, handled by `crate::extract::parse_json_reply`.
         VlmRoutingConfig {
             default_class: Some("settled_expense_receipt".to_string()),
+            tolerance: None,
             classes: vec![
                 VlmRouteClass {
                     name: "income_payslip".to_string(),
@@ -224,19 +251,24 @@ impl Default for VlmRoutingConfig {
                         ReaderSpec::with("vlm_primary", 1024, 400),
                         ReaderSpec::with("vlm_escalation", 768, 400),
                     ],
+                    tiebreak: ReaderSpec::with("vlm_fallback", 1024, 1500),
                 },
                 VlmRouteClass {
                     name: "pending_bill_due_date".to_string(),
                     event_types: vec![],
                     statuses: vec!["pending".to_string(), "scheduled".to_string()],
                     categories: vec![],
-                    // gemma excluded (analyst pre-audit board:verify.image_agree_preaudit:
-                    // drops due-date fields on this shape 4/4, falls back to the pre-cutoff
-                    // amount even when the settlement date is past it).
+                    // User decision decision.tiebreak_distinct (analyst #215/#219): primary
+                    // pair is 235B + Kimi-K3 (gemma drops due-date fields on this shape 4/4,
+                    // per the earlier pre-audit); tiebreak is gemma instead of Kimi again --
+                    // Kimi-as-its-own-tiebreak was the exact image_05 false accept (5/5,
+                    // Kimi read 704.05, matched itself). gemma's tiebreak vote only counts
+                    // if it also satisfies the resolved cutoff (images.rs).
                     readers: vec![
                         ReaderSpec::with("vlm_primary", 1024, 400),
                         ReaderSpec::with("vlm_fallback", 1024, 1500),
                     ],
+                    tiebreak: ReaderSpec::with("vlm_escalation", 768, 400),
                 },
                 VlmRouteClass {
                     name: "settled_expense_receipt".to_string(),
@@ -247,6 +279,7 @@ impl Default for VlmRoutingConfig {
                         ReaderSpec::with("vlm_primary", 1024, 400),
                         ReaderSpec::with("vlm_escalation", 768, 400),
                     ],
+                    tiebreak: ReaderSpec::with("vlm_fallback", 1024, 1500),
                 },
             ],
         }
@@ -257,7 +290,64 @@ impl Default for VlmRoutingConfig {
 impl ModelsConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let cfg: ModelsConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate_vlm_routing()
+            .with_context(|| format!("validating [vlm_routing] in {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// User decision `decision.tiebreak_distinct` (analyst #215/#219): a class's `tiebreak`
+    /// reader must be a genuinely distinct model from both of its primary `readers` — hard
+    /// error at load time, not a runtime skip, so a misconfigured class can never silently
+    /// self-tiebreak (the image_05 false accept: Kimi read 704.05, Kimi-as-its-own-tiebreak
+    /// matched it 5/5, deciding alone). Checked both by role name (structural) and by the
+    /// candidate id each role resolves to today (in case two different role keys happen to
+    /// point at the same underlying model in `[selected]`) — the latter check is skipped for
+    /// a role that doesn't resolve yet (an unset `[selected]` entry is a valid, inactive
+    /// config state, not a distinctness violation).
+    fn validate_vlm_routing(&self) -> Result<()> {
+        if let Some(tolerance) = self.vlm_routing.tolerance {
+            if !(0.0..=MAX_AGREEMENT_TOLERANCE).contains(&tolerance) {
+                anyhow::bail!(
+                    "[vlm_routing].tolerance must be in [0.0, {MAX_AGREEMENT_TOLERANCE}], got {tolerance} -- decision.accuracy_first requires 0 false accepts, and a looser cross-model agreement tolerance accepts more disagreeing reads as a match"
+                );
+            }
+        }
+        for class in &self.vlm_routing.classes {
+            if class.readers.len() != 2 {
+                anyhow::bail!(
+                    "[vlm_routing] class '{}' must have exactly two primary readers, found {}",
+                    class.name,
+                    class.readers.len()
+                );
+            }
+            for reader in &class.readers {
+                if reader.role == class.tiebreak.role {
+                    anyhow::bail!(
+                        "[vlm_routing] class '{}': tiebreak role '{}' duplicates a primary reader role -- decision.tiebreak_distinct requires the tiebreak to be a distinct model from both primary readers",
+                        class.name,
+                        class.tiebreak.role
+                    );
+                }
+            }
+            if let Some(tb_candidate) = self.resolve_role(&class.tiebreak.role) {
+                for reader in &class.readers {
+                    if let Some(reader_candidate) = self.resolve_role(&reader.role) {
+                        if reader_candidate.id == tb_candidate.id {
+                            anyhow::bail!(
+                                "[vlm_routing] class '{}': tiebreak role '{}' resolves to the same model ('{}') as primary reader role '{}' -- decision.tiebreak_distinct requires a genuinely distinct model",
+                                class.name,
+                                class.tiebreak.role,
+                                tb_candidate.id,
+                                reader.role
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn vlm_primary(&self) -> Option<&CandidateConfig> {
@@ -289,6 +379,13 @@ impl ModelsConfig {
 
     pub fn image_max_dim_px(&self) -> u32 {
         self.selected.image_max_dim_px.unwrap_or(1024)
+    }
+
+    /// Cross-model agreement/tiebreak matching tolerance (verifier gate #250): `[vlm_routing]
+    /// .tolerance` if set, else `MAX_AGREEMENT_TOLERANCE` (1.0). Validated at `load()` to
+    /// never exceed that ceiling.
+    pub fn agreement_tolerance(&self) -> f64 {
+        self.vlm_routing.tolerance.unwrap_or(MAX_AGREEMENT_TOLERANCE)
     }
 
     pub fn vlm_mode(&self) -> VlmMode {
@@ -339,6 +436,16 @@ impl ModelsConfig {
         let a = class.readers.first()?;
         let b = class.readers.get(1)?;
         Some((self.resolve_pick(a)?, self.resolve_pick(b)?))
+    }
+
+    /// This event's route class's tiebreak reader (user decision `decision.tiebreak_distinct`)
+    /// — a genuinely distinct model from both of `readers_for`'s primary readers, enforced at
+    /// `load()`. `None` when the class isn't found or the tiebreak role doesn't resolve to a
+    /// configured candidate (never guesses a reader).
+    pub fn tiebreak_for(&self, event: &Event) -> Option<ReaderPick<'_>> {
+        let class_name = self.classify_event(event);
+        let class = self.vlm_routing.classes.iter().find(|c| c.name == class_name)?;
+        self.resolve_pick(&class.tiebreak)
     }
 
     fn resolve_pick<'a>(&'a self, spec: &'a ReaderSpec) -> Option<ReaderPick<'a>> {
@@ -547,6 +654,120 @@ mod tests {
         let (a, b) = cfg.readers_for(&settled).expect("pair resolves");
         assert_eq!((a.role, b.role), ("vlm_primary", "vlm_escalation"));
         assert_eq!((a.max_dim_px, b.max_dim_px), (1024, 768));
+    }
+
+    /// User decision `decision.tiebreak_distinct`: each class's tiebreak reader is distinct
+    /// from its own primary pair -- pending/scheduled bills tiebreak with gemma (not Kimi
+    /// again, which was the image_05 self-tiebreak false accept), everything else tiebreaks
+    /// with Kimi-K3.
+    #[test]
+    fn builtin_routing_resolves_a_tiebreak_distinct_from_its_own_readers() {
+        use crate::engine::types::{EventType, Status};
+        let cfg = minimal_cfg_with_selected();
+
+        let payslip = event_with(EventType::Income, Status::Settled, "salary");
+        let tb = cfg.tiebreak_for(&payslip).expect("tiebreak resolves");
+        assert_eq!(tb.role, "vlm_fallback");
+
+        let pending_bill = event_with(EventType::Expense, Status::Pending, "utilities");
+        let (a, b) = cfg.readers_for(&pending_bill).expect("pair resolves");
+        let tb = cfg.tiebreak_for(&pending_bill).expect("tiebreak resolves");
+        assert_eq!(tb.role, "vlm_escalation");
+        assert_ne!(tb.candidate.id, a.candidate.id);
+        assert_ne!(tb.candidate.id, b.candidate.id);
+
+        let settled = event_with(EventType::Expense, Status::Settled, "groceries");
+        let tb = cfg.tiebreak_for(&settled).expect("tiebreak resolves");
+        assert_eq!(tb.role, "vlm_fallback");
+        assert_eq!(tb.max_tokens, 1500);
+    }
+
+    /// User decision `decision.tiebreak_distinct` (analyst #215/#219): the built-in
+    /// `Default` routing must itself pass validation -- it is the fallback that applies
+    /// whenever `[vlm_routing]` is absent from `models.toml`, so a broken default would
+    /// silently disable the whole image path.
+    #[test]
+    fn builtin_default_routing_passes_distinctness_validation() {
+        let cfg = minimal_cfg_with_selected();
+        cfg.validate_vlm_routing().expect("built-in Default routing must be internally distinct");
+    }
+
+    /// A `[vlm_routing]` class whose `tiebreak` role names one of its own two primary
+    /// `readers` must be a hard load-time error -- this is the exact shape of the image_05
+    /// false accept (analyst #214/#219): Kimi read 704.05, then "tiebreak"-called Kimi again,
+    /// which trivially matched its own cached answer and decided alone.
+    #[test]
+    fn tiebreak_duplicating_a_primary_reader_role_is_a_hard_error() {
+        let cfg: ModelsConfig = toml::from_str(
+            r#"
+            [decoding]
+            temperature = 0.0
+            seed = 42
+            max_tokens_vlm = 400
+            max_tokens_llm = 300
+            [image_preprocessing]
+            candidate_max_dimensions_px = [1024]
+            [candidates]
+            vlm = []
+            llm = []
+            [[vlm_routing.classes]]
+            name = "bad_class"
+            [[vlm_routing.classes.readers]]
+            role = "vlm_primary"
+            [[vlm_routing.classes.readers]]
+            role = "vlm_escalation"
+            [vlm_routing.classes.tiebreak]
+            role = "vlm_primary"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.validate_vlm_routing().expect_err("self-tiebreak by role must be rejected");
+        assert!(err.to_string().contains("duplicates a primary reader role"), "{err}");
+    }
+
+    /// Even when the tiebreak role KEY differs from both reader role keys, if `[selected]`
+    /// happens to point two different role keys at the same underlying candidate id, that is
+    /// still a self-tiebreak in substance and must be rejected too.
+    #[test]
+    fn tiebreak_resolving_to_the_same_candidate_id_as_a_reader_is_a_hard_error() {
+        let cfg: ModelsConfig = toml::from_str(
+            r#"
+            [decoding]
+            temperature = 0.0
+            seed = 42
+            max_tokens_vlm = 400
+            max_tokens_llm = 300
+            [image_preprocessing]
+            candidate_max_dimensions_px = [1024]
+            [selected]
+            vlm_primary = "vendor/Same"
+            vlm_escalation = "vendor/Other"
+            vlm_fallback = "vendor/Same"
+            [candidates]
+            llm = []
+            [[candidates.vlm]]
+            id = "vendor/Same"
+            provider = "p1"
+            model_revision = "rev1"
+            [[candidates.vlm]]
+            id = "vendor/Other"
+            provider = "p2"
+            model_revision = "rev2"
+            [[vlm_routing.classes]]
+            name = "bad_class"
+            [[vlm_routing.classes.readers]]
+            role = "vlm_primary"
+            [[vlm_routing.classes.readers]]
+            role = "vlm_escalation"
+            [vlm_routing.classes.tiebreak]
+            role = "vlm_fallback"
+            "#,
+        )
+        .unwrap();
+        let err = cfg
+            .validate_vlm_routing()
+            .expect_err("self-tiebreak by resolved candidate id must be rejected");
+        assert!(err.to_string().contains("resolves to the same model"), "{err}");
     }
 
     #[test]
