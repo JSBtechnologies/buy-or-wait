@@ -28,8 +28,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use buyorwait::engine::ledger::Fact;
+use buyorwait::engine::types::Event as ProdEvent;
 use buyorwait::extract::images::{self as prod_images, ImageFigures};
+use buyorwait::extract::model_config::ModelsConfig as ProdModelsConfig;
+use buyorwait::extract::prompts as prod_prompts;
 use buyorwait::hf::{ContentPart, HfClient, ModelCall, Usage};
+use buyorwait::model as prod_model;
 use chrono::NaiveDate;
 use serde::Deserialize;
 use serde_json::Value;
@@ -1281,8 +1286,271 @@ fn splice_into_bakeoff_md(out_path: &Path, new_section: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Live N=5 witness-gate sweep (image_accuracy_plan.md §"Live N=5" / Phase A DONE
+// criteria): runs the REAL production path (`extract::images::resolve_blank_amount_
+// numbered_run`, the same function main.rs's pipeline calls) against every blank-
+// amount event's linked image, `--runs` (default 5) times each, with every raw model
+// response persisted per run (`hf::HfClient::chat_completion_cold_numbered`, no cache
+// replay). Usage: `cargo run --release --bin bakeoff -- --live-n5 [--runs 5]
+// [--config config/models.toml] [--dataset-dir ../dataset] [--prompts-dir prompts]
+// [--cache-dir store/bakeoff_live_n5] [--out ../docs/bakeoff.md]`.
+// ---------------------------------------------------------------------------
+
+/// One attempted resolution of one image on one run.
+struct LiveRunRow {
+    image_id: String,
+    run_idx: u32,
+    reads_used: usize,
+    normalized_figure: Option<f64>,
+    witness: Option<String>,
+    outcome: String,
+    total_tokens: u64,
+}
+
+/// `[selected]` injected HF-only for Phase A (image_accuracy_plan.md §2, RULES.md S8: no
+/// Claude dependency) -- matches the values recorded, but not yet activated, in
+/// `config/models.toml`'s "PENDING ACTIVATION" comment block (integrator's work item 1
+/// activates them for real). Injected into a LOCAL copy of the config so this sweep never
+/// depends on (or mutates) the committed file's activation state.
+const LIVE_N5_SELECTED_BLOCK: &str = r#"
+[selected]
+vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+vlm_escalation = "google/gemma-4-31B-it"
+vlm_mode = "agreement"
+image_max_dim_px = 1024
+llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
+"#;
+
+fn run_live_n5(args: &Args) -> Result<()> {
+    fs::create_dir_all(&args.cache_dir)?;
+
+    let base_config_text = fs::read_to_string(&args.config)
+        .with_context(|| format!("reading {}", args.config.display()))?;
+    let injected_config_text = format!("{base_config_text}\n{LIVE_N5_SELECTED_BLOCK}");
+    let live_config_path = args.cache_dir.join("_live_n5_models.toml");
+    fs::write(&live_config_path, &injected_config_text)
+        .with_context(|| format!("writing {}", live_config_path.display()))?;
+    let prod_cfg = ProdModelsConfig::load(&live_config_path)
+        .context("loading the [selected]-injected config for the live N=5 sweep")?;
+
+    let events = prod_model::load_financial_events(args.dataset_dir.join("financial_events.csv"))
+        .context("loading financial_events.csv")?;
+    let images_csv = prod_model::load_images(args.dataset_dir.join("images.csv"))
+        .context("loading images.csv")?;
+
+    struct Target {
+        image_id: String,
+        image_path: PathBuf,
+        event: ProdEvent,
+        user_id: String,
+    }
+    let mut targets: Vec<Target> = Vec::new();
+    for event in &events {
+        if event.amount.is_some() {
+            continue;
+        }
+        let Some(image) = images_csv.iter().find(|i| i.related_event_id == event.event_id) else {
+            continue;
+        };
+        let Ok(typed) = ProdEvent::from_model(event) else { continue };
+        let image_path = args.dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+        targets.push(Target { image_id: image.image_id.clone(), image_path, event: typed, user_id: event.user_id.clone() });
+    }
+    targets.sort_by(|a, b| a.image_id.cmp(&b.image_id));
+
+    eprintln!(
+        "live N=5: {} blank-amount images with a linked image row, {} runs each ({})",
+        targets.len(),
+        args.runs,
+        live_config_path.display()
+    );
+
+    // image_accuracy_plan.md §"Live N=5": check HF credits/router reachability BEFORE a run
+    // that may fire up to `images * up-to-4-reads * runs` paid completion calls.
+    let client = HfClient::with_cache_dir(&args.cache_dir)?
+        .with_request_timeout(90)?
+        .with_retry_policy(3, 1000, 2.0, 8000);
+    client
+        .check_router_reachable()
+        .context("HF router pre-flight check failed -- aborting before the live N=5 sweep")?;
+
+    let prompt = prod_prompts::load(&args.prompts_dir.join("image_transcription.v3.md"), "User prompt template")
+        .context("loading prompt v3")?;
+
+    let mut rows: Vec<LiveRunRow> = Vec::new();
+    for target in &targets {
+        let history: Vec<ProdEvent> = events
+            .iter()
+            .filter(|e| e.user_id == target.user_id)
+            .filter_map(|e| ProdEvent::from_model(e).ok())
+            .collect();
+
+        for run_idx in 0..args.runs {
+            let before = client.usage_records().len();
+            let result = prod_images::resolve_blank_amount_numbered_run(
+                &client,
+                None, // image_accuracy_plan.md/RULES.md S8: no Anthropic client on this path
+                &prompt,
+                prod_cfg.image_max_dim_px(),
+                &target.image_path,
+                &target.image_id,
+                &prod_cfg,
+                &target.event,
+                &history,
+                run_idx,
+            );
+            let after_usage = client.usage_records();
+            let total_tokens: u64 = after_usage[before..]
+                .iter()
+                .map(|u| u.prompt_tokens + u.completion_tokens)
+                .sum();
+
+            let row = match result {
+                Ok(resolution) => {
+                    let normalized_figure = resolution.evidence.as_ref().and_then(|e| match &e.fact {
+                        Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    });
+                    let witness = normalized_figure.and_then(|amt| {
+                        resolution
+                            .reads
+                            .iter()
+                            .find(|r| r.witness.is_some() && r.selected_amount.map(|a| (a - amt).abs() < 0.01).unwrap_or(false))
+                            .and_then(|r| r.witness.clone())
+                    });
+                    LiveRunRow {
+                        image_id: target.image_id.clone(),
+                        run_idx,
+                        reads_used: resolution.reads.len(),
+                        normalized_figure,
+                        witness,
+                        outcome: resolution.outcome.clone(),
+                        total_tokens,
+                    }
+                }
+                Err(e) => {
+                    eprintln!("live N=5: {} run {}: {e:#}", target.image_id, run_idx + 1);
+                    LiveRunRow {
+                        image_id: target.image_id.clone(),
+                        run_idx,
+                        reads_used: 0,
+                        normalized_figure: None,
+                        witness: None,
+                        outcome: format!("error: {e:#}"),
+                        total_tokens,
+                    }
+                }
+            };
+            eprintln!(
+                "  [{}] run {}/{}: outcome={} figure={:?} witness={:?} reads={} tokens={}",
+                row.image_id, row.run_idx + 1, args.runs, row.outcome, row.normalized_figure, row.witness, row.reads_used, row.total_tokens
+            );
+            rows.push(row);
+        }
+    }
+
+    let stability = live_n5_stability_summary(&rows, targets.iter().map(|t| t.image_id.as_str()));
+    let table = render_live_n5_section(&rows, &stability, args.runs);
+    splice_live_n5_section(&args.out, &table)?;
+
+    eprintln!(
+        "live N=5 sweep complete: {} rows across {} images written to {}",
+        rows.len(),
+        targets.len(),
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// Per image: whether every run resolved (accepted, non-error outcome) to the SAME
+/// normalized figure (or every run fail-closed identically) -- Phase A DONE criterion.
+fn live_n5_stability_summary<'a>(rows: &[LiveRunRow], image_ids: impl Iterator<Item = &'a str>) -> Vec<(String, bool, usize, usize)> {
+    image_ids
+        .map(|id| {
+            let this_image: Vec<&LiveRunRow> = rows.iter().filter(|r| r.image_id == id).collect();
+            let total = this_image.len();
+            let accepted = this_image.iter().filter(|r| r.normalized_figure.is_some()).count();
+            let stable = if accepted == 0 {
+                true // every run fail-closed -- identically, since there is nothing to disagree on
+            } else if accepted != total {
+                false // some runs accepted, some fail-closed: not identical across runs
+            } else {
+                let first = this_image[0].normalized_figure;
+                this_image.iter().all(|r| match (r.normalized_figure, first) {
+                    (Some(a), Some(b)) => (a - b).abs() < 0.01,
+                    _ => false,
+                })
+            };
+            (id.to_string(), stable, accepted, total)
+        })
+        .collect()
+}
+
+fn render_live_n5_section(rows: &[LiveRunRow], stability: &[(String, bool, usize, usize)], runs: u32) -> String {
+    let mut s = String::new();
+    s.push_str("## Step 5 — Live N=5 witness-gate sweep (Phase A OCR)\n\n");
+    s.push_str(&format!(
+        "Production path (`extract::images::resolve_blank_amount_numbered_run`), HF-only \
+         (Qwen3-VL-235B + gemma-4-31B, image_accuracy_plan.md §2 witness gate, RULES.md S8), \
+         prompt v3, {runs} runs per image, no cache replay (every raw response persisted per \
+         run). 0 wrong figures and images 02/05/10/11 accepted 5/5 are the Phase A DONE gate.\n\n"
+    ));
+    s.push_str("| image_id | stable 5/5 | accepted/total | figure (if accepted) | witness (last accepted run) |\n");
+    s.push_str("|---|---|---|---|---|\n");
+    for (image_id, stable, accepted, total) in stability {
+        let last_accept = rows
+            .iter()
+            .filter(|r| &r.image_id == image_id && r.normalized_figure.is_some())
+            .next_back();
+        let figure = last_accept.and_then(|r| r.normalized_figure).map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string());
+        let witness = last_accept.and_then(|r| r.witness.clone()).unwrap_or_else(|| "—".to_string());
+        s.push_str(&format!(
+            "| {image_id} | {} | {accepted}/{total} | {figure} | {witness} |\n",
+            if *stable { "yes" } else { "NO" }
+        ));
+    }
+    s.push_str("\n### Per image × run detail\n\n");
+    s.push_str("| image_id | run | reads used | normalized figure | witness | outcome | tokens |\n");
+    s.push_str("|---|---|---|---|---|---|---|\n");
+    for row in rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            row.image_id,
+            row.run_idx + 1,
+            row.reads_used,
+            row.normalized_figure.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
+            row.witness.clone().unwrap_or_else(|| "—".to_string()),
+            row.outcome,
+            row.total_tokens,
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// Same splice-or-append pattern as `splice_into_bakeoff_md`, with this section's own
+/// markers so a re-run replaces the prior sweep's table instead of duplicating it. This
+/// section is the last one in the file (after Step 4), so its own heading is both start
+/// and (implicit) end marker -- it always runs to EOF.
+fn splice_live_n5_section(out_path: &Path, new_section: &str) -> Result<()> {
+    let existing = fs::read_to_string(out_path).unwrap_or_default();
+    let start_marker = "## Step 5 — Live N=5 witness-gate sweep";
+    let spliced = match existing.find(start_marker) {
+        Some(start) => format!("{}{}", &existing[..start], new_section),
+        None => format!("{}\n{}", existing.trim_end(), new_section),
+    };
+    fs::write(out_path, spliced)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = parse_args();
+
+    if env::args().any(|a| a == "--live-n5") {
+        return run_live_n5(&args);
+    }
 
     let config_text = fs::read_to_string(&args.config)
         .with_context(|| format!("reading {}", args.config.display()))?;

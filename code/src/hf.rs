@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const ROUTER_CHAT_COMPLETIONS_URL: &str = "https://router.huggingface.co/v1/chat/completions";
+const ROUTER_MODELS_URL: &str = "https://router.huggingface.co/v1/models";
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
 
 /// One part of the user message content: plain text, or a downscaled image
@@ -199,6 +200,26 @@ impl HfClient {
     /// `code/evaluation/usage_report.md` (PLAN.md §6.5).
     pub fn usage_records(&self) -> Vec<Usage> {
         self.usage_log.lock().expect("usage_log mutex poisoned").clone()
+    }
+
+    /// A cheap, zero-completion-token pre-flight check (image_accuracy_plan.md §"Live N=5":
+    /// "check HF credits first") -- GETs the router's model listing with the same bearer token
+    /// a completion call would use. Confirms the token is valid and the router is reachable
+    /// BEFORE a run that may fire up to `16 images * 4 reads * N runs` paid completion calls;
+    /// a 401/403 here means an invalid/expired token, not exhausted credits per se (the router
+    /// does not expose a separate balance endpoint), but either way this is cheaper and faster
+    /// to fail on than discovering it mid-sweep.
+    pub fn check_router_reachable(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(ROUTER_MODELS_URL)
+            .bearer_auth(&self.token)
+            .send()
+            .context("HF router unreachable (GET /v1/models)")?;
+        if !resp.status().is_success() {
+            bail!("HF router GET /v1/models returned {} -- check HF_TOKEN and account status before running a live sweep", resp.status());
+        }
+        Ok(())
     }
 
     /// Rebuild the HTTP client with a hard per-request timeout (connect
