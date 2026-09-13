@@ -12,14 +12,16 @@
 //! match = { statuses = ["pending", "scheduled"], categories = ["utilities"], settles_after_event = true }
 //! readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 },
 //!             { model = "moonshotai/Kimi-K3", max_dim_px = 1024 } ]
-//! cutoff_rule = true                                      # every read must satisfy the due-date cutoff
-//! fallback = "none"                                       # optional; omitted = global fallback
+//! cutoff_rule = true                                      # every read (incl. tiebreak) must satisfy the due-date cutoff
+//! fallback = { model = "google/gemma-4-31B-it", max_dim_px = 768 }  # class tiebreak; omitted = global
 //!
 //! [[vlm_routing.classes]]
 //! name = "default"                                        # no `match` = matches everything
 //! readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 },
 //!             { model = "google/gemma-4-31B-it", max_dim_px = 768 } ]
 //! ```
+//! Board decision.tiebreak_distinct: a class's tiebreak model must differ from every reader of that
+//! class (IA12, checked on the table itself and on each provenance).
 //! `match` keys (all optional, all must hold): statuses, categories, event_types, directions,
 //! settles_after_event (settlement_date > event_date). The class is recomputed from the event row.
 //!
@@ -224,7 +226,7 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, event: &Event) -
         notes.push("readers disagree".into());
     }
     if let Some(fb_routed) = routing.fallback_for(class) {
-        if let Some(fr) = p.reads.iter().find(|r| r.role == "fallback") {
+        if let Some(fr) = p.reads.iter().find(|r| r.role == "fallback" && !class.readers.iter().any(|x| x.model == r.model_id)) {
             match read_problem(fr, Some(fb_routed), class, event, tol) {
                 Some(why) => notes.push(format!("fallback {}: {why}", fr.model_id)),
                 None => {
@@ -238,6 +240,22 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, event: &Event) -
         }
     }
     ("missing", None, notes)
+}
+
+/// Table-level rules (no evidence needed): tolerance bound, tiebreak distinct from class readers.
+pub fn validate_table(routing: &Routing) -> Vec<Finding> {
+    let mut out = Vec::new();
+    if !(0.0..=MAX_TOLERANCE).contains(&routing.tolerance) {
+        out.push(fail("config", "IA8_tolerance_out_of_range", format!("tolerance {} not in [0, {MAX_TOLERANCE}]", routing.tolerance)));
+    }
+    for c in &routing.classes {
+        if let Some(fb) = routing.fallback_for(c) {
+            if c.readers.iter().any(|r| r.model == fb.model) {
+                out.push(fail("config", "IA12_tiebreak_equals_reader", format!("class {} tiebreak {} is also one of its readers {:?}", c.name, fb.model, c.readers.iter().map(|r| &r.model).collect::<Vec<_>>())));
+            }
+        }
+    }
+    out
 }
 
 /// Check persisted image EventAmounts and provenance under `code_dir` against the routing table.
@@ -264,24 +282,23 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
     }
     let prov_dir = processed.join("image_reads");
     let has_provenance = prov_dir.exists();
-    if facts.is_empty() && !has_provenance {
-        return Ok(out); // model path not run: nothing to check
-    }
-
     let routing = match std::fs::read_to_string(models_toml).map_err(anyhow::Error::from).and_then(|t| Routing::from_models_toml(&t)) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            out.push(fail("config", "IA9_no_routing_table", format!("{} has no [vlm_routing] but image evidence exists", models_toml.display())));
-            return Ok(out);
-        }
+        Ok(r) => r,
         Err(e) => {
             out.push(fail("config", "IA9_no_routing_table", e.to_string()));
             return Ok(out);
         }
     };
-    if !(0.0..=MAX_TOLERANCE).contains(&routing.tolerance) {
-        out.push(fail("config", "IA8_tolerance_out_of_range", format!("tolerance {} not in [0, {MAX_TOLERANCE}]", routing.tolerance)));
+    if let Some(r) = &routing {
+        out.extend(validate_table(r));
     }
+    if facts.is_empty() && !has_provenance {
+        return Ok(out); // model path not run: only the table is checked
+    }
+    let Some(routing) = routing else {
+        out.push(fail("config", "IA9_no_routing_table", format!("{} has no [vlm_routing] but image evidence exists", models_toml.display())));
+        return Ok(out);
+    };
 
     let ds = Dataset::load(dataset_dir, &dataset_dir.join("requests.csv"))?;
     let mut link: HashMap<String, String> = HashMap::new();
@@ -317,6 +334,11 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
                 out.push(fail(&p.image_id, "IA10_class_mismatch", format!("provenance class {} but routing table gives {} for {}", p.class, class.name, event.event_id)));
             }
             let fallback = routing.fallback_for(class);
+            for r in p.reads.iter().filter(|r| r.role == "fallback") {
+                if class.readers.iter().any(|x| x.model == r.model_id) {
+                    out.push(fail(&p.image_id, "IA12_tiebreak_equals_reader", format!("tiebreak read {} is one of class {} readers", r.model_id, class.name)));
+                }
+            }
             for r in &p.reads {
                 let routed = match r.role.as_str() {
                     "reader" => class.readers.iter().find(|x| x.model == r.model_id),
@@ -390,7 +412,7 @@ name = "pending_bill_with_cutoff"
 match = { statuses = ["pending", "scheduled"], categories = ["utilities"], settles_after_event = true }
 readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, { model = "moonshotai/Kimi-K3", max_dim_px = 1024 } ]
 cutoff_rule = true
-fallback = "none"
+fallback = { model = "google/gemma-4-31B-it", max_dim_px = 768 }
 
 [[vlm_routing.classes]]
 name = "default"
@@ -488,6 +510,45 @@ readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, {
         // Wrong class recorded.
         let wrong = prov("image_05", "event_1786", "default", vec![with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", K, 1024, true, 822.05), "2026-02-06", 704.05, 822.05)], "agree", Some(822.05));
         assert!(run("k", "image_05", "event_1786", wrong, Some(822.05), ROUTING).contains(&"IA10_class_mismatch"));
+    }
+
+    #[test]
+    fn tiebreak_model_must_differ_from_readers() {
+        // Table-level: default class tiebreak set to the 235B reader.
+        let bad_table = ROUTING.replace(
+            "fallback = { model = \"moonshotai/Kimi-K3\", max_dim_px = 1024 }",
+            "fallback = { model = \"Qwen/Qwen3-VL-235B-A22B-Instruct\", max_dim_px = 1024 }",
+        );
+        let r = Routing::from_models_toml(&bad_table).unwrap().unwrap();
+        assert!(validate_table(&r).iter().any(|f| f.code == "IA12_tiebreak_equals_reader"));
+        assert!(validate_table(&Routing::from_models_toml(ROUTING).unwrap().unwrap()).is_empty());
+        // Checked even when no image facts exist yet.
+        let root = std::env::temp_dir().join(format!("verifier_ia2_table_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("models.toml"), &bad_table).unwrap();
+        let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
+        assert!(check(&root, &dataset, &root.join("models.toml")).unwrap().iter().any(|f| f.code == "IA12_tiebreak_equals_reader"));
+        std::fs::remove_dir_all(&root).ok();
+
+        // Pending-bill class: 235B and Kimi disagree, gemma tiebreak matches 235B on the after-cutoff figure.
+        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
+        let k = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
+        let g = with_cutoff(read("fallback", G, 768, true, 822.05), "2026-02-06", 704.05, 822.05);
+        let tie = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, g], "fallback_tiebreak", Some(822.05));
+        assert!(run("n", "image_05", "event_1786", tie, Some(822.05), ROUTING).is_empty());
+        // Kimi (a reader of this class) recorded as the tiebreak: IA12 and no acceptance.
+        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
+        let g2 = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
+        let kf = with_cutoff(read("fallback", K, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
+        let dup = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, g2, kf], "fallback_tiebreak", Some(822.05));
+        let c = run("o", "image_05", "event_1786", dup, Some(822.05), ROUTING);
+        assert!(c.contains(&"IA12_tiebreak_equals_reader") && c.contains(&"IA4_no_agreement"), "{c:?}");
+        // gemma tiebreak picking the before-cutoff figure (cutoff rule applies to the tiebreak): no accept.
+        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
+        let k = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
+        let gb = with_cutoff(read("fallback", G, 768, true, 704.05), "2026-02-06", 704.05, 822.05);
+        let before = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, gb], "missing", None);
+        assert!(run("p", "image_05", "event_1786", before, None, ROUTING).is_empty());
     }
 
     #[test]
