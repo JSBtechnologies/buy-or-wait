@@ -198,9 +198,44 @@ fn token_byte_ranges(s: &str) -> Vec<(usize, usize)> {
 
 fn push_row(out: &mut Vec<LabeledValue>, page: u32, label: &str, value_raw: &str, currency_hint: Option<&str>) {
     let value_raw = value_raw.trim().to_string();
-    let amount = crate::extract::normalize::parse_amount(&value_raw, currency_hint, false);
+    let amount = crate::extract::normalize::parse_amount(&value_raw, currency_hint, false)
+        .or_else(|| join_rs_ps_cells(&value_raw, currency_hint))
+        .or_else(|| rightmost_amount_token(&value_raw, currency_hint));
     let date = if amount.is_none() { crate::extract::normalize::parse_date(&value_raw) } else { None };
     out.push(LabeledValue { page, label: label.trim().to_string(), value_raw, amount, date });
+}
+
+/// User ruling `ruling.total_or_witnessed_sum` point 3 (image_14): a Rs/Ps amount split
+/// across SEPARATE table cells (`"TOTAL"|"4 543"|"0"`, not one string like normalize.rs's
+/// own `"4543 00"` wrapped-cell case) joins into one value when the whole-rupee part parses
+/// on its own and the last fragment is a 1-2 digit paise/cents suffix.
+fn join_rs_ps_cells(value_raw: &str, currency_hint: Option<&str>) -> Option<f64> {
+    let parts: Vec<&str> = value_raw.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let last = parts[parts.len() - 1];
+    if last.is_empty() || last.len() > 2 || !last.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let whole_str = parts[..parts.len() - 1].join(" ");
+    let whole = crate::extract::normalize::parse_amount(&whole_str, currency_hint, false)?;
+    let paise: f64 = last.parse().ok()?;
+    let paise = if last.len() == 1 { paise * 10.0 } else { paise };
+    Some(whole + paise / 100.0)
+}
+
+/// User ruling point 3 (image_15): a final-labeled row with many numeric columns (a
+/// sub-total/tax/total breakdown merged into one joined string by the row-pairing logic
+/// above) -- take the RIGHT-MOST amount, the convention this dataset's tables use for the
+/// column under a Total/Amount header. Only used once every other parse of the full joined
+/// string has already failed, so a normal single amount is never second-guessed.
+fn rightmost_amount_token(value_raw: &str, currency_hint: Option<&str>) -> Option<f64> {
+    let parts: Vec<&str> = value_raw.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    crate::extract::normalize::parse_amount(parts[parts.len() - 1], currency_hint, false)
 }
 
 fn ranges_overlap(a1: i64, a2: i64, b1: i64, b2: i64) -> bool {
