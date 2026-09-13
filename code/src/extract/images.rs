@@ -528,10 +528,10 @@ fn call_vlm(
         seed: decoding.seed,
         max_tokens,
         json_response: candidate.supports_structured_output,
-        // Only meaningful to the Anthropic backend (crate::anthropic::AnthropicClient),
-        // which uses it to request structured JSON output; HF ignores it.
-        json_schema: (candidate.provider == "anthropic")
-            .then(crate::anthropic::image_figures_json_schema),
+        // ml-engineer dropped structured-output json_schema for the Anthropic backend after
+        // 3 live schema-validation errors in a row (anthropic.rs); every provider now relies
+        // on the prompt text alone plus `parse_json_reply`'s lenient parsing.
+        json_schema: None,
     };
     let response = dispatch_call(client, anthropic, cold, candidate, &call)?;
     // Kimi-K3 (a thinking model, ml-engineer #204/lead) returns reasoning text ahead of the
