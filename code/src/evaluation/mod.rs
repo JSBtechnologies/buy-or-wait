@@ -13,6 +13,7 @@ pub mod image_agreement;
 pub mod invariants;
 pub mod ledger_gate;
 pub mod mirror;
+pub mod normalization_audit;
 pub mod replay;
 pub mod scorer;
 pub mod signoff;
