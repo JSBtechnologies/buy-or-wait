@@ -121,6 +121,45 @@ happened it's called out explicitly, and stability numbers from a
 cache-replay of the same cached response 5x is trivially "stable" and
 proves nothing about actual run-to-run variance.
 
+**All three runs are stopped** (verified: no `bakeoff.exe` process running).
+No retry loop risk: 402 is a plain 4xx, classified `Fatal` not `Retryable`
+in `hf.rs` — it was never retried within a call, only the circuit breaker's
+"3 consecutive failures → mark unavailable, stop" fired, so no attempts or
+rate-limit budget were burned looping. Caches (`store/model_cache`,
+`store/gate_cache`, `store/frontier_cache`) are untouched and intact for a
+`--rescore-from-cache` resume — nothing needs to be redone from zero.
+
+**Exact progress per run, for a `--rescore-from-cache` resume once credits return:**
+
+| Run | Config | N | Images | Progress when the wall hit |
+|---|---|---|---|---|
+| Sign-off audit (#215) | Kimi-K3, max_tokens=1500, `store/model_cache` | 5 | 02, 05, 10, 11 | Runs 1–3/5 complete (12/20 calls); run 4 failed on its first call (image_02) |
+| Gate (K3+K2.6) | max_tokens=2000, `store/gate_cache` | 5 | all 16 | Kimi-K3: run 1/5 complete + ~4 images into run 2 (~20/80 calls); Kimi-K2.6: ~2 images into run 1 (~2/80 calls) |
+| Frontier | Kimi-K3 VLM @400, 3 LLM candidates, `store/frontier_cache` | 3 | all 16 (VLM), 47 msgs (LLM) | Kimi-K3 VLM: **complete**, all 3/3 runs (unaffected — finished before the wall). LLM: DeepSeek-V4-Pro-0813 **complete** 3/3; GLM-5.3 and Kimi-K3-as-LLM hit the wall partway, both circuit-broken |
+
+**Resume order once the user confirms credits (per the lead):** #215 audit
+first (2 more runs × 4 images = 8 calls) — it's sign-off-critical — then
+the gate run's remainder (Kimi-K3: 3 more runs × 16 = 48 calls;
+Kimi-K2.6: needs essentially a full re-run, ~5 × 16 = 80 calls, since it
+has no usable data yet).
+
+**Estimated credits still needed** (rough, from the token/cost rates
+already observed in this document; actual mix will vary per-image):
+
+| Item | Calls | Est. tokens | Est. cost |
+|---|---|---|---|
+| Finish #215 audit (Kimi-K3, 2 more runs × 4 images) | 8 | ~22,900 (in 1414 + out 1445 per call, observed rate) | ~$0.20 |
+| Finish gate run (Kimi-K3: 3×16; Kimi-K2.6: 5×16) | 128 | ~330,000 (Kimi-K3 at observed 1322in/1258out; Kimi-K2.6 estimated similar profile, unverified — it has zero data so far) | ~$1.10 (K3) + ~$0.55 (K2.6, priced lower at $0.75/$3.50) ≈ **~$1.65** |
+| Final cold run — VLM, 16 images × 2 readers/class (`[vlm_routing]` above) | up to 32 | ~600–900in/175–185out per 235B/gemma call (cheap primary/escalation pair); **any image classified `pending_bill_due_date` currently reads vlm_fallback = Kimi-K3 (fails the gate, ~7–8x the token cost of a normal reader) until that's replaced** | ~$0.05–$0.15 if the fallback reader is swapped to something cheap before the final run; meaningfully higher (**+$0.02–0.04/image** on that class) if Kimi-K3 stays as-is |
+| Final cold run — LLM, `msg_86` only | 1 | ~75–85in/2–3out (observed primary-LLM rate) | <$0.001 |
+| **Total estimate** | ~169 | ~380,000 | **~$2–3**, most of it the two Kimi test completions, not the final run itself |
+
+This assumes the routing table's fallback reader gets swapped to a
+gate-passing candidate before the final cold run — if `vlm_fallback`
+stays `Kimi-K3` as currently configured, every `pending_bill_due_date`
+event pays Kimi-K3's per-token rate instead of a primary-tier rate, which
+is exactly the risk the backup gate exists to catch.
+
 ### Candidate selection
 
 `moonshotai/Kimi-K3` (multimodal, covers both LLM and VLM fallback roles,
