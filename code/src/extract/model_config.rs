@@ -137,7 +137,52 @@ pub struct VlmRouteClass {
     /// Event categories ("salary", "rent", ...). Empty = any.
     #[serde(default)]
     pub categories: Vec<String>,
-    pub readers: Vec<String>,
+    pub readers: Vec<ReaderSpec>,
+}
+
+/// One reader slot in a route class: a role key plus its OWN resolution/token budget
+/// (ml-engineer #204/lead: the bake-off screened different candidates at different
+/// resolutions -- 235B@1024, gemma@768 -- and a thinking model like Kimi-K3 needs a much
+/// larger `max_tokens` or it returns nothing (reasoning tokens consume the default
+/// budget). Using the wrong px for a candidate also changes the §2.11 cache key, silently
+/// triggering a brand-new paid call instead of a cache hit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReaderSpec {
+    /// "vlm_primary" | "vlm_escalation" | "vlm_fallback", resolved via `resolve_role`.
+    pub role: String,
+    /// Falls back to `[selected].image_max_dim_px` (global default) when unset.
+    #[serde(default)]
+    pub max_dim_px: Option<u32>,
+    /// Falls back to `[decoding].max_tokens_vlm` when unset.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+impl ReaderSpec {
+    /// A reader that wants the global `[selected].image_max_dim_px` / `[decoding].max_tokens_vlm`
+    /// defaults rather than an override -- available for a hand-written `[vlm_routing]` entry.
+    #[allow(dead_code)]
+    fn new(role: &str) -> ReaderSpec {
+        ReaderSpec { role: role.to_string(), max_dim_px: None, max_tokens: None }
+    }
+
+    fn with(role: &str, max_dim_px: u32, max_tokens: u32) -> ReaderSpec {
+        ReaderSpec {
+            role: role.to_string(),
+            max_dim_px: Some(max_dim_px),
+            max_tokens: Some(max_tokens),
+        }
+    }
+}
+
+/// One resolved reader: role, candidate, and the exact per-call `max_dim_px`/`max_tokens`
+/// to use for it (either the reader's own override or the global default).
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderPick<'a> {
+    pub role: &'a str,
+    pub candidate: &'a CandidateConfig,
+    pub max_dim_px: u32,
+    pub max_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +205,13 @@ pub struct VlmRoutingConfig {
 /// per the lead's own example of what the routing table exists to express.
 impl Default for VlmRoutingConfig {
     fn default() -> Self {
+        // Per-reader px matches what ml-engineer's bake-off actually screened each
+        // candidate at (235B@1024, gemma@768) -- using a different px changes the §2.11
+        // cache key and silently triggers a new paid call instead of a cache hit. Kimi-K3's
+        // max_tokens=1500 (vs the decoding-default ~400) is ml-engineer's finding: as a
+        // thinking model it returns 0% output at the default budget (reasoning tokens
+        // consume it) -- the final answer still needs extracting from any reasoning
+        // preamble, handled by `crate::extract::parse_json_reply`.
         VlmRoutingConfig {
             default_class: Some("settled_expense_receipt".to_string()),
             classes: vec![
@@ -168,26 +220,39 @@ impl Default for VlmRoutingConfig {
                     event_types: vec!["income".to_string()],
                     statuses: vec![],
                     categories: vec![],
-                    readers: vec!["vlm_primary".to_string(), "vlm_escalation".to_string()],
+                    readers: vec![
+                        ReaderSpec::with("vlm_primary", 1024, 400),
+                        ReaderSpec::with("vlm_escalation", 768, 400),
+                    ],
                 },
                 VlmRouteClass {
                     name: "pending_bill_due_date".to_string(),
                     event_types: vec![],
                     statuses: vec!["pending".to_string(), "scheduled".to_string()],
                     categories: vec![],
-                    readers: vec!["vlm_primary".to_string(), "vlm_fallback".to_string()],
+                    // gemma excluded (analyst pre-audit board:verify.image_agree_preaudit:
+                    // drops due-date fields on this shape 4/4, falls back to the pre-cutoff
+                    // amount even when the settlement date is past it).
+                    readers: vec![
+                        ReaderSpec::with("vlm_primary", 1024, 400),
+                        ReaderSpec::with("vlm_fallback", 1024, 1500),
+                    ],
                 },
                 VlmRouteClass {
                     name: "settled_expense_receipt".to_string(),
                     event_types: vec![],
                     statuses: vec!["settled".to_string()],
                     categories: vec![],
-                    readers: vec!["vlm_primary".to_string(), "vlm_escalation".to_string()],
+                    readers: vec![
+                        ReaderSpec::with("vlm_primary", 1024, 400),
+                        ReaderSpec::with("vlm_escalation", 768, 400),
+                    ],
                 },
             ],
         }
     }
 }
+
 
 impl ModelsConfig {
     pub fn load(path: &Path) -> Result<Self> {
@@ -268,14 +333,22 @@ impl ModelsConfig {
     /// `(role_a, candidate_a, role_b, candidate_b)`. `None` when the class's reader list has
     /// fewer than two entries, or either role doesn't resolve to a configured candidate
     /// (never guesses a reader pair).
-    pub fn readers_for(&self, event: &Event) -> Option<(&str, &CandidateConfig, &str, &CandidateConfig)> {
+    pub fn readers_for(&self, event: &Event) -> Option<(ReaderPick<'_>, ReaderPick<'_>)> {
         let class_name = self.classify_event(event);
         let class = self.vlm_routing.classes.iter().find(|c| c.name == class_name)?;
-        let role_a = class.readers.first()?.as_str();
-        let role_b = class.readers.get(1)?.as_str();
-        let candidate_a = self.resolve_role(role_a)?;
-        let candidate_b = self.resolve_role(role_b)?;
-        Some((role_a, candidate_a, role_b, candidate_b))
+        let a = class.readers.first()?;
+        let b = class.readers.get(1)?;
+        Some((self.resolve_pick(a)?, self.resolve_pick(b)?))
+    }
+
+    fn resolve_pick<'a>(&'a self, spec: &'a ReaderSpec) -> Option<ReaderPick<'a>> {
+        let candidate = self.resolve_role(&spec.role)?;
+        Some(ReaderPick {
+            role: &spec.role,
+            candidate,
+            max_dim_px: spec.max_dim_px.unwrap_or_else(|| self.image_max_dim_px()),
+            max_tokens: spec.max_tokens.unwrap_or(self.decoding.max_tokens_vlm),
+        })
     }
 
     fn find_vlm(&self, id: &str) -> Option<&CandidateConfig> {
@@ -455,23 +528,25 @@ mod tests {
 
         let payslip = event_with(EventType::Income, Status::Settled, "salary");
         assert_eq!(cfg.classify_event(&payslip), "income_payslip");
-        let (role_a, a, role_b, b) = cfg.readers_for(&payslip).expect("pair resolves");
-        assert_eq!((role_a, &a.id[..]), ("vlm_primary", "vendor/VlmA"));
-        assert_eq!((role_b, &b.id[..]), ("vlm_escalation", "vendor/VlmB"));
+        let (a, b) = cfg.readers_for(&payslip).expect("pair resolves");
+        assert_eq!((a.role, &a.candidate.id[..]), ("vlm_primary", "vendor/VlmA"));
+        assert_eq!((b.role, &b.candidate.id[..]), ("vlm_escalation", "vendor/VlmB"));
 
         let pending_bill = event_with(EventType::Expense, Status::Pending, "utilities");
         assert_eq!(cfg.classify_event(&pending_bill), "pending_bill_due_date");
-        let (role_a, a, role_b, b) = cfg.readers_for(&pending_bill).expect("pair resolves");
-        assert_eq!((role_a, &a.id[..]), ("vlm_primary", "vendor/VlmA"));
-        assert_eq!((role_b, &b.id[..]), ("vlm_fallback", "vendor/VlmC"));
+        let (a, b) = cfg.readers_for(&pending_bill).expect("pair resolves");
+        assert_eq!((a.role, &a.candidate.id[..]), ("vlm_primary", "vendor/VlmA"));
+        assert_eq!((b.role, &b.candidate.id[..]), ("vlm_fallback", "vendor/VlmC"));
+        assert_eq!(b.max_tokens, 1500); // Kimi-K3 thinking-model budget (ml-engineer #204)
 
         let scheduled_bill = event_with(EventType::Expense, Status::Scheduled, "healthcare");
         assert_eq!(cfg.classify_event(&scheduled_bill), "pending_bill_due_date");
 
         let settled = event_with(EventType::Expense, Status::Settled, "groceries");
         assert_eq!(cfg.classify_event(&settled), "settled_expense_receipt");
-        let (role_a, _, role_b, _) = cfg.readers_for(&settled).expect("pair resolves");
-        assert_eq!((role_a, role_b), ("vlm_primary", "vlm_escalation"));
+        let (a, b) = cfg.readers_for(&settled).expect("pair resolves");
+        assert_eq!((a.role, b.role), ("vlm_primary", "vlm_escalation"));
+        assert_eq!((a.max_dim_px, b.max_dim_px), (1024, 768));
     }
 
     #[test]
