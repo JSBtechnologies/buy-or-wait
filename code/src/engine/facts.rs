@@ -26,6 +26,18 @@ pub enum CandidateOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TroughDriver {
+    /// `reserved`, `scheduled`, `stream`, or `evidence`.
+    pub kind: String,
+    /// Stream id, event id, or evidence record id.
+    pub component: String,
+    pub category: String,
+    /// Signed sum before the trough (debits negative).
+    pub total: Money,
+    pub occurrences: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChangeFact {
     pub rendered: String,
     pub event_id: String,
@@ -55,6 +67,11 @@ pub struct DecisionFacts {
     pub trough_date: NaiveDate,
     /// `trough_balance - minimum_balance` (may be negative).
     pub headroom: Money,
+    /// What moves the balance from `starting_balance` to the trough: every flow from
+    /// request_date through the trough date (the trough day's credits excluded, since the
+    /// trough is that day's pre-credit low), grouped by forecast component, largest first.
+    /// `starting_balance + sum(total) == trough_balance`.
+    pub trough_drivers: Vec<TroughDriver>,
     pub horizon_end: NaiveDate,
 
     // ---- the two hard numbers ----------------------------------------------------------

@@ -103,6 +103,8 @@ mod tests {
             match session.decide(&r.request_id, r.request_date, &RequestSpec::from_model(r), &opts) {
                 Ok(d) => {
                     *dist.entry(format!("{}/{}", d.row.affordability_status, d.row.recommended_payment_method)).or_default() += 1;
+                    let drivers: crate::engine::money::Money = d.facts.trough_drivers.iter().map(|t| t.total).sum();
+                    assert_eq!(d.facts.starting_balance + drivers, d.facts.trough_balance, "{} trough drivers do not reconcile", r.request_id);
                     if !d.facts.missing_amounts.is_empty() {
                         issues += 1;
                         let rows: Vec<String> = d.facts.missing_amounts.iter().map(|id| {
@@ -283,5 +285,76 @@ mod image_preview {
             println!("{} {} {} safe={} E={:?} missing={:?} rejected={:?} | {}", rid, d.row.affordability_status, d.row.recommended_payment_method,
                 d.row.amount_safe_to_pay, d.row.earliest_date_for_full_payment, d.facts.missing_amounts, d.facts.rejected_evidence, d.row.decision_explanation);
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostics {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::patched_rules;
+    use crate::engine::{session::Session, types::*};
+    use crate::model;
+
+    /// Per-row forecast diagnostics for the held-out amount investigation: trough date and
+    /// balance, safe/earliest, streams, and trough drivers. Tuning rows 01–18 plus the 250
+    /// evaluation rows; held-out 19–25 are deliberately excluded. Writes one JSON file.
+    /// `DIAG_OUT=path cargo test --lib engine::samples::diagnostics -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_diagnostics() {
+        let ds = Path::new("../dataset");
+        let profiles = model::load_financial_profiles(ds.join("financial_profiles.csv")).unwrap();
+        let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
+        let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
+        let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
+        let messages = model::load_messages(ds.join("messages.csv")).unwrap();
+        let mut reqs: Vec<(String, String, chrono::NaiveDate, RequestSpec, Option<f64>)> = model::load_sample_requests(ds.join("sample_requests.csv"))
+            .unwrap()
+            .into_iter()
+            .take(18)
+            .map(|s| {
+                let spec = RequestSpec {
+                    amount: crate::engine::money::Money::from_f64(s.requested_amount),
+                    deadline: s.desired_completion_date,
+                    request_type: s.request_type.clone(),
+                    allows_partial_payment: s.allows_partial_payment,
+                };
+                (s.request_id, s.user_id, s.request_date, spec, Some(s.amount_safe_to_pay))
+            })
+            .collect();
+        reqs.extend(model::load_requests(ds.join("requests.csv")).unwrap().into_iter().map(|r| {
+            let spec = RequestSpec::from_model(&r);
+            (r.request_id, r.user_id, r.request_date, spec, None)
+        }));
+        let mut rows = Vec::new();
+        for (rid, uid, rd, spec, label_safe) in reqs {
+            let mut session = Session::from_model(&uid, &profiles, &events, rates.clone(), patched_rules()).unwrap();
+            let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == uid && m.sent_at.date_naive() <= rd).collect();
+            let home = session.profile().home_currency.clone();
+            session.apply_evidence(crate::extract::messages::deterministic_evidence(&msgs, &home));
+            let opts: Vec<PaymentOption> = options.iter().filter(|o| o.request_id == rid).map(|o| PaymentOption::from_model(o).unwrap()).collect();
+            let d = session.decide(&rid, rd, &spec, &opts).unwrap();
+            let f = &d.facts;
+            rows.push(serde_json::json!({
+                "request_id": rid, "currency": f.currency, "request_date": rd, "horizon_end": f.horizon_end,
+                "starting_balance": f.starting_balance.to_f64(), "minimum": f.minimum_balance.to_f64(),
+                "trough_balance": f.trough_balance.to_f64(), "trough_date": f.trough_date,
+                "raw_safe": f.raw_safe_amount.to_f64(), "label_safe": label_safe,
+                "earliest": f.earliest_full_date, "status": d.row.affordability_status,
+                "trough_drivers": f.trough_drivers.iter().map(|t| serde_json::json!({
+                    "kind": t.kind, "component": t.component, "category": t.category, "total": t.total.to_f64(), "occurrences": t.occurrences
+                })).collect::<Vec<_>>(),
+                "streams": d.streams.streams.iter().map(|s| serde_json::json!({
+                    "id": s.id, "cadence": format!("{:?}", s.cadence), "amount": s.projected_amount.to_f64(), "last": s.last_date()
+                })).collect::<Vec<_>>(),
+                "inactive_streams": d.streams.inactive,
+                "missing_amounts": f.missing_amounts, "rejected_evidence": f.rejected_evidence,
+            }));
+        }
+        let out = std::env::var("DIAG_OUT").unwrap_or_else(|_| "diagnostics.json".into());
+        std::fs::write(&out, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+        println!("wrote {} rows to {out}", rows.len());
     }
 }

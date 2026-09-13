@@ -66,6 +66,102 @@ pub enum DayOrder {
     CreditsFirst,
 }
 
+/// Where a debit sits relative to the same day's credits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Placement {
+    #[serde(alias = "before_credits")]
+    BeforeCredits,
+    #[serde(alias = "after_credits")]
+    AfterCredits,
+}
+
+/// Forecast debit classes whose same-day placement is configurable (verifier class A).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebitKind {
+    /// Monthly bill stream occurrence whose latest row is `fixed`.
+    FixedBill,
+    /// Monthly bill stream occurrence whose latest row is reducible and/or stoppable.
+    FlexibleBill,
+    /// Interval (variable-spend) stream occurrence.
+    VariableSpend,
+    /// Scheduled ledger row.
+    Scheduled,
+    /// Pending debit reserve.
+    Reserved,
+    /// Forecast-level evidence flow (new expense, one-time debit).
+    Evidence,
+}
+
+/// Per-kind same-day placement (plan payments use `Rules::payment_timing`). Default: every
+/// debit before credits (RULES S2.3). Patch any subset, e.g.
+/// `{"SAME_DAY_PLACEMENT":{"variable_spend":"after_credits"}}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SameDayPlacement {
+    pub fixed_bill: Placement,
+    pub flexible_bill: Placement,
+    pub variable_spend: Placement,
+    pub scheduled: Placement,
+    pub reserved: Placement,
+    pub evidence: Placement,
+}
+
+impl Default for SameDayPlacement {
+    fn default() -> Self {
+        SameDayPlacement {
+            fixed_bill: Placement::BeforeCredits,
+            flexible_bill: Placement::BeforeCredits,
+            variable_spend: Placement::BeforeCredits,
+            scheduled: Placement::BeforeCredits,
+            reserved: Placement::BeforeCredits,
+            evidence: Placement::BeforeCredits,
+        }
+    }
+}
+
+/// RULES S8.1 `SALARY_DAY_ORDER` (verifier class A): a named preset over `SameDayPlacement`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SalaryDayOrder {
+    /// S2.3 default: use `same_day_placement` as configured (all debits before credits).
+    #[serde(alias = "debits_first")]
+    DebitsFirst,
+    /// Fixed monthly bills and pending/scheduled debits after the credit; flexible bills,
+    /// variable spend and evidence flows stay before.
+    #[serde(alias = "fixed_bills_after_credit")]
+    FixedBillsAfterCredit,
+    /// Every monthly bill and pending/scheduled debit after the credit; variable spend and
+    /// evidence flows stay before.
+    #[serde(alias = "bills_after_credit")]
+    BillsAfterCredit,
+    /// Every debit after the credit.
+    #[serde(alias = "credits_first")]
+    CreditsFirst,
+}
+
+/// RULES S8.2 `VAR_LONG_PHASE` (verifier class E): phase of long-interval variable spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VarLongPhase {
+    /// Default: next = last occurrence + step.
+    #[serde(alias = "last_settled")]
+    LastSettled,
+    /// For step >= `var_long_min_step`: first occurrence at rd + IV_SKIP_DAYS, then every step.
+    #[serde(alias = "from_request")]
+    FromRequest,
+}
+
+/// RULES S8.3 `SCHEDULED_REPLACE_SCOPE` (verifier class D).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScheduledReplaceScope {
+    /// Default S3.4(c): same category and direction within the window.
+    #[serde(alias = "category_window")]
+    CategoryWindow,
+    /// A scheduled debit replaces the cycle only if it is linked (a retry/lifecycle row) or its
+    /// amount is within `scheduled_replace_amount_pct` of the stream estimate; otherwise both
+    /// count. Scheduled credits keep `CategoryWindow`.
+    #[serde(alias = "lifecycle_or_amount")]
+    LifecycleOrAmount,
+}
+
 /// S0 `PAYMENT_TIMING`: when a plan payment on day d is applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaymentTiming {
@@ -154,6 +250,13 @@ pub struct Rules {
     /// [SAME_DAY_ORDER] S2.3: debits before credits.
     #[serde(alias = "SAME_DAY_ORDER")]
     pub same_day_order: DayOrder,
+    /// [SAME_DAY_PLACEMENT] per-debit-kind placement relative to same-day credits (class A
+    /// variants are config-only). `same_day_order: CreditsFirst` forces every kind after.
+    #[serde(alias = "SAME_DAY_PLACEMENT")]
+    pub same_day_placement: SameDayPlacement,
+    /// [SALARY_DAY_ORDER] S8.1: preset overriding `same_day_placement` unless `debits_first`.
+    #[serde(alias = "SALARY_DAY_ORDER")]
+    pub salary_day_order: SalaryDayOrder,
     /// [PAYMENT_TIMING] S3.5 (fixed 52b4184): plan payments apply after the day's rows.
     #[serde(alias = "PAYMENT_TIMING")]
     pub payment_timing: PaymentTiming,
@@ -197,6 +300,11 @@ pub struct Rules {
     #[serde(alias = "SCHEDULED_REPLACES_CYCLE")]
     pub scheduled_replaces_cycle: bool,
     pub scheduled_replacement_window_days: i64,
+    /// [SCHEDULED_REPLACE_SCOPE] S8.3.
+    #[serde(alias = "SCHEDULED_REPLACE_SCOPE")]
+    pub scheduled_replace_scope: ScheduledReplaceScope,
+    /// Amount tolerance for `lifecycle_or_amount`, percent of the stream estimate (S8.3: 10).
+    pub scheduled_replace_amount_pct: i64,
     /// [SEEDED_SALARY_STREAM] S3.4(b): a scheduled salary seeds/continues a monthly stream.
     #[serde(alias = "SEEDED_SALARY_STREAM")]
     pub seeded_salary_stream: bool,
@@ -207,6 +315,11 @@ pub struct Rules {
     /// i.e. rd and rd+1).
     #[serde(alias = "IV_SKIP_DAYS")]
     pub variable_skip_days: i64,
+    /// [VAR_LONG_PHASE] S8.2.
+    #[serde(alias = "VAR_LONG_PHASE")]
+    pub var_long_phase: VarLongPhase,
+    /// Interval step (days) from which `var_long_phase` applies (S8.2: 21).
+    pub var_long_min_step: i64,
 
     // ---- plans (S1) ---------------------------------------------------------------------
     /// Plans finishing after desired_completion_date are dropped (S1.1 `pays[-1] <= due`).
@@ -239,6 +352,8 @@ impl Default for Rules {
             horizon: Horizon::EndOfMonthPlus(2),
             variable_horizon: None,
             same_day_order: DayOrder::DebitsFirst,
+            same_day_placement: SameDayPlacement::default(),
+            salary_day_order: SalaryDayOrder::DebitsFirst,
             payment_timing: PaymentTiming::AfterDayRows,
             reserve_pending_on_request_date: false,
             ignore_scheduled_before_request_date: true,
@@ -257,9 +372,13 @@ impl Default for Rules {
             stop_income_after_missed_occurrence: true,
             scheduled_replaces_cycle: true,
             scheduled_replacement_window_days: 15,
+            scheduled_replace_scope: ScheduledReplaceScope::CategoryWindow,
+            scheduled_replace_amount_pct: 10,
             seeded_salary_stream: true,
             final_payroll_stops_income: true,
             variable_skip_days: 2,
+            var_long_phase: VarLongPhase::LastSettled,
+            var_long_min_step: 21,
             drop_late_plans: true,
             ignore_payments_after_horizon: true,
             max_spending_changes: 3,
@@ -272,6 +391,31 @@ impl Default for Rules {
 }
 
 impl Rules {
+    pub fn placement_of(&self, kind: DebitKind) -> Placement {
+        use Placement::{AfterCredits, BeforeCredits};
+        if self.same_day_order == DayOrder::CreditsFirst {
+            return AfterCredits;
+        }
+        let bill_or_row = matches!(kind, DebitKind::FixedBill | DebitKind::Scheduled | DebitKind::Reserved);
+        match self.salary_day_order {
+            SalaryDayOrder::DebitsFirst => {}
+            SalaryDayOrder::FixedBillsAfterCredit => return if bill_or_row { AfterCredits } else { BeforeCredits },
+            SalaryDayOrder::BillsAfterCredit => {
+                return if bill_or_row || kind == DebitKind::FlexibleBill { AfterCredits } else { BeforeCredits }
+            }
+            SalaryDayOrder::CreditsFirst => return AfterCredits,
+        }
+        let p = &self.same_day_placement;
+        match kind {
+            DebitKind::FixedBill => p.fixed_bill,
+            DebitKind::FlexibleBill => p.flexible_bill,
+            DebitKind::VariableSpend => p.variable_spend,
+            DebitKind::Scheduled => p.scheduled,
+            DebitKind::Reserved => p.reserved,
+            DebitKind::Evidence => p.evidence,
+        }
+    }
+
     pub fn horizon_end(&self, rd: NaiveDate) -> NaiveDate {
         self.horizon.end(rd)
     }

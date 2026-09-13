@@ -240,6 +240,7 @@ impl Session {
             trough_balance,
             trough_date,
             headroom: trough_balance - profile.minimum_balance_to_keep,
+            trough_drivers: baseline.trough_drivers(),
             horizon_end: baseline.horizon_end(),
             raw_safe_amount: raw_safe,
             safe_amount: safe,
