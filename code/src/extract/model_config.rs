@@ -198,9 +198,26 @@ pub struct ReaderPick<'a> {
 pub struct VlmRoutingConfig {
     #[serde(default)]
     pub default_class: Option<String>,
+    /// Rounding tolerance (currency units) for cross-model agreement/tiebreak matching in
+    /// `extract::images`'s `resolve_blank_amount_agreement` -- how close two readers' (or a
+    /// reader and the tiebreak's) selected amounts must be to count as a match. Distinct
+    /// from `images::ROUNDING_TOLERANCE_2TERM`, which is a fixed accounting-precision
+    /// constant for a document's OWN internal arithmetic (subtotal+tax=total); this one
+    /// governs how strict cross-model agreement is, so it is user/config tunable but capped:
+    /// verifier gate #250 and board decision `decision.accuracy_first` (0 false accepts is a
+    /// hard sign-off gate) require it never exceed the documented default of 1.0 -- a looser
+    /// tolerance would accept more disagreeing reads as "agreeing". Enforced at
+    /// `ModelsConfig::load()` (hard error), defaults to 1.0 when unset.
+    #[serde(default)]
+    pub tolerance: Option<f64>,
     #[serde(default)]
     pub classes: Vec<VlmRouteClass>,
 }
+
+/// Default/maximum cross-model agreement tolerance (verifier gate #250,
+/// `decision.accuracy_first`): 0.5 currency units per side, so two independently rounded
+/// reads of the same figure can still agree.
+const MAX_AGREEMENT_TOLERANCE: f64 = 1.0;
 
 /// Built-in routing (user decision `decision.vlm_setup`): a linked event classifies as
 /// deterministic income/payslip, pending-or-scheduled bill, or settled expense/receipt —
@@ -223,6 +240,7 @@ impl Default for VlmRoutingConfig {
         // preamble, handled by `crate::extract::parse_json_reply`.
         VlmRoutingConfig {
             default_class: Some("settled_expense_receipt".to_string()),
+            tolerance: None,
             classes: vec![
                 VlmRouteClass {
                     name: "income_payslip".to_string(),
@@ -289,6 +307,13 @@ impl ModelsConfig {
     /// a role that doesn't resolve yet (an unset `[selected]` entry is a valid, inactive
     /// config state, not a distinctness violation).
     fn validate_vlm_routing(&self) -> Result<()> {
+        if let Some(tolerance) = self.vlm_routing.tolerance {
+            if !(0.0..=MAX_AGREEMENT_TOLERANCE).contains(&tolerance) {
+                anyhow::bail!(
+                    "[vlm_routing].tolerance must be in [0.0, {MAX_AGREEMENT_TOLERANCE}], got {tolerance} -- decision.accuracy_first requires 0 false accepts, and a looser cross-model agreement tolerance accepts more disagreeing reads as a match"
+                );
+            }
+        }
         for class in &self.vlm_routing.classes {
             if class.readers.len() != 2 {
                 anyhow::bail!(
@@ -354,6 +379,13 @@ impl ModelsConfig {
 
     pub fn image_max_dim_px(&self) -> u32 {
         self.selected.image_max_dim_px.unwrap_or(1024)
+    }
+
+    /// Cross-model agreement/tiebreak matching tolerance (verifier gate #250): `[vlm_routing]
+    /// .tolerance` if set, else `MAX_AGREEMENT_TOLERANCE` (1.0). Validated at `load()` to
+    /// never exceed that ceiling.
+    pub fn agreement_tolerance(&self) -> f64 {
+        self.vlm_routing.tolerance.unwrap_or(MAX_AGREEMENT_TOLERANCE)
     }
 
     pub fn vlm_mode(&self) -> VlmMode {
