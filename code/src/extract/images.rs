@@ -806,6 +806,10 @@ pub struct ImageReadProvenance {
     /// `"field=value"`). A non-summing itemized breakdown is never reported here (module doc,
     /// `extract::witness`) -- only Total/Grand Total/Amount Due/Balance Due/Net Pay count.
     pub contradiction: Option<String>,
+    /// fleet/specs/ocr_vllm_pipeline.md work item A4: the OCR path's fail-closed/audit reason
+    /// codes from `labels::figures_from_rows` (an unmapped label, a role conflict, an
+    /// unparseable cutoff date) -- empty for the VLM path, which has no such notes.
+    pub ocr_notes: Vec<String>,
 }
 
 /// Full resolution for one blank-amount event: every read attempted, the outcome, and the
@@ -977,6 +981,7 @@ fn read_candidate(
         witness: None,
         witness_computed: None,
         contradiction: None,
+        ocr_notes: Vec::new(),
     };
     match call_vlm(client, anthropic, cold, run_idx, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
         Ok(figures) => {
@@ -1276,6 +1281,93 @@ fn find_witnessed_pair(
         }
     }
     None
+}
+
+/// OCR-path resolution (fleet/specs/ocr_vllm_pipeline.md work item A4): Unlimited-OCR already
+/// ran at ingestion and is cached (`extract::ocr::OcrResult`); this reads that cache, maps
+/// every page's rows to `ImageFigures` (`extract::labels::figures_from_rows`), and runs the
+/// SAME deterministic `select` + witness gate the VLM path uses -- `reconciles`/`doc_checks`
+/// don't apply here (there is nothing to reconcile away: the model transcribed the label the
+/// page actually prints, not a value guessed into a fixed JSON key). There is exactly one
+/// deterministic reader, so two-read agreement never applies -- a figure is accepted the
+/// moment `select` finds one AND the witness gate (a witness, no contradiction) clears it;
+/// otherwise the read fails closed, never a guess.
+pub fn resolve_blank_amount_ocr(
+    ocr_result: &crate::extract::ocr::OcrResult,
+    image_id: &str,
+    event: &Event,
+) -> ImageResolution {
+    let outcome = |outcome: &str, reads: Vec<ImageReadProvenance>, evidence: Option<EvidenceRecord>| ImageResolution {
+        image_id: image_id.to_string(),
+        class: None,
+        mode: "ocr".to_string(),
+        reads,
+        outcome: outcome.to_string(),
+        evidence,
+    };
+
+    let currency_hint = normalize::parse_currency(&event.currency);
+    let mut rows = Vec::new();
+    let mut page_notes = Vec::new();
+    for page in &ocr_result.pages {
+        rows.extend(crate::extract::ocr_parse::parse_page(&page.raw_text, page.page, currency_hint.as_deref()));
+        if page.truncated {
+            page_notes.push(format!("page_{}_truncated", page.page));
+        }
+    }
+
+    let (figures, mut notes) = crate::extract::labels::figures_from_rows(&rows, event.cash_date());
+    notes.extend(page_notes);
+
+    let mut prov = ImageReadProvenance {
+        role: "ocr".to_string(),
+        model_id: "baidu/Unlimited-OCR".to_string(),
+        model_revision: String::new(),
+        max_dim_px: 0,
+        max_tokens: 0,
+        reconciled: true,
+        doc_checks: DocValidationResult::default(),
+        selected_amount: None,
+        currency: None,
+        due_date: figures.due_cutoff_date.clone(),
+        before_amount: figures.amount_due_by_cutoff,
+        after_amount: figures.amount_due_after_cutoff,
+        error: None,
+        witness: None,
+        witness_computed: None,
+        contradiction: None,
+        ocr_notes: notes,
+    };
+
+    let Some(amount) = select(&figures, event) else {
+        prov.ocr_notes.push("no_final_label".to_string());
+        return outcome("fail_closed", vec![prov], None);
+    };
+
+    let scope = match event.status {
+        Status::Pending | Status::Scheduled if figures.due_cutoff_date.is_some() => {
+            witness::FinalLabelScope::CutoffResolved
+        }
+        Status::Pending | Status::Scheduled => witness::FinalLabelScope::RemainingOwed,
+        _ => witness::FinalLabelScope::Whole,
+    };
+    let witness_hit = witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
+    let contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
+
+    prov.witness = witness_hit.map(|(kind, _)| kind.label().to_string());
+    prov.witness_computed = witness_hit.map(|(_, computed)| computed);
+    prov.contradiction = contradiction.map(|(field, value)| format!("{field}={value}"));
+
+    if prov.witness.is_none() || prov.contradiction.is_some() {
+        prov.ocr_notes.push(if prov.witness.is_none() { "no_witness".to_string() } else { "contradiction".to_string() });
+        return outcome("fail_closed", vec![prov], None);
+    }
+
+    prov.selected_amount = Some(amount);
+    let currency = figures.currency.clone().unwrap_or_else(|| event.currency.clone());
+    prov.currency = Some(currency.clone());
+    let evidence = build_evidence(image_id, event, amount, currency, &["ocr"]);
+    outcome("witness_accept", vec![prov], Some(evidence))
 }
 
 #[cfg(test)]
@@ -1696,6 +1788,7 @@ mod tests {
             witness: None,
             witness_computed: None,
             contradiction: None,
+            ocr_notes: Vec::new(),
         }
     }
 
@@ -2003,5 +2096,151 @@ mod tests {
                 eprintln!("--- {role} ({}) ---\n{prov:#?}\n", candidate.id);
             }
         }
+    }
+}
+
+/// End-to-end fixture tests for the OCR path (fleet/specs/ocr_vllm_pipeline.md work item A5),
+/// using the lead's local Unlimited-OCR outputs verbatim
+/// (`scratch/ocr_baidu/pagesgundam/final_r1/image_0{1,2,4,5}.md`, copied here dev-only --
+/// production code never names an image id). Images 07/10/11/12 have no local fixture yet
+/// (only 01-06 were captured before this pivot); their e2e expectations from the spec
+/// (07=8528, 10=79679.26, 11=3650, 12=33.50 USD) are not yet covered by a fixture test.
+#[cfg(test)]
+mod ocr_e2e {
+    use super::*;
+    use crate::engine::types::{Direction, Flexibility};
+    use crate::extract::ocr::{OcrPage, OcrResult, OcrUsage};
+
+    fn ocr_result(raw: &str) -> OcrResult {
+        OcrResult {
+            image_id: "test".to_string(),
+            pages: vec![OcrPage { page: 1, raw_text: raw.to_string(), truncated: false, usage: OcrUsage::default() }],
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn event(
+        id: &str,
+        event_type: EventType,
+        category: &str,
+        currency: &str,
+        event_date: NaiveDate,
+        settlement_date: NaiveDate,
+        status: Status,
+    ) -> Event {
+        Event {
+            id: id.to_string(),
+            event_type,
+            description: "x".into(),
+            category: category.into(),
+            direction: Direction::Debit,
+            amount: None,
+            currency: currency.into(),
+            event_date,
+            settlement_date: Some(settlement_date),
+            status,
+            linked_event_id: None,
+            flexibility: Flexibility::Fixed,
+            minimum_allowed_amount: None,
+        }
+    }
+
+    fn accepted_amount(resolution: &ImageResolution) -> f64 {
+        assert_eq!(resolution.outcome, "witness_accept", "reads: {:#?}", resolution.reads);
+        match &resolution.evidence.as_ref().expect("should have evidence").fact {
+            Fact::EventAmount { amount, .. } => amount.to_f64(),
+            other => panic!("expected EventAmount, got {other:?}"),
+        }
+    }
+
+    /// image_01 (payslip, settled income): Net Pay 4,365,000 IDR, three separate `<|det|>text`
+    /// blocks on the same visual row (`"Net Pay"` / `": IDR"` / `"4,365,000"`).
+    #[test]
+    fn image_01_net_pay() {
+        let raw = r#"<|det|>header [70, 117, 228, 130]<|/det|>HUMAN RESOURCE DEPARTMENT
+<|det|>text [460, 160, 546, 175]<|/det|>PAY SLIP Aug-2019
+<|det|>table [70, 178, 814, 234]<|/det|><table><tr><td>Name</td><td>: M NURHUDA SY</td><td>Tax Ref No</td><td>: 899763619907000</td></tr></table>
+<|det|>table [68, 294, 937, 495]<|/det|><table><tr><td colspan="2">Earning Allowances</td><td colspan="3">Deductions</td></tr><tr><td>Salary</td><td>: IDR</td><td>4,500,000</td><td>Deduction BPJS Pen 2% Company</td><td>: IDR 90,000</td></tr></table>
+<|det|>table [68, 504, 937, 694]<|/det|><table><tr><td>Subtotal Earnings</td><td>: IDR</td><td>4,780,800</td><td>Subtotal Deductions</td><td>: IDR</td><td>415,800</td></tr><tr><td>Total Earnings</td><td>: IDR</td><td>4,780,800</td><td>Total Deductions</td><td>: IDR</td><td>415,800</td></tr></table>
+<|det|>text [512, 671, 548, 686]<|/det|>Net Pay
+<|det|>text [789, 671, 821, 685]<|/det|>: IDR
+<|det|>text [888, 671, 930, 685]<|/det|>4,365,000
+<|det|>text [689, 694, 938, 709]<|/det|>Four Million Three Hundred Sixty Five Thousand Rupiahs"#;
+        let event = event(
+            "event_253",
+            EventType::Income,
+            "salary",
+            "IDR",
+            NaiveDate::from_ymd_opt(2019, 8, 31).unwrap(),
+            NaiveDate::from_ymd_opt(2019, 8, 31).unwrap(),
+            Status::Settled,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 4_365_000.0);
+    }
+
+    /// image_02 (rent balance, scheduled): balance_due = 100,000, witnessed by
+    /// total - amount_paid.
+    #[test]
+    fn image_02_balance_due() {
+        let raw = r#"<|det|>table [53, 33, 999, 999]<|/det|><table><tr><td colspan="4">Rent Receipt</td></tr><tr><td>Owner Name</td><td>Vimlesh</td><td></td><td></td></tr><tr><td>Receipt No.</td><td>9453</td><td>Date</td><td>11/08/23</td></tr><tr><td colspan="4">This is to acknowledged the receipt from Yashwant (tenant) to sum of Rupees 2,00,000 towards house rent for the month of April 2022 to September 2022, towards the property bearing the address &quot;24th, 3 floor, 150/2 Enzyme Diamond, 7th Cross Rd, 1st Sector, HSR Layout, Bengaluru, Karnataka 560102</td></tr><tr><td colspan="4">Payment Mode</td></tr><tr><td rowspan="4"></td><td colspan="2">Rent &amp; Maintenance</td><td>1,80,000.00</td></tr><tr><td colspan="2">Water Charges:</td><td>5,000.00</td></tr><tr><td colspan="2">Rental Tax:</td><td>5,000.00</td></tr><tr><td colspan="2">Electrical Charges:</td><td>10,000.00</td></tr><tr><td></td><td colspan="2">Total Amount to be Receiv</td><td>2,00,000.00</td></tr><tr><td>Amount in Words</td><td colspan="2">Amount Received:</td><td>1,00,000.00</td></tr><tr><td></td><td colspan="2">Balance Due:</td><td>1,00,000.00</td></tr></table>"#;
+        let event = event(
+            "event_1442",
+            EventType::Expense,
+            "rent",
+            "INR",
+            NaiveDate::from_ymd_opt(2023, 8, 11).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 8, 16).unwrap(),
+            Status::Scheduled,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 100_000.0);
+    }
+
+    /// image_04 (cropped delivery-app screenshot, settled, history-only): "Item Bill" maps
+    /// only to `subtotal` -- with no total/grand total/amount paid/balance due anywhere on the
+    /// page, `select` finds no final label at all, so this fails closed (never a guess at a
+    /// subtotal standing in for the real, uncaptured total).
+    #[test]
+    fn image_04_no_final_label_fails_closed() {
+        let raw = r#"<|det|>header [41, 27, 278, 47]<|/det|>ITEM DETAILS
+<|det|>text [43, 214, 965, 240]<|/det|>1x [Combo] Nissin Cup Noodles Mazedaar Masala 95.0
+<|det|>footer [40, 944, 160, 965]<|/det|>Item Bill
+<|det|>footer [824, 944, 963, 965]<|/det|>2854.00"#;
+        let event = event(
+            "event_1700",
+            EventType::Expense,
+            "groceries",
+            "INR",
+            NaiveDate::from_ymd_opt(2024, 9, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 9, 3).unwrap(),
+            Status::Settled,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(resolution.outcome, "fail_closed");
+        assert!(resolution.evidence.is_none());
+        assert!(resolution.reads[0].ocr_notes.contains(&"no_final_label".to_string()));
+    }
+
+    /// image_05 (telecom, pending, due-date cutoff): 822.05 after the 06-Feb-2026 cutoff --
+    /// event settles 2026-02-09, after the cutoff.
+    #[test]
+    fn image_05_after_cutoff_amount() {
+        let raw = r#"<|det|>text [13, 20, 294, 56]<|/det|>YOUR ACCOUNT SUMMARY
+<|det|>table [38, 88, 442, 380]<|/det|><table><tr><td>Previous balance</td><td></td><td>3,543.54</td></tr><tr><td>Payments</td><td>-</td><td>3,543.54</td></tr><tr><td>This month&#x27;s charges</td><td>+</td><td>704.05</td></tr><tr><td>Amount due till</td><td></td><td></td></tr><tr><td>06-Feb-2026</td><td>=</td><td>704.05</td></tr><tr><td>Amount due after</td><td></td><td></td></tr><tr><td>06-Feb-2026</td><td>=</td><td>822.05</td></tr></table>
+<|det|>title [544, 20, 800, 56]<|/det|>THIS MONTH'S CHARGES
+<|det|>table [556, 88, 952, 425]<|/det|><table><tr><td></td><td>amount(&#8377;)</td></tr><tr><td>Rentals</td><td>580.65</td></tr><tr><td>Usage charges</td><td>16.00</td></tr><tr><td>Taxes</td><td>107.40</td></tr><tr><td>Total (&#8377;)</td><td>704.05</td></tr></table>
+<|det|>text [572, 432, 860, 456]<|/det|>Total : Seven Hundred Four Rupees and Five Paise Only"#;
+        let event = event(
+            "event_1786",
+            EventType::Expense,
+            "utilities",
+            "INR",
+            NaiveDate::from_ymd_opt(2026, 2, 6).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 2, 9).unwrap(),
+            Status::Pending,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 822.05);
     }
 }
