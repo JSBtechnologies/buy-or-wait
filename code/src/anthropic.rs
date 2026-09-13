@@ -221,7 +221,7 @@ impl AnthropicClient {
             }
         }
 
-        let mut body = json!({
+        let body = json!({
             "model": call.model_id,
             "max_tokens": call.max_tokens,
             "system": call.system_prompt,
@@ -229,14 +229,16 @@ impl AnthropicClient {
         });
         // Deliberately NOT sending temperature/top_p/top_k — Opus 5 returns
         // 400 Bad Request if any of these are present in the body.
-        if call.json_response {
-            if let Some(schema) = &call.json_schema {
-                body["output_config"] = json!({
-                    "effort": "low",
-                    "format": { "type": "json_schema", "schema": schema },
-                });
-            }
-        }
+        //
+        // Also deliberately NOT sending output_config.format.json_schema
+        // (lead directive, after 3 live schema-validation errors in a row —
+        // type-array+enum rejection, the 16-union-field cap, then "Schema is
+        // too complex" even after both fixes): relies on the prompt text
+        // alone to ask for JSON, the same path every HF-router model in this
+        // project already uses. The lenient parser (`parse_json_reply`) plus
+        // reconciliation/grounding/agreement already validate every read
+        // regardless of provider, so one consistent parse path across
+        // providers is simpler than a second structured-output contract.
 
         let started = Instant::now();
         let response = self
