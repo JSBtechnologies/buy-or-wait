@@ -145,6 +145,10 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         None
     };
+    // Backup frontier model for the VLM agreement tiebreak (decision.claude_backup). Also only
+    // constructed when a model is actually selected; ANTHROPIC_API_KEY may be unset even then,
+    // in which case the tiebreak path is simply unavailable this run.
+    let anthropic_client: Option<AnthropicClient> = if use_models { AnthropicClient::new().ok() } else { None };
     let model_ctx = ModelContext {
         config: &models_config,
         client: hf_client.as_ref(),
@@ -353,6 +357,11 @@ fn decide_one(
     if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
         if model_ctx.config.vlm_primary().is_some() {
             let image_max_dim_px = model_ctx.config.image_max_dim_px();
+            let history: Vec<Event> = events
+                .iter()
+                .filter(|e| e.user_id == request.user_id)
+                .filter_map(|e| Event::from_model(e).ok())
+                .collect();
             for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
                 let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
                     continue;
@@ -377,6 +386,7 @@ fn decide_one(
                     &image.image_id,
                     model_ctx.config,
                     &typed_event,
+                    &history,
                 ) {
                     Ok(resolution) => {
                         let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {

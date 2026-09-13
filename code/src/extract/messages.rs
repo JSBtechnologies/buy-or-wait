@@ -129,14 +129,14 @@ pub fn skeleton(text: &str) -> String {
     names.replace_all(&t, "<ORG>").into_owned()
 }
 
-/// Prefers the shared `normalize::parse_amount` (handles lakh grouping, dot-thousands, etc.
-/// consistently with the image path); falls back to the old permissive strip-commas-and-
-/// parse behavior when the strict parser rejects a shape as ambiguous, since this function's
-/// caller already isolated the text via a regex match on a known, controlled skeleton
-/// template (never free-form text), so the input is a real number by construction -- 0.0 is
-/// only ever reached for a shape neither parser recognizes at all.
-fn amt(s: &str) -> f64 {
-    normalize::parse_amount(s, None).unwrap_or_else(|| s.replace(',', "").parse().unwrap_or(0.0))
+/// Analyst audit #301 (G4, CRITICAL): a regex-captured amount that fails to parse must
+/// become `None`, never a silent `0.0` -- a blank/unparseable amount is not the same fact as
+/// a stated zero, and every caller here already treats `None` correctly (e.g. `SalaryChange`
+/// with `(None, Some(date))` becomes `IncomeDateMoved` instead of a fabricated
+/// `IncomeAmountChange` of 0). Delegates to the shared `normalize::parse_amount` so this
+/// stays consistent with the image path's number parsing.
+fn amt(s: &str) -> Option<f64> {
+    normalize::parse_amount(s, None, false)
 }
 
 fn blank_record(record_type: RecordType) -> MessageRecord {
@@ -209,7 +209,7 @@ pub fn parse_known_skeleton(text: &str, sent_at: NaiveDate) -> Option<Vec<Messag
     if let Some(c) = regex::Regex::new(RE_SALARY_LEAVE_EN).unwrap().captures(text) {
         let mut r = blank_record(RecordType::SalaryChange);
         r.currency = Some(c[1].to_string());
-        r.amount = Some(amt(&c[2]));
+        r.amount = amt(&c[2]);
         r.date = Some(sent_at.format("%Y-%m-%d").to_string());
         r.direction = Some(RecordDirection::Decrease);
         r.status_hint = Some(StatusHint::Confirmed);
@@ -239,7 +239,7 @@ pub fn parse_known_skeleton(text: &str, sent_at: NaiveDate) -> Option<Vec<Messag
         // so to_evidence() routes it there instead of a plain amount change.
         let mut salary = blank_record(RecordType::SalaryFirstConfirmed);
         salary.currency = Some(c[1].to_string());
-        salary.amount = Some(amt(&c[2]));
+        salary.amount = amt(&c[2]);
         salary.date = Some(c[3].to_string());
         salary.direction = Some(RecordDirection::Increase);
         salary.status_hint = Some(StatusHint::Confirmed);
@@ -349,7 +349,7 @@ pub fn parse_known_skeleton(text: &str, sent_at: NaiveDate) -> Option<Vec<Messag
         if let Some(c) = regex::Regex::new(re).unwrap().captures(text) {
             let mut r = blank_record(RecordType::OneTimeAdjustment);
             r.currency = Some(c[1].to_string());
-            r.amount = Some(amt(&c[2]));
+            r.amount = amt(&c[2]);
             r.date = Some(c[3].to_string());
             r.status_hint = Some(StatusHint::Confirmed);
             r.category_hint = Some("invoice_income".to_string());
@@ -365,7 +365,7 @@ pub fn parse_known_skeleton(text: &str, sent_at: NaiveDate) -> Option<Vec<Messag
     for re in [RE_RENT_PCT_EN, RE_RENT_PCT_ID] {
         if let Some(c) = regex::Regex::new(re).unwrap().captures(text) {
             let mut r = blank_record(RecordType::RecurringExpenseChange);
-            r.percent = Some(amt(&c[1]));
+            r.percent = amt(&c[1]);
             r.status_hint = Some(StatusHint::Confirmed);
             r.direction = Some(RecordDirection::Increase);
             r.category_hint = Some("rent".to_string());
@@ -586,7 +586,7 @@ fn unconfirmed_record(note: &str) -> MessageRecord {
 fn salary_change_record(c: &regex::Captures, direction: &str, note: &str) -> MessageRecord {
     let mut r = blank_record(RecordType::SalaryChange);
     r.currency = Some(c[1].to_string());
-    r.amount = Some(amt(&c[2]));
+    r.amount = amt(&c[2]);
     r.date = Some(c[3].to_string());
     r.direction = Some(if direction == "increase" { RecordDirection::Increase } else { RecordDirection::Decrease });
     r.status_hint = Some(StatusHint::Confirmed);
@@ -598,7 +598,7 @@ fn salary_change_record(c: &regex::Captures, direction: &str, note: &str) -> Mes
 fn salary_next_amount_record(c: &regex::Captures, note: &str) -> MessageRecord {
     let mut r = blank_record(RecordType::SalaryChange);
     r.currency = Some(c[1].to_string());
-    r.amount = Some(amt(&c[2]));
+    r.amount = amt(&c[2]);
     r.direction = Some(RecordDirection::Decrease);
     r.status_hint = Some(StatusHint::Scheduled);
     r.category_hint = Some("salary".to_string());
@@ -618,7 +618,7 @@ fn salary_date_moved_record(c: &regex::Captures) -> MessageRecord {
 fn first_salary_record(c: &regex::Captures) -> MessageRecord {
     let mut r = blank_record(RecordType::SalaryFirstConfirmed);
     r.currency = Some(c[1].to_string());
-    r.amount = Some(amt(&c[2]));
+    r.amount = amt(&c[2]);
     r.date = Some(c[3].to_string());
     r.status_hint = Some(StatusHint::Confirmed);
     r.category_hint = Some("salary".to_string());
@@ -675,7 +675,16 @@ pub fn extract_batch(
         temperature: decoding.temperature,
         seed: decoding.seed,
         max_tokens: decoding.max_tokens_llm,
-        json_response: candidate.supports_structured_output,
+        // ml-engineer's step-5 harness (blocker.msg86_json_array_mismatch): this call's
+        // contract is a top-level JSON *array* (one entry per batched message), but
+        // `response_format: json_object` requires a top-level *object* on every provider
+        // that implements it -- SEA-LION and its DeepSeek fallback both collapsed a batch
+        // to one bare `{message_id, records}` object instead of the array this parses
+        // below. That breaks any batch, including production's single-message batch=1 call
+        // for msg_86. Never force structured-output mode for this array-shaped contract;
+        // the prompt's own "strict JSON only" instruction is what every other array-shaped
+        // path here already relies on.
+        json_response: false,
         json_schema: None,
     };
     let response =
