@@ -197,11 +197,14 @@ pub struct Read {
     pub max_tokens: Option<u32>,
     pub reconciled: bool,
     pub selected_amount: Option<f64>,
-    #[serde(default)]
+    /// v1 `due_date`; prompt v2 (RULES.md S5, analyst 40edcb5) `due_cutoff_date`.
+    #[serde(default, alias = "due_cutoff_date")]
     pub due_date: Option<String>,
-    #[serde(default)]
+    /// v1 `before_amount`; v2 `amount_due_by_cutoff`.
+    #[serde(default, alias = "amount_due_by_cutoff")]
     pub before_amount: Option<f64>,
-    #[serde(default)]
+    /// v1 `after_amount`; v2 `amount_due_after_cutoff`.
+    #[serde(default, alias = "amount_due_after_cutoff")]
     pub after_amount: Option<f64>,
     /// Every other field of the read, kept so a renamed cutoff field cannot silently switch
     /// the due-date rule off (IA13).
@@ -250,11 +253,26 @@ fn parse_day(s: &str) -> Option<NaiveDate> {
     ["%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%Y"].iter().find_map(|f| NaiveDate::parse_from_str(s.trim(), f).ok())
 }
 
-/// Cutoff requirement resolved by one read: after-cutoff amount iff cash date > due date.
-fn requirement(r: &Read, e: &Event) -> Option<f64> {
-    let due = r.due_date.as_deref().and_then(parse_day)?;
+/// What the due-date cutoff demands of a read (RULES.md S5 v2).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cutoff {
+    /// No parseable cutoff on this read.
+    None,
+    /// The figure that applies on the event's cash date.
+    Required(f64),
+    /// Cash date is after the cutoff but the read has no after-cutoff amount: nothing valid,
+    /// never fall back to the by-cutoff amount.
+    NothingValid,
+}
+
+fn requirement(r: &Read, e: &Event) -> Cutoff {
+    let Some(due) = r.due_date.as_deref().and_then(parse_day) else { return Cutoff::None };
     let req = if e.cash_date() > due { r.after_amount } else { r.before_amount };
-    req.filter(|v| *v > 0.0)
+    match req.filter(|v| *v > 0.0) {
+        Some(v) => Cutoff::Required(v),
+        None if e.cash_date() > due => Cutoff::NothingValid,
+        None => Cutoff::None,
+    }
 }
 
 fn close(a: f64, b: f64, tol: f64) -> bool {
@@ -277,7 +295,7 @@ fn slot_problem(r: &Read, slot: &Slot) -> Option<String> {
 pub fn decide(routing: &Routing, class: &Class, p: &Provenance, e: &Event) -> (&'static str, Option<f64>, Vec<String>) {
     let tol = routing.tolerance;
     let mut notes = Vec::new();
-    let reqs: Vec<f64> = p.reads.iter().filter_map(|r| requirement(r, e)).collect();
+    let reqs: Vec<f64> = p.reads.iter().filter_map(|r| match requirement(r, e) { Cutoff::Required(v) => Some(v), _ => None }).collect();
     if reqs.windows(2).any(|w| !close(w[0], w[1], tol)) {
         notes.push(format!("reads resolve conflicting cutoff requirements {reqs:?}"));
         return ("missing", None, notes);
@@ -290,6 +308,9 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, e: &Event) -> (&
             .or_else(|| {
                 let a = r.selected_amount.unwrap();
                 (matches!(e.status.as_str(), "pending" | "scheduled") && a <= 0.0).then(|| format!("{} event figure {a} <= 0", e.status))
+            })
+            .or_else(|| {
+                (requirement(r, e) == Cutoff::NothingValid).then(|| format!("cash date {} is after this read's cutoff but it has no after-cutoff amount: nothing valid", e.cash_date()))
             })
             .or_else(|| {
                 let a = r.selected_amount.unwrap();
@@ -530,6 +551,17 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         json!({"role": role, "model_id": model, "model_revision": "x", "max_dim_px": px, "max_tokens": tokens, "reconciled": ok,
                "selected_amount": amt, "currency": "INR", "due_date": null, "before_amount": null, "after_amount": null, "error": null})
     }
+    /// Prompt v2 read: drop the v1 cutoff keys so only the v2 names are present.
+    fn v2(mut r: Value, due: &str, by: Option<f64>, after: Option<f64>) -> Value {
+        let o = r.as_object_mut().unwrap();
+        for k in ["due_date", "before_amount", "after_amount"] {
+            o.remove(k);
+        }
+        o.insert("due_cutoff_date".into(), json!(due));
+        o.insert("amount_due_by_cutoff".into(), json!(by));
+        o.insert("amount_due_after_cutoff".into(), json!(after));
+        r
+    }
     fn anthropic(mut r: Value) -> Value {
         r["provider"] = json!("anthropic");
         r
@@ -643,10 +675,25 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         let v = run("i", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "no_agreement", None), CONFIG);
         assert!(errors(&v).is_empty() && v.contains(&("IA6_outcome_mismatch", Severity::Warn)), "{v:?}");
 
+        // Prompt v2 field names are mapped: both readers pick the by-cutoff figure after the cutoff -> no accept.
+        let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", Some(120.75), Some(150.25));
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
+        let e = errors(&run("v2a", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement") && !e.contains(&"IA13_unmapped_cutoff_field") && !e.contains(&"IA0_provenance_unreadable"), "{e:?}");
+        // ...and on the after-cutoff figure: accept.
+        let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", Some(120.75), Some(150.25));
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25)));
+        assert!(errors(&run("v2b", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG)).is_empty());
+        // v2: after the cutoff with no after-cutoff amount -> nothing valid, never the by-cutoff figure.
+        let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", Some(120.75), None);
+        let c = anthropic(v2(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)), "2026-02-06", Some(120.75), None));
+        let e = errors(&run("v2c", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
+
         // A renamed cutoff field (e.g. a prompt v2 schema) must not silently disable the cutoff rule.
         let mut q = read("vlm_primary", Q, 1024, 400, true, Some(120.75));
         q["cutoff_date"] = json!("2026-02-06");
-        q["amount_due_after_cutoff"] = json!(150.25);
+        q["amount_payable_after_deadline"] = json!(150.25);
         let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
         let e = errors(&run("r", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
         assert!(e.contains(&"IA13_unmapped_cutoff_field"), "{e:?}");
