@@ -309,6 +309,8 @@ Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
 | 15 | event_9806 transport, settled, INR | **9,968.00** grand total | 9,580 (air travel line incl. taxes), 9,512 (total excl. tax), 9,124 taxable | history |
 | 16 | event_10521 transport, settled, INR | **393.22** total | 333.24 energy amount; 29.99 each GST | history (message_86 confirms date only) |
 
+**Sign-off gate (user decision `decision.accuracy_first`):** for every model-derived fact, a flagged missing value always beats a wrong one. The image/message audit signs off only when **false accepts = 0** (a wrong amount accepted counts even once, on any read combination). "Unverifiable" (no reads for a routed model) is **not** a pass, and "missing/escalated" is acceptable. Validation has no time cutoff: audits wait for the data instead of reporting partial results as final.
+
 Cash-moving images (change a request's forecast): **02, 05, 10, 11**. The other 12 only feed stream estimators, and a missing figure there is safe (row excluded) as long as it is never read as 0.
 
 ---
