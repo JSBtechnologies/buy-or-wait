@@ -329,6 +329,17 @@ Routing for the audit (board `decision.vlm_routing_v2`, `decision.tiebreak_disti
 
 Cash-moving images (change a request's forecast): **02, 05, 10, 11**. The other 12 only feed stream estimators, and a missing figure there is safe (row excluded) as long as it is never read as 0.
 
+**Routing v3 gate result (ml-engineer 28b0b72/5bdb0f2 reads; 235B + gemma primary, claude-opus-5 tiebreak only; cutoff-date agreement guard on; `scratch/gate_v2.py` ROUTING=v3 GUARD=date).** Reads from `ml-engineer/code/store/bakeoff_cache_v2` (50 files, all attributed). Every read combination: accept_ok_pair 33, accept_ok_tiebreak 3, escalate 4, **FALSE_ACCEPT 0**. The result is the same without the date guard.
+
+| image | 235B | gemma | claude | outcome |
+|---|---|---|---|---|
+| 04 | 2,854 | null | null | escalate (history only; row excluded, safe) |
+| 11 (cash) | null | 3,650 | 3,650 | tiebreak accept 3,650 (**needs the cached claude read**; Anthropic capped until 2026-10-01) |
+| 15 | 9,968 | null | 9,968 | tiebreak accept (history only) |
+| other 13 | agree | agree | – | pair accept, all equal to the S5 expected figure |
+
+**Limit:** the cache keeps one response per (model, image, prompt). The five per-run reads behind the N=5 claim were not saved, so the "all N=5 combinations" gate **cannot be checked from disk**. The per-run evidence is only in bakeoff.md: gemma was 5/5 stable, and 235B returned null on image_02 in 1 run out of 5. A null cannot become a false accept, because agreement needs two non-null values. In that run, gemma and claude both read 100,000 and the tiebreak picks it. Signing off the literal N=5 gate needs each run's raw read saved separately.
+
 ---
 
 ## S1. Plan candidates, eligibility, selection, status/method mapping
