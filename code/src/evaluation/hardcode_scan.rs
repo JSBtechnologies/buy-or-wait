@@ -71,10 +71,16 @@ pub fn forbidden_figures(dataset_dir: &Path, gold: Option<&Path>) -> Result<BTre
         }
         walk(&v, &mut set);
     }
-    // Figures the verifier read from images for VLM validation (bus extract#130): gold only.
-    set.extend([7_967_926, 365_000]);
     set.retain(|c| *c >= 1000_00);
     Ok(set)
+}
+
+/// Every figure (expected and alt) in the analyst's image audit reference, read at runtime from
+/// RULES.md. Validation only: no audit figure is compiled into this crate.
+pub fn image_gold(rules_md: Option<&Path>) -> Option<BTreeSet<Cents>> {
+    let text = std::fs::read_to_string(rules_md?).ok()?;
+    let set: BTreeSet<Cents> = super::false_accepts::gold_from_rules(&text).into_values().flat_map(|g| g.amounts).collect();
+    (!set.is_empty()).then_some(set)
 }
 
 /// Numeric literals in code as cents under each plausible scale (units, cents, 1e4 Money).
@@ -111,16 +117,28 @@ fn literal_values(code: &str) -> Vec<(usize, Vec<Cents>, String)> {
     out
 }
 
-pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<Vec<Finding>> {
+/// Prediction modules (engine, extract, main.rs) must not contain record ids, label/gold/audit
+/// figures, or references to label/gold/audit files. Test code anywhere under `code/` is reported
+/// (warning) when it embeds an image audit figure, so owners can keep the package free of anything
+/// that looks like precomputed answers.
+pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>, rules_md: Option<&Path>) -> Result<Vec<Finding>> {
     let figures = forbidden_figures(dataset_dir, gold)?;
+    let mut out = Vec::new();
+    let images = match image_gold(rules_md) {
+        Some(i) => i,
+        None => {
+            out.push(Finding { request_id: "RULES.md".into(), severity: Severity::Error, code: "H0_audit_reference_unavailable", detail: "image audit table not found: image figures cannot be scanned".into() });
+            BTreeSet::new()
+        }
+    };
     let mut files = Vec::new();
     for sub in ["src/engine", "src/extract"] {
         rust_files(&code_dir.join(sub), &mut files);
     }
+    files.push(code_dir.join("src/main.rs"));
     files.sort();
-    let mut out = Vec::new();
     for f in files {
-        let text = std::fs::read_to_string(&f)?;
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
         let Some(code) = production_part(&f, &text) else { continue };
         let rel = f.strip_prefix(code_dir).unwrap_or(&f).display().to_string().replace('\\', "/");
         let mut push = |line: usize, code_: &'static str, detail: String| {
@@ -142,7 +160,7 @@ pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<
                     rest = &rest[pos + 1..];
                 }
             }
-            for needle in ["sample_requests.csv", "gold_subset"] {
+            for needle in ["sample_requests.csv", "gold_subset", "RULES.md", "false_accepts", "image_gold", "image_audit"] {
                 if line.contains(needle) {
                     push(lineno + 1, "H3_label_file_reference", needle.to_string());
                 }
@@ -152,6 +170,50 @@ pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<
         for (line, vals, tok) in literal_values(&comment_free) {
             if let Some(hit) = vals.iter().find(|v| figures.contains(v)) {
                 push(line, "H2_label_or_gold_figure", format!("literal {tok} equals label/gold figure {}", super::data::fmt_cents_2dp(*hit)));
+            } else if let Some(hit) = vals.iter().find(|v| images.contains(v)) {
+                push(line, "H4_image_gold_figure", format!("literal {tok} equals an image audit figure {} (validation only)", super::data::fmt_cents_2dp(*hit)));
+            }
+        }
+    }
+
+    // Appearance: audit figures embedded in test code anywhere in the shipped package.
+    let mut all = Vec::new();
+    rust_files(&code_dir.join("src"), &mut all);
+    rust_files(&code_dir.join("tests"), &mut all);
+    all.sort();
+    for f in all {
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        let name = f.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let whole_file_is_test = name.contains("test") || name == "samples.rs" || f.starts_with(code_dir.join("tests"));
+        let offset = if whole_file_is_test {
+            0
+        } else {
+            match text.find("#[cfg(test)]") {
+                Some(i) => i,
+                None => continue,
+            }
+        };
+        let test_part = &text[offset..];
+        let base_line = text[..offset].matches('\n').count();
+        let rel = f.strip_prefix(code_dir).unwrap_or(&f).display().to_string().replace('\\', "/");
+        let comment_free: String = test_part.lines().map(|l| if l.trim_start().starts_with("//") { "" } else { l }).collect::<Vec<_>>().join("\n");
+        for (line, vals, tok) in literal_values(&comment_free) {
+            // Appearance only matters for distinctive figures (>= 4 significant digits); round
+            // numbers like 100000 or 723 coincide with test fixtures by chance.
+            let distinctive = |c: &Cents| {
+                let mut v = *c;
+                while v > 0 && v % 10 == 0 {
+                    v /= 10;
+                }
+                v >= 1000
+            };
+            if let Some(hit) = vals.iter().find(|v| images.contains(v) && distinctive(v)) {
+                out.push(Finding {
+                    request_id: format!("{rel}:{}", base_line + line),
+                    severity: Severity::Warn,
+                    code: "H6_audit_figure_in_test_code",
+                    detail: format!("test literal {tok} equals an image audit figure {}; prefer synthetic values or reading RULES.md at test time", super::data::fmt_cents_2dp(*hit)),
+                });
             }
         }
     }
@@ -162,31 +224,60 @@ pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>) -> Result<
 mod tests {
     use super::*;
 
+    /// Synthetic audit table for tests (no real audit figures in this crate).
+    fn synthetic_rules(dir: &Path) -> std::path::PathBuf {
+        let p = dir.join("RULES.md");
+        std::fs::write(&p, "| 01 | event_1 salary, settled | **2,468,000** net pay | x | y |\n| 02 | event_2 utilities, **pending** | **654.32** amount due (alt 654.3 \"Total\") | x | y |\n").unwrap();
+        p
+    }
+
+    #[test]
+    fn reference_comes_from_rules_md_only() {
+        let dir = std::env::temp_dir().join(format!("verifier_hc_ref_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let set = image_gold(Some(&synthetic_rules(&dir))).unwrap();
+        assert_eq!(set.into_iter().collect::<Vec<_>>(), vec![654_30, 654_32, 2_468_000_00]);
+        assert!(image_gold(Some(&dir.join("missing.md"))).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn detects_ids_figures_and_label_files_but_not_tests_or_comments() {
         let root = std::env::temp_dir().join(format!("verifier_hardcode_{}", std::process::id()));
         let eng = root.join("src/engine");
         std::fs::create_dir_all(&eng).unwrap();
+        let rules = synthetic_rules(&root);
         std::fs::write(
             eng.join("plans.rs"),
             "// request_03 label 873000 in a comment is fine\n\
              fn f(id: &str) -> i64 { if id == \"request_03\" { return 873_000; } 0 }\n\
-             const SALARY_CENTS: i64 = 436500000;\n\
+             const SALARY_CENTS: i64 = 246800000;\n\
              fn g() { let _ = std::fs::read(\"../dataset/sample_requests.csv\"); }\n\
              const DAYS: i64 = 90;\n\
-             #[cfg(test)] mod t { const X: i64 = 873000; fn h() { let _ = \"event_12\"; } }\n",
+             #[cfg(test)] mod t { const X: i64 = 873000; const Y: f64 = 654.32; fn h() { let _ = \"event_12\"; } }\n",
         )
         .unwrap();
         std::fs::write(eng.join("scenario_tests.rs"), "const Y: &str = \"event_476\";").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { let _ = std::fs::read_to_string(\"../RULES.md\"); }\n").unwrap();
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
-        let f = scan(&root, &dir, None).unwrap();
-        let codes: Vec<(&str, &str)> = f.iter().map(|x| (x.request_id.as_str(), x.code)).collect();
-        assert!(codes.contains(&("src/engine/plans.rs:2", "H1_record_id_literal")), "{f:?}");
-        assert!(codes.contains(&("src/engine/plans.rs:2", "H2_label_or_gold_figure")), "{f:?}");
-        assert!(codes.contains(&("src/engine/plans.rs:4", "H3_label_file_reference")), "{f:?}");
-        // comment (line 1), a small constant (5), cfg(test) code (6) and test files are ignored
-        assert_eq!(f.len(), 3, "{f:?}");
-        assert!(!codes.iter().any(|(l, _)| l.contains("scenario_tests") || l.ends_with(":1") || l.ends_with(":5") || l.ends_with(":6")));
+        let f = scan(&root, &dir, None, Some(&rules)).unwrap();
+        let errs: Vec<(&str, &str)> = f.iter().filter(|x| x.severity == Severity::Error).map(|x| (x.request_id.as_str(), x.code)).collect();
+        assert!(errs.contains(&("src/engine/plans.rs:2", "H1_record_id_literal")), "{f:?}");
+        assert!(errs.contains(&("src/engine/plans.rs:2", "H2_label_or_gold_figure")), "{f:?}");
+        assert!(errs.contains(&("src/engine/plans.rs:3", "H4_image_gold_figure")), "{f:?}");
+        assert!(errs.contains(&("src/engine/plans.rs:4", "H3_label_file_reference")), "{f:?}");
+        assert!(errs.contains(&("src/main.rs:1", "H3_label_file_reference")), "{f:?}");
+        assert_eq!(errs.len(), 5, "{f:?}");
+        // The audit figure inside cfg(test) is only an appearance warning.
+        assert!(f.iter().any(|x| x.severity == Severity::Warn && x.code == "H6_audit_figure_in_test_code" && x.request_id.starts_with("src/engine/plans.rs:")), "{f:?}");
+
+        // Image audit figures in units, cents and Money(1e4) forms, incl. the alt rendering.
+        std::fs::write(eng.join("plans.rs"), "const A: f64 = 654.32;\nconst B: i64 = 65430;\nconst C: i64 = 6_543_200;\nconst OK: f64 = 1.5;\n").unwrap();
+        let f = scan(&root, &dir, None, Some(&rules)).unwrap();
+        let lines: Vec<&str> = f.iter().filter(|x| x.code == "H4_image_gold_figure").map(|x| x.request_id.as_str()).collect();
+        assert_eq!(lines, vec!["src/engine/plans.rs:1", "src/engine/plans.rs:2", "src/engine/plans.rs:3"], "{f:?}");
+        // No audit reference: the scan cannot vouch for image figures, so it fails.
+        assert!(scan(&root, &dir, None, None).unwrap().iter().any(|x| x.code == "H0_audit_reference_unavailable"));
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use buyorwait::anthropic::AnthropicClient;
+use buyorwait::engine::ledger::Fact;
 use buyorwait::engine::session::Session;
 use buyorwait::engine::types::{Event, PaymentOption, RateTable, RequestSpec};
 use buyorwait::engine::Rules;
 use buyorwait::evaluation::{Finding, ForecastSeries, InvariantViolation, Invariants};
+use buyorwait::extract::intake;
 use buyorwait::extract::messages::{deterministic_evidence, llm_evidence};
 use buyorwait::extract::model_config::ModelsConfig;
 use buyorwait::extract::prompts::{self, PromptSet};
@@ -16,6 +19,7 @@ use buyorwait::hf::{self, HfClient};
 use buyorwait::model;
 use buyorwait::store::cache::DiskCache;
 use buyorwait::store::processed::ProcessedStore;
+use chrono::NaiveDate;
 use serde::Deserialize;
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -26,6 +30,15 @@ fn main() -> anyhow::Result<ExitCode> {
     if args.get(1).map(String::as_str) == Some("verify") {
         let code = buyorwait::evaluation::cli(&args[2..])?;
         return Ok(ExitCode::from(code.clamp(0, 255) as u8));
+    }
+
+    // `buyorwait ask --user <id> --text "..."` is the interactive mode of PLAN.md §2.6: the
+    // request arrives as free text instead of `requests.csv` columns, so it goes through
+    // `extract::intake::parse_request_text` to build the same `RequestSpec` batch mode builds
+    // from columns. Not part of the graded batch pipeline above (never touches `output.csv`),
+    // and never runs with `[selected]` absent since it has no non-model path to a `RequestSpec`.
+    if args.get(1).map(String::as_str) == Some("ask") {
+        return run_ask(&args[2..]);
     }
 
     let mut cold = false;
@@ -118,6 +131,10 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         None
     };
+    // Backup frontier model for the VLM agreement tiebreak (decision.claude_backup). Also
+    // only constructed when a model is actually selected; ANTHROPIC_API_KEY may be unset
+    // even then, in which case the tiebreak path is simply unavailable this run.
+    let anthropic_client: Option<AnthropicClient> = if use_models { AnthropicClient::new().ok() } else { None };
     let image_prompt = if models_config.vlm_primary().is_some() && hf_client.is_some() {
         Some(prompts::load(Path::new("prompts/image_transcription.v1.md"), "User prompt template")?)
     } else {
@@ -131,6 +148,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let model_ctx = ModelContext {
         config: &models_config,
         client: hf_client.as_ref(),
+        anthropic: anthropic_client.as_ref(),
         cold,
         image_prompt: image_prompt.as_ref(),
         message_prompt: message_prompt.as_ref(),
@@ -192,7 +210,10 @@ fn main() -> anyhow::Result<ExitCode> {
     // into `decide_one`); `write_usage_report` still renders every required section with
     // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
     let pricing = load_pricing(Path::new("config/models.toml"))?;
-    let usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
+    let mut usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
+    if let Some(client) = anthropic_client.as_ref() {
+        usage_records.extend(client.usage_records());
+    }
     hf::write_usage_report(
         Path::new("evaluation/usage_report.md"),
         &usage_records,
@@ -205,12 +226,100 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Interactive-mode entry point (PLAN.md §2.6): `buyorwait ask --user <id> --text "..." [--date
+/// YYYY-MM-DD]`. Requires an active `[selected]` `llm_primary` in `config/models.toml` --
+/// unlike batch mode, free text has no columns to fall back to, so with no model selected this
+/// prints a clear message instead of guessing a field.
+fn run_ask(args: &[String]) -> anyhow::Result<ExitCode> {
+    let mut user_id: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut date: Option<NaiveDate> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--user" => {
+                user_id = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--user needs a value"))?,
+                );
+            }
+            "--text" => {
+                text = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("--text needs a value"))?,
+                );
+            }
+            "--date" => {
+                let s = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--date needs a value"))?;
+                date = Some(
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .map_err(|e| anyhow::anyhow!("--date {s:?}: {e}"))?,
+                );
+            }
+            other => anyhow::bail!("unexpected argument {other:?} (usage: ask --user <id> --text \"...\" [--date YYYY-MM-DD])"),
+        }
+    }
+    let user_id = user_id.ok_or_else(|| anyhow::anyhow!("ask needs --user <id>"))?;
+    let text = text.ok_or_else(|| anyhow::anyhow!("ask needs --text \"...\""))?;
+    let request_date = date.unwrap_or_else(|| chrono::Local::now().date_naive());
+
+    let dataset_dir = Path::new("../dataset");
+    let profiles = model::load_financial_profiles(dataset_dir.join("financial_profiles.csv"))?;
+    let events = model::load_financial_events(dataset_dir.join("financial_events.csv"))?;
+    let rates = model::load_exchange_rates(dataset_dir.join("exchange_rates.csv"))?;
+    let rates = Arc::new(RateTable::from_model(&rates));
+
+    let models_config = ModelsConfig::load(Path::new("config/models.toml"))?;
+    let Some(llm_primary) = models_config.llm_primary() else {
+        anyhow::bail!(
+            "interactive mode needs an active `[selected]` llm_primary in config/models.toml; \
+             none is configured yet (see PLAN.md §2.6 and board decision.selected_activation_question) -- \
+             batch mode (`cargo run --release`) is unaffected, it never needs a model for intake"
+        );
+    };
+    let client = HfClient::new()?;
+    let prompt = prompts::load(
+        Path::new("prompts/request_text_extraction.v1.md"),
+        "User prompt template",
+    )?;
+
+    let Some(spec) = intake::parse_request_text(&client, false, &prompt, &models_config.decoding, llm_primary, &text)?
+    else {
+        eprintln!(
+            "could not ground amount, deadline, and type in the request text -- \
+             refusing to guess a decision-affecting default"
+        );
+        return Ok(ExitCode::FAILURE);
+    };
+
+    let session = Session::from_model(&user_id, &profiles, &events, rates, Rules::default())?;
+    // No `request_payment_options.csv` row exists for an ad hoc text request, so only the
+    // full-payment/wait/spending-change candidates (PLAN.md §2.8) are considered; no
+    // installment option can be offered.
+    let decision = session.decide("ask", request_date, &spec, &[])?;
+    let row = decision.row;
+    println!("amount_safe_to_pay: {}", row.amount_safe_to_pay);
+    println!("affordability_status: {}", row.affordability_status);
+    println!("recommended_payment_method: {}", row.recommended_payment_method);
+    println!("payment_plan: {}", row.payment_plan);
+    println!("earliest_date_for_full_payment: {}", row.earliest_date_for_full_payment);
+    println!("spending_changes_needed: {}", row.spending_changes_needed);
+    println!("decision_explanation: {}", row.decision_explanation);
+
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The model path's shared, load-once state (PLAN.md §2.11: one client, one prompt load
 /// per file, reused across every request). Every field stays `None` when no model is
 /// selected in `config/models.toml`, which keeps the whole model path inactive.
 struct ModelContext<'a> {
     config: &'a ModelsConfig,
     client: Option<&'a HfClient>,
+    anthropic: Option<&'a AnthropicClient>,
     cold: bool,
     image_prompt: Option<&'a PromptSet>,
     message_prompt: Option<&'a PromptSet>,
@@ -241,39 +350,85 @@ fn decide_one(
     let home_currency = session.profile().home_currency.clone();
     let mut facts = deterministic_evidence(&evidence.messages, &home_currency);
 
-    if let (Some(client), Some(prompt), Some(vlm_primary)) =
-        (model_ctx.client, model_ctx.image_prompt, model_ctx.config.vlm_primary())
-    {
-        let vlm_escalation = model_ctx.config.vlm_escalation();
-        let image_max_dim_px = model_ctx.config.image_max_dim_px();
-        for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
-            let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
-                continue;
-            };
-            let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
-            let typed_event = match Event::from_model(event) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("vlm: skipping {}: {e:#}", event.event_id);
+    if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
+        if model_ctx.config.vlm_primary().is_some() {
+            let image_max_dim_px = model_ctx.config.image_max_dim_px();
+            for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
+                let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
                     continue;
+                };
+                let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+                let typed_event = match Event::from_model(event) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("vlm: skipping {}: {e:#}", event.event_id);
+                        continue;
+                    }
+                };
+                // resolve_blank_amount dispatches on config.vlm_mode() (escalate vs.
+                // two-model agreement) internally now, per extraction's decision.vlm_setup.
+                match images::resolve_blank_amount(
+                    client,
+                    model_ctx.anthropic,
+                    model_ctx.cold,
+                    prompt,
+                    image_max_dim_px,
+                    &image_path,
+                    &image.image_id,
+                    model_ctx.config,
+                    &typed_event,
+                ) {
+                    Ok(resolution) => {
+                        let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {
+                            Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
+                            _ => None,
+                        });
+                        // Blocker #205 (verifier board:verify.image_agreement): persist every
+                        // attempted read's provenance, independent of whether it contributed to
+                        // the final evidence, so the agreement outcome is auditable. Runtime
+                        // store only (code/store/, gitignored), never shipped.
+                        let reads: Vec<serde_json::Value> = resolution
+                            .reads
+                            .iter()
+                            .map(|r| {
+                                let cutoff = (r.due_date.is_some()
+                                    || r.before_amount.is_some()
+                                    || r.after_amount.is_some())
+                                .then(|| {
+                                    serde_json::json!({
+                                        "due_date": r.due_date,
+                                        "before_amount": r.before_amount,
+                                        "after_amount": r.after_amount,
+                                    })
+                                });
+                                serde_json::json!({
+                                    "role": r.role,
+                                    "model_id": r.model_id,
+                                    "model_revision": r.model_revision,
+                                    "max_dim_px": r.max_dim_px,
+                                    "reconciled": r.reconciled,
+                                    "selected_amount": r.selected_amount,
+                                    "cutoff": cutoff,
+                                })
+                            })
+                            .collect();
+                        let provenance = serde_json::json!({
+                            "image_id": image.image_id,
+                            "event_id": typed_event.id,
+                            "class": resolution.class.clone().unwrap_or_default(),
+                            "reads": reads,
+                            "outcome": resolution.outcome,
+                            "accepted_amount": accepted_amount,
+                        });
+                        if let Err(e) = processed_store.save("image_reads", &image.image_id, &provenance) {
+                            eprintln!("vlm: failed to persist provenance for {}: {e:#}", image.image_id);
+                        }
+                        if let Some(record) = resolution.evidence {
+                            facts.push(record);
+                        }
+                    }
+                    Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
                 }
-            };
-            match images::resolve_blank_amount(
-                client,
-                model_ctx.cold,
-                prompt,
-                &model_ctx.config.decoding,
-                image_max_dim_px,
-                &image_path,
-                &image.image_id,
-                vlm_primary,
-                vlm_escalation,
-                model_ctx.config.vlm_fallback(),
-                &typed_event,
-            ) {
-                Ok(Some(record)) => facts.push(record),
-                Ok(None) => {}
-                Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
             }
         }
     }

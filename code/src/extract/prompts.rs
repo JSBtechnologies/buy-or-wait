@@ -86,4 +86,18 @@ mod tests {
         assert_eq!(prompt.version, "image_transcription.v1");
         assert!(prompt.system_prompt.contains("transcribe every labeled numeric figure"));
     }
+
+    /// Board `finding.image05_root_cause`: v2 replaces v1's inverted-name/typed due-date trio
+    /// with an unambiguous `due_cutoff_date`/`amount_due_by_cutoff`/`amount_due_after_cutoff`
+    /// schema.
+    #[test]
+    fn loads_image_transcription_v2_prompt() {
+        let path = Path::new("prompts/image_transcription.v2.md");
+        let prompt = load(path, "User prompt template").expect("prompt file should parse");
+        assert_eq!(prompt.version, "image_transcription.v2");
+        assert!(prompt.system_prompt.contains("due_cutoff_date"));
+        assert!(prompt.system_prompt.contains("amount_due_by_cutoff"));
+        assert!(prompt.system_prompt.contains("amount_due_after_cutoff"));
+        assert!(!prompt.system_prompt.contains("amount_due_before_date"));
+    }
 }

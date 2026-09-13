@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use super::ledger::{Fact, Ledger, LedgerEntry};
 use super::money::Money;
 use super::recurrence::{Cadence, Stream, StreamKind, Streams};
-use super::rules::{DayOrder, PaymentTiming, Rules};
-use super::types::{Direction, Payment, RateProvider};
+use super::rules::{DebitKind, PaymentTiming, Placement, Rules, ScheduledReplaceScope, VarLongPhase};
+use super::types::{Direction, Flexibility, Payment, RateProvider};
 
 /// Half a cent: plan amounts are written rounded to cents (RULES S1.5), so a plan built from
 /// the rounded safe amount may exceed the exact headroom by at most this much.
@@ -78,6 +78,9 @@ pub struct Forecast {
     pub suffix_low: Vec<Money>,
     /// How `check` applies a plan payment within its day.
     pub payment_timing: PaymentTiming,
+    /// Same-day placement of each entry of `flows` (credits are recorded as BeforeCredits
+    /// but always land between the two debit groups).
+    pub placements: Vec<Placement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -149,7 +152,28 @@ impl Forecast {
                 (StreamKind::VariableSpend, Some(h)) => h.end(start).min(end),
                 _ => end,
             };
-            let mut dates = stream.dates_between(start, stream_end);
+            let mut dates = match stream.cadence {
+                // RULES S8.2 VAR_LONG_PHASE=from_request: long-interval variable spend restarts
+                // its phase at rd + IV_SKIP_DAYS instead of continuing from the last row.
+                Cadence::EveryDays { days }
+                    if stream.kind == StreamKind::VariableSpend
+                        && rules.var_long_phase != VarLongPhase::LastSettled
+                        && days >= rules.var_long_min_step =>
+                {
+                    let first = match rules.var_long_phase {
+                        VarLongPhase::MidStep => {
+                            (stream.last_date() + Duration::days(days)).min(start + Duration::days((days + 1) / 2))
+                        }
+                        _ => start + Duration::days(rules.variable_skip_days),
+                    };
+                    (0..)
+                        .map(|k| first + Duration::days(k * days))
+                        .take_while(|d| *d <= stream_end)
+                        .filter(|d| *d >= start)
+                        .collect()
+                }
+                _ => stream.dates_between(start, stream_end),
+            };
             // RULES S3.4(c): a scheduled row replaces the projected occurrence of a monthly
             // stream with the same category and direction within the window (verifier#45).
             if rules.scheduled_replaces_cycle && matches!(stream.cadence, Cadence::Monthly { .. }) {
@@ -158,6 +182,7 @@ impl Forecast {
                         e.event.category == stream.category
                             && e.event.direction == stream.direction
                             && (e.cash_date - *d).num_days().abs() <= rules.scheduled_replacement_window_days
+                            && replaces_in_scope(e, stream, rules)
                     })
                 });
             }
@@ -177,30 +202,20 @@ impl Forecast {
         apply_adjustments(&mut flows, inp, start, end);
 
         flows.sort_by(|a, b| (a.date, &a.category).cmp(&(b.date, &b.category)));
-        let mut f = Forecast::from_flows(start, inp.opening_balance, inp.minimum_balance, reserved_total, flows, horizon_days);
-        if rules.same_day_order == DayOrder::CreditsFirst {
-            f.apply_credits_first();
-        }
+        let mut f = Forecast::from_flows_placed(
+            start,
+            inp.opening_balance,
+            inp.minimum_balance,
+            reserved_total,
+            flows,
+            horizon_days,
+            &|flow| rules.placement_of(debit_kind(flow, &inp.streams.streams)),
+        );
         f.payment_timing = rules.payment_timing;
         f
     }
 
-    /// Recompute intraday lows with credits applied before debits (S0 SAME_DAY_ORDER A/B).
-    fn apply_credits_first(&mut self) {
-        let mut prev = self.opening_balance;
-        for t in 0..self.balance.len() {
-            let debits = self.low[t] - prev; // <= 0
-            let credits = self.balance[t] - self.low[t]; // >= 0
-            self.low[t] = prev + credits + debits;
-            prev = self.balance[t];
-        }
-        let mut m = Money(i64::MAX);
-        for t in (0..self.low.len()).rev() {
-            m = m.min(self.low[t]);
-            self.suffix_low[t] = m;
-        }
-    }
-
+    /// All debits before same-day credits (RULES S2.3 default).
     pub fn from_flows(
         start: NaiveDate,
         opening_balance: Money,
@@ -209,16 +224,38 @@ impl Forecast {
         flows: Vec<Flow>,
         horizon_days: i64,
     ) -> Forecast {
+        Forecast::from_flows_placed(start, opening_balance, minimum_balance, reserved_total, flows, horizon_days, &|_| {
+            Placement::BeforeCredits
+        })
+    }
+
+    /// Day-by-day balances where each debit is placed before or after that day's credits.
+    /// `low[t]` is the day's lowest point: min(balance after pre-credit debits, end of day).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_flows_placed(
+        start: NaiveDate,
+        opening_balance: Money,
+        minimum_balance: Money,
+        reserved_total: Money,
+        flows: Vec<Flow>,
+        horizon_days: i64,
+        placement: &dyn Fn(&Flow) -> Placement,
+    ) -> Forecast {
         let n = horizon_days as usize;
-        let mut debits = vec![Money::ZERO; n];
+        let placements: Vec<Placement> = flows.iter().map(|f| placement(f)).collect();
+        let mut before = vec![Money::ZERO; n];
         let mut credits = vec![Money::ZERO; n];
-        for f in &flows {
+        let mut after = vec![Money::ZERO; n];
+        for (f, p) in flows.iter().zip(&placements) {
             let t = (f.date - start).num_days();
             if (0..horizon_days).contains(&t) {
-                if f.amount < Money::ZERO {
-                    debits[t as usize] += f.amount;
+                let t = t as usize;
+                if f.amount >= Money::ZERO {
+                    credits[t] += f.amount;
+                } else if *p == Placement::AfterCredits {
+                    after[t] += f.amount;
                 } else {
-                    credits[t as usize] += f.amount;
+                    before[t] += f.amount;
                 }
             }
         }
@@ -226,9 +263,9 @@ impl Forecast {
         let mut balance = Vec::with_capacity(n);
         let mut running = opening_balance;
         for t in 0..n {
-            running += debits[t];
-            low.push(running);
-            running += credits[t];
+            let pre = running + before[t];
+            running = pre + credits[t] + after[t];
+            low.push(pre.min(running));
             balance.push(running);
         }
         let mut suffix_low = vec![Money::ZERO; n];
@@ -247,7 +284,41 @@ impl Forecast {
             balance,
             suffix_low,
             payment_timing: PaymentTiming::AfterDayRows,
+            placements,
         }
+    }
+
+    /// Flows that produce the trough, grouped by component (see `DecisionFacts::trough_drivers`).
+    pub fn trough_drivers(&self) -> Vec<super::facts::TroughDriver> {
+        use std::collections::BTreeMap;
+        let (_, tdate) = self.trough();
+        let mut groups: BTreeMap<(String, String, String), (Money, usize)> = BTreeMap::new();
+        // The trough is either the trough day's pre-credit low (only its before-credit debits
+        // count) or its end-of-day balance (every flow of the day counts).
+        let td = (tdate - self.start).num_days() as usize;
+        let end_of_day_trough = self.low.get(td) == self.balance.get(td);
+        for (f, p) in self.flows.iter().zip(&self.placements) {
+            let same_day = f.date == tdate && (end_of_day_trough || (f.amount < Money::ZERO && *p == Placement::BeforeCredits));
+            let counts = f.date < tdate || same_day;
+            if f.date < self.start || !counts {
+                continue;
+            }
+            let (kind, component) = match &f.source {
+                FlowSource::Reserved { event_id } => ("reserved", event_id.clone()),
+                FlowSource::Scheduled { event_id } => ("scheduled", event_id.clone()),
+                FlowSource::Stream { stream_id } => ("stream", stream_id.clone()),
+                FlowSource::Evidence { record_id } => ("evidence", record_id.clone()),
+            };
+            let e = groups.entry((kind.to_string(), component, f.category.clone())).or_insert((Money::ZERO, 0));
+            e.0 += f.amount;
+            e.1 += 1;
+        }
+        let mut out: Vec<super::facts::TroughDriver> = groups
+            .into_iter()
+            .map(|((kind, component, category), (total, occurrences))| super::facts::TroughDriver { kind, component, category, total, occurrences })
+            .collect();
+        out.sort_by(|a, b| b.total.abs().cmp(&a.total.abs()).then(a.component.cmp(&b.component)));
+        out
     }
 
     pub fn horizon_end(&self) -> NaiveDate {
@@ -332,6 +403,41 @@ impl Forecast {
 impl SafetyReport {
     pub fn trough(&self) -> (Money, NaiveDate) {
         (self.trough_balance, self.trough_date)
+    }
+}
+
+/// Which configurable same-day ordering class a debit flow belongs to. A monthly bill is
+/// flexible when its stream's latest row is reducible or stoppable; a stream not found in
+/// `streams` counts as fixed.
+pub fn debit_kind(f: &Flow, streams: &[Stream]) -> DebitKind {
+    match &f.source {
+        FlowSource::Reserved { .. } => DebitKind::Reserved,
+        FlowSource::Scheduled { .. } => DebitKind::Scheduled,
+        FlowSource::Evidence { .. } => DebitKind::Evidence,
+        FlowSource::Stream { stream_id } => match streams.iter().find(|s| &s.id == stream_id) {
+            Some(s) if s.kind == StreamKind::VariableSpend => DebitKind::VariableSpend,
+            Some(s) if s.occurrences.last().is_some_and(|o| o.flexibility != Flexibility::Fixed) => {
+                DebitKind::FlexibleBill
+            }
+            // Interval (variable-spend) streams are the only ids recurrence builds as `var:*`.
+            None if stream_id.starts_with("var:") => DebitKind::VariableSpend,
+            _ => DebitKind::FixedBill,
+        },
+    }
+}
+
+/// RULES S8.3 `SCHEDULED_REPLACE_SCOPE`: whether a scheduled row in a stream's window may
+/// replace that stream's projected occurrence.
+fn replaces_in_scope(e: &LedgerEntry, stream: &Stream, rules: &Rules) -> bool {
+    match rules.scheduled_replace_scope {
+        ScheduledReplaceScope::CategoryWindow => true,
+        ScheduledReplaceScope::LifecycleOrAmount => {
+            if e.event.direction != Direction::Debit || e.event.linked_event_id.is_some() {
+                return true;
+            }
+            let (Some(a), est) = (e.home_amount, stream.projected_amount) else { return false };
+            (a - est).abs().0 as i128 * 100 <= est.abs().0 as i128 * rules.scheduled_replace_amount_pct as i128
+        }
     }
 }
 
