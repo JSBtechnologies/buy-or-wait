@@ -58,6 +58,12 @@ pub struct ModelCall {
     pub seed: i64,
     pub max_tokens: u32,
     pub json_response: bool,
+    /// Strict JSON Schema for structured output, when the backend needs the
+    /// actual schema rather than just "respond in JSON" (e.g. Anthropic's
+    /// `output_config.format.schema` — `crate::anthropic`). `None` for
+    /// backends that only need `json_response` as a boolean flag (HF's
+    /// `response_format: {"type": "json_object"}`).
+    pub json_schema: Option<serde_json::Value>,
 }
 
 /// Per-call usage record for the cost/token report (PLAN.md §6.5).
@@ -94,6 +100,41 @@ impl fmt::Display for HfCallError {
             HfCallError::Fatal(msg) => write!(f, "{msg}"),
         }
     }
+}
+
+/// Content hash of a call's variable inputs only. Model identity and prompt
+/// version are folded in separately by `cache_key_for` so identical content
+/// under a different model or prompt version gets its own cache entry.
+fn content_hash(call: &ModelCall) -> String {
+    let mut hasher = Sha256::new();
+    for part in &call.user_content {
+        match part {
+            ContentPart::Text(t) => {
+                hasher.update(b"text:");
+                hasher.update(t.as_bytes());
+            }
+            ContentPart::ImageDataUrl { mime, base64_data } => {
+                hasher.update(b"image:");
+                hasher.update(mime.as_bytes());
+                hasher.update(base64_data.as_bytes());
+            }
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// `sha256(content_hash + model_id + model_revision + prompt_version)` (PLAN.md
+/// §2.11). Shared by every backend (`HfClient`, `crate::anthropic::AnthropicClient`)
+/// so a call routed to a different provider for the same logical model/prompt
+/// still gets its own cache entry, and the formula never drifts between them.
+pub(crate) fn cache_key_for(call: &ModelCall) -> String {
+    let content_hash = content_hash(call);
+    let mut hasher = Sha256::new();
+    hasher.update(content_hash.as_bytes());
+    hasher.update(call.model_id.as_bytes());
+    hasher.update(call.model_revision.as_bytes());
+    hasher.update(call.prompt_version.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 pub struct HfClient {
@@ -190,38 +231,6 @@ impl HfClient {
         self
     }
 
-    /// Content hash of the call's variable inputs only. Model identity and
-    /// prompt version are folded in separately by `cache_key` so identical
-    /// content under a different model or prompt version gets its own entry.
-    fn content_hash(call: &ModelCall) -> String {
-        let mut hasher = Sha256::new();
-        for part in &call.user_content {
-            match part {
-                ContentPart::Text(t) => {
-                    hasher.update(b"text:");
-                    hasher.update(t.as_bytes());
-                }
-                ContentPart::ImageDataUrl { mime, base64_data } => {
-                    hasher.update(b"image:");
-                    hasher.update(mime.as_bytes());
-                    hasher.update(base64_data.as_bytes());
-                }
-            }
-        }
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// `sha256(content_hash + model_id + model_revision + prompt_version)` (PLAN.md §2.11).
-    fn cache_key(call: &ModelCall) -> String {
-        let content_hash = Self::content_hash(call);
-        let mut hasher = Sha256::new();
-        hasher.update(content_hash.as_bytes());
-        hasher.update(call.model_id.as_bytes());
-        hasher.update(call.model_revision.as_bytes());
-        hasher.update(call.prompt_version.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
     fn cache_path(&self, key: &str) -> PathBuf {
         self.cache_dir.join(format!("{key}.json"))
     }
@@ -229,7 +238,7 @@ impl HfClient {
     /// Run one chat completion. Cache-first; on a miss, calls the router
     /// with retry/backoff and writes the result back to the cache.
     pub fn chat_completion(&self, call: &ModelCall) -> Result<ModelResponse> {
-        let key = Self::cache_key(call);
+        let key = cache_key_for(call);
         let path = self.cache_path(&key);
 
         if let Ok(bytes) = fs::read(&path) {
@@ -252,7 +261,7 @@ impl HfClient {
     /// check.
     pub fn chat_completion_cold(&self, call: &ModelCall) -> Result<ModelResponse> {
         let response = self.call_with_retry(call)?;
-        let key = Self::cache_key(call);
+        let key = cache_key_for(call);
         self.write_cache(&self.cache_path(&key), &response);
         self.record_usage(&response.usage);
         Ok(response)
@@ -585,6 +594,7 @@ mod tests {
             seed: 42,
             max_tokens: 100,
             json_response: true,
+            json_schema: None,
         }
     }
 
@@ -592,7 +602,7 @@ mod tests {
     fn cache_key_is_stable_for_identical_calls() {
         let a = sample_call();
         let b = sample_call();
-        assert_eq!(HfClient::cache_key(&a), HfClient::cache_key(&b));
+        assert_eq!(cache_key_for(&a), cache_key_for(&b));
     }
 
     #[test]
@@ -600,7 +610,7 @@ mod tests {
         let a = sample_call();
         let mut b = sample_call();
         b.prompt_version = "v2".to_string();
-        assert_ne!(HfClient::cache_key(&a), HfClient::cache_key(&b));
+        assert_ne!(cache_key_for(&a), cache_key_for(&b));
     }
 
     #[test]
@@ -608,7 +618,7 @@ mod tests {
         let a = sample_call();
         let mut b = sample_call();
         b.model_revision = "def456".to_string();
-        assert_ne!(HfClient::cache_key(&a), HfClient::cache_key(&b));
+        assert_ne!(cache_key_for(&a), cache_key_for(&b));
     }
 
     #[test]
@@ -616,7 +626,7 @@ mod tests {
         let a = sample_call();
         let mut b = sample_call();
         b.user_content = vec![ContentPart::Text("different".to_string())];
-        assert_ne!(HfClient::cache_key(&a), HfClient::cache_key(&b));
+        assert_ne!(cache_key_for(&a), cache_key_for(&b));
     }
 
     /// Live smoke test against the real router (cheapest LLM candidate,
@@ -639,6 +649,7 @@ mod tests {
             seed: 42,
             max_tokens: 200,
             json_response: true,
+            json_schema: None,
         };
         let resp = client.chat_completion(&call).expect("live call failed");
         println!("smoke test raw_text: {:?}", resp.raw_text);

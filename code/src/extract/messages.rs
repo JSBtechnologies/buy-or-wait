@@ -14,6 +14,7 @@ use crate::engine::money::Money;
 use crate::engine::types::Direction;
 use crate::extract::grounding::amount_grounded;
 use crate::extract::model_config::{CandidateConfig, DecodingConfig};
+use crate::extract::normalize;
 use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
 use crate::hf::{ContentPart, HfClient, ModelCall};
@@ -108,8 +109,11 @@ struct MessageRecordsReply {
     records: Vec<MessageRecord>,
 }
 
+/// Delegates to the shared `normalize::parse_date` (a strict superset of the old ISO-only
+/// parse: dashes/spaces/month-names/unambiguous slash dates also accepted, never fewer) so
+/// date parsing never drifts between the message and image evidence paths.
 fn parse_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    normalize::parse_date(s)
 }
 
 /// Mask numbers/dates/percentages and multi-word proper-noun runs into a skeleton, so
@@ -125,8 +129,14 @@ pub fn skeleton(text: &str) -> String {
     names.replace_all(&t, "<ORG>").into_owned()
 }
 
+/// Prefers the shared `normalize::parse_amount` (handles lakh grouping, dot-thousands, etc.
+/// consistently with the image path); falls back to the old permissive strip-commas-and-
+/// parse behavior when the strict parser rejects a shape as ambiguous, since this function's
+/// caller already isolated the text via a regex match on a known, controlled skeleton
+/// template (never free-form text), so the input is a real number by construction -- 0.0 is
+/// only ever reached for a shape neither parser recognizes at all.
 fn amt(s: &str) -> f64 {
-    s.replace(',', "").parse().unwrap_or(0.0)
+    normalize::parse_amount(s, None).unwrap_or_else(|| s.replace(',', "").parse().unwrap_or(0.0))
 }
 
 fn blank_record(record_type: RecordType) -> MessageRecord {
@@ -666,6 +676,7 @@ pub fn extract_batch(
         seed: decoding.seed,
         max_tokens: decoding.max_tokens_llm,
         json_response: candidate.supports_structured_output,
+        json_schema: None,
     };
     let response =
         if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
@@ -1216,5 +1227,107 @@ mod tests {
             note: None,
         };
         assert!(to_evidence(&message, 0, &record, "EUR").is_some());
+    }
+
+    /// TEMPORARY duplicate of `tests/llm_generalization_fixtures.rs` (ml-engineer step 5,
+    /// lead request 2026-09-12): that integration test can't build right now because
+    /// `cargo test` (anything beyond `--lib`) also compiles `src/main.rs`, which is blocked
+    /// on board:blocker.main_anthropic_wiring (owner: integrator, not touched here). This
+    /// copy runs under `--lib` to verify `docs/llm_generalization_fixtures.json` is correct
+    /// today; delete it once the integration test runs for real (main.rs fixed).
+    #[test]
+    fn llm_generalization_fixtures_are_internally_consistent() {
+        use std::fs;
+        let text = fs::read_to_string(std::path::Path::new("../docs/llm_generalization_fixtures.json"))
+            .expect("docs/llm_generalization_fixtures.json should exist");
+        let root: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let fixtures = root["fixtures"].as_array().expect("fixtures array");
+        assert!(fixtures.len() >= 18, "expected ~20 fixtures, found {}", fixtures.len());
+
+        for fixture in fixtures {
+            let id = fixture["id"].as_str().unwrap();
+            let text = fixture["text"].as_str().unwrap();
+            assert!(
+                parse_known_skeleton(text, NaiveDate::from_ymd_opt(2027, 1, 1).unwrap()).is_none(),
+                "{id} matched a known deterministic skeleton -- reword it"
+            );
+
+            let record: MessageRecord = serde_json::from_value(fixture["expected_llm_record"].clone())
+                .unwrap_or_else(|e| panic!("{id}: expected_llm_record should deserialize: {e}"));
+            let message = Message {
+                message_id: "llm_gen_fixture".to_string(),
+                user_id: "user_fixture".to_string(),
+                request_id: None,
+                related_event_id: None,
+                sent_at: "2027-01-01T00:00:00Z".parse().unwrap(),
+                source_type: "test_fixture".to_string(),
+                message_text: text.to_string(),
+            };
+            let home_currency = record.currency.clone().unwrap_or_else(|| "USD".to_string());
+            let evidence = to_evidence(&message, 0, &record, &home_currency);
+            let expected_facts = fixture["expected_facts"].as_array().unwrap();
+
+            if expected_facts.is_empty() {
+                assert!(
+                    evidence.is_none(),
+                    "{id}: expected no fact ({}), got {:?}",
+                    fixture["expected_no_fact_reason"].as_str().unwrap_or(""),
+                    evidence.map(|e| e.fact)
+                );
+                continue;
+            }
+            let evidence = evidence.unwrap_or_else(|| panic!("{id}: expected a fact, got None"));
+            let expected = &expected_facts[0];
+            let kind = expected["fact"].as_str().unwrap();
+            let amt = |key: &str| expected[key].as_f64().map(Money::from_f64);
+            let date = |key: &str| {
+                expected[key].as_str().and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            };
+            let txt = |key: &str| expected[key].as_str().map(str::to_string);
+
+            match (kind, evidence.fact) {
+                ("IncomeAmountChange", Fact::IncomeAmountChange { category, amount, currency, effective }) => {
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(Some(amount), amt("amount"), "{id} amount");
+                    assert_eq!(currency, expected["currency"].as_str().unwrap(), "{id} currency");
+                    assert_eq!(Some(effective), date("effective"), "{id} effective");
+                }
+                ("IncomeDateMoved", Fact::IncomeDateMoved { category, new_date }) => {
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(Some(new_date), date("new_date"), "{id} new_date");
+                }
+                ("IncomeEnded", Fact::IncomeEnded { category, effective, description }) => {
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(Some(effective), date("effective"), "{id} effective");
+                    assert_eq!(description, txt("description"), "{id} description");
+                }
+                ("IncomeStarts", Fact::IncomeStarts { category, amount, currency, first_date }) => {
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(Some(amount), amt("amount"), "{id} amount");
+                    assert_eq!(currency, expected["currency"].as_str().unwrap(), "{id} currency");
+                    assert_eq!(Some(first_date), date("first_date"), "{id} first_date");
+                }
+                ("ExpenseAmountChange", Fact::ExpenseAmountChange { category, amount, percent, currency, effective }) => {
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(amount, expected["amount"].as_f64().map(Money::from_f64), "{id} amount");
+                    assert_eq!(percent, expected["percent"].as_f64(), "{id} percent");
+                    assert_eq!(currency, txt("currency"), "{id} currency");
+                    assert_eq!(effective, expected["effective"].as_str().and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()), "{id} effective");
+                }
+                ("OneTimeFlow", Fact::OneTimeFlow { direction, category, amount, currency, date: d }) => {
+                    assert_eq!(direction, if expected["direction"] == "Credit" { Direction::Credit } else { Direction::Debit }, "{id} direction");
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(Some(amount), amt("amount"), "{id} amount");
+                    assert_eq!(currency, expected["currency"].as_str().unwrap(), "{id} currency");
+                    assert_eq!(Some(d), date("date"), "{id} date");
+                }
+                ("Unconfirmed", Fact::Unconfirmed { category, amount, currency }) => {
+                    assert_eq!(category, expected["category"].as_str().unwrap(), "{id} category");
+                    assert_eq!(amount, expected["amount"].as_f64().map(Money::from_f64), "{id} amount");
+                    assert_eq!(currency, txt("currency"), "{id} currency");
+                }
+                (kind, other) => panic!("{id}: expected {kind:?}, got {other:?}"),
+            }
+        }
     }
 }

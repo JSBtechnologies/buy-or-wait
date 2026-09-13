@@ -20,9 +20,13 @@ use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
 use crate::engine::money::Money;
 use crate::engine::types::{Event, EventType, Status};
 use crate::extract::model_config::{CandidateConfig, DecodingConfig, ModelsConfig, ReaderPick, VlmMode};
+use crate::extract::normalize;
 use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
-use crate::hf::{ContentPart, HfClient, ModelCall};
+use anyhow::Context as _;
+
+use crate::anthropic::AnthropicClient;
+use crate::hf::{ContentPart, HfClient, ModelCall, ModelResponse};
 
 /// `doc_type` is purely advisory metadata (`select`/`reconciles` never branch on it) and is
 /// deserialized leniently on purpose: a VLM's own wording for a document type is free text
@@ -63,22 +67,18 @@ impl DocType {
             .collect::<Vec<_>>()
             .join("_");
         match normalized.as_str() {
-            "payslip" | "pay_slip" | "salary_slip" | "pay_stub" | "paystub" => DocType::Payslip,
-            "receipt" | "cash_receipt" | "sales_receipt" | "bill_of_supply" | "cash_bill" => {
-                DocType::Receipt
-            }
-            "invoice" | "tax_invoice" | "gst_invoice" | "sales_invoice" | "gst_tax_invoice" => {
-                DocType::Invoice
-            }
-            "bill" | "provisional_bill" | "hospital_bill" | "utility_bill" | "rent_receipt" => {
-                DocType::Bill
-            }
-            "delivery_summary" | "order_summary" | "delivery_receipt" | "order_details" => {
-                DocType::DeliverySummary
-            }
-            "bank_statement_excerpt" | "bank_statement" | "statement" | "account_summary" => {
-                DocType::BankStatementExcerpt
-            }
+            "payslip" | "pay_slip" | "salary_slip" | "pay_stub" | "paystub"
+            | "slip_gaji" | "slip_gajian" => DocType::Payslip,
+            "receipt" | "cash_receipt" | "sales_receipt" | "bill_of_supply" | "cash_bill"
+            | "kwitansi" | "struk" | "nota" => DocType::Receipt,
+            "invoice" | "tax_invoice" | "gst_invoice" | "sales_invoice" | "gst_tax_invoice"
+            | "faktur" | "faktur_pajak" => DocType::Invoice,
+            "bill" | "provisional_bill" | "hospital_bill" | "utility_bill" | "rent_receipt"
+            | "tagihan" | "tagihan_listrik" | "tagihan_air" => DocType::Bill,
+            "delivery_summary" | "order_summary" | "delivery_receipt" | "order_details"
+            | "ringkasan_pesanan" | "rincian_pesanan" => DocType::DeliverySummary,
+            "bank_statement_excerpt" | "bank_statement" | "statement" | "account_summary"
+            | "rekening_koran" | "mutasi_rekening" => DocType::BankStatementExcerpt,
             _ => DocType::Other,
         }
     }
@@ -103,9 +103,24 @@ pub struct ImageFigures {
     pub deductions: Option<f64>,
     pub net_pay: Option<f64>,
     pub previous_balance: Option<f64>,
+    /// v1 schema (`image_transcription.v1.md`) -- LEGACY. `amount_due_before_date` is
+    /// numeric-typed while `amount_due_before_date_value` is the date-string-typed field
+    /// (an inverted name/type pairing), and `amount_due_after_date` reads as a date name but
+    /// is numeric. Board finding `finding.image05_root_cause`: this ambiguity, not model
+    /// vision, was why gemma-4-31B-it wrote the cutoff date into both `*_date` fields and had
+    /// no slot left for the amount (0/5 image_05 reads), while other models put the amount in
+    /// inconsistent slots. Kept only so already-cached v1 reads still parse; `select_pending_
+    /// or_scheduled` prefers the unambiguous v2 fields below whenever they're present.
     pub amount_due_before_date: Option<f64>,
     pub amount_due_before_date_value: Option<String>,
     pub amount_due_after_date: Option<f64>,
+    /// v2 schema (`image_transcription.v2.md`, `finding.image05_root_cause`): unambiguous
+    /// replacement for the v1 trio above -- a date-typed cutoff field plus two clearly-named
+    /// amount fields, no inverted names. `None` when the page has no due-date cutoff, or when
+    /// this read used the v1 prompt (see the v1 fields above instead).
+    pub due_cutoff_date: Option<String>,
+    pub amount_due_by_cutoff: Option<f64>,
+    pub amount_due_after_cutoff: Option<f64>,
     pub document_date: Option<String>,
     pub period_label: Option<String>,
     pub line_items_sum_check: Option<f64>,
@@ -159,6 +174,12 @@ struct RawImageFigures {
     #[serde(default)]
     amount_due_after_date: Option<Value>,
     #[serde(default)]
+    due_cutoff_date: Option<Value>,
+    #[serde(default)]
+    amount_due_by_cutoff: Option<Value>,
+    #[serde(default)]
+    amount_due_after_cutoff: Option<Value>,
+    #[serde(default)]
     document_date: Option<Value>,
     #[serde(default)]
     period_label: Option<Value>,
@@ -166,12 +187,14 @@ struct RawImageFigures {
     line_items_sum_check: Option<Value>,
 }
 
-/// Accepts a JSON number or a numeric-looking string; anything else (including a date
-/// string landing in a numeric field) is `None` rather than a hard parse error.
-fn coerce_f64(v: &Option<Value>) -> Option<f64> {
+/// Accepts a JSON number as-is, or a numeric-looking string via `normalize::parse_amount`
+/// (thousands/lakh grouping, currency-aware decimal-vs-thousands disambiguation, analyst
+/// RULES.md S7); anything else (including a date string landing in a numeric field, or a
+/// genuinely ambiguous grouping) is `None` rather than a hard parse error or a guess.
+fn coerce_f64(v: &Option<Value>, currency_hint: Option<&str>) -> Option<f64> {
     match v.as_ref()? {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().replace(',', "").parse::<f64>().ok(),
+        Value::String(s) => normalize::parse_amount(s, currency_hint),
         _ => None,
     }
 }
@@ -198,6 +221,12 @@ fn date_string_hint(v: &Option<Value>) -> Option<String> {
 
 impl From<RawImageFigures> for ImageFigures {
     fn from(raw: RawImageFigures) -> Self {
+        // Resolved first so every amount field can disambiguate its own grouping/decimal
+        // convention against it (normalize::parse_amount, analyst RULES.md S7).
+        let currency = coerce_string(&raw.currency);
+        let currency_hint = currency.as_deref().and_then(normalize::parse_currency);
+        let currency_hint = currency_hint.as_deref();
+
         let mut before_value = coerce_string(&raw.amount_due_before_date_value);
         if before_value.as_deref().and_then(parse_date).is_none() {
             before_value = date_string_hint(&raw.amount_due_before_date)
@@ -210,31 +239,34 @@ impl From<RawImageFigures> for ImageFigures {
                 .as_ref()
                 .and_then(Value::as_str)
                 .map(DocType::from_free_text),
-            currency: coerce_string(&raw.currency),
-            subtotal: coerce_f64(&raw.subtotal),
-            tax: coerce_f64(&raw.tax),
-            total: coerce_f64(&raw.total),
-            amount_due: coerce_f64(&raw.amount_due),
-            amount_paid: coerce_f64(&raw.amount_paid),
-            balance_due: coerce_f64(&raw.balance_due),
-            gross_pay: coerce_f64(&raw.gross_pay),
-            deductions: coerce_f64(&raw.deductions),
-            net_pay: coerce_f64(&raw.net_pay),
-            previous_balance: coerce_f64(&raw.previous_balance),
-            amount_due_before_date: coerce_f64(&raw.amount_due_before_date),
+            currency,
+            subtotal: coerce_f64(&raw.subtotal, currency_hint),
+            tax: coerce_f64(&raw.tax, currency_hint),
+            total: coerce_f64(&raw.total, currency_hint),
+            amount_due: coerce_f64(&raw.amount_due, currency_hint),
+            amount_paid: coerce_f64(&raw.amount_paid, currency_hint),
+            balance_due: coerce_f64(&raw.balance_due, currency_hint),
+            gross_pay: coerce_f64(&raw.gross_pay, currency_hint),
+            deductions: coerce_f64(&raw.deductions, currency_hint),
+            net_pay: coerce_f64(&raw.net_pay, currency_hint),
+            previous_balance: coerce_f64(&raw.previous_balance, currency_hint),
+            amount_due_before_date: coerce_f64(&raw.amount_due_before_date, currency_hint),
             amount_due_before_date_value: before_value,
-            amount_due_after_date: coerce_f64(&raw.amount_due_after_date),
+            amount_due_after_date: coerce_f64(&raw.amount_due_after_date, currency_hint),
+            due_cutoff_date: coerce_string(&raw.due_cutoff_date),
+            amount_due_by_cutoff: coerce_f64(&raw.amount_due_by_cutoff, currency_hint),
+            amount_due_after_cutoff: coerce_f64(&raw.amount_due_after_cutoff, currency_hint),
             document_date: coerce_string(&raw.document_date),
             period_label: coerce_string(&raw.period_label),
-            line_items_sum_check: coerce_f64(&raw.line_items_sum_check),
+            line_items_sum_check: coerce_f64(&raw.line_items_sum_check, currency_hint),
         }
     }
 }
 
 
 /// Rounding tolerance for reconciliation checks combining two printed terms (e.g.
-/// subtotal+tax=total). Analyst audit RULES.md S5 image_07: subtotal 8,122 + tax 406.10 =
-/// 8,528.10 exactly, but the same page also prints a plain "8,528" total — both readings
+/// subtotal+tax=total). Analyst audit RULES.md S5 image_07: subtotal 7,150 + tax 358.10 =
+/// 7,508.10 exactly, but the same page also prints a plain "7,508" total — both readings
 /// are legitimate, and an exact-cent check rejects a genuinely reconciling document. Allow
 /// each of the two printed terms in a check to be off by up to half a currency unit
 /// (0.5), for a combined tolerance of 1.0, and log whenever the looser bound is what
@@ -249,8 +281,11 @@ fn close(a: f64, b: f64, tolerance: f64) -> bool {
     diff <= tolerance
 }
 
+/// Delegates to the shared `normalize::parse_date` (ISO, "DD-Mon-YYYY"/"D Mon YYYY" in
+/// English or Indonesian, and an unambiguous "DD/MM/YYYY") so date parsing never drifts
+/// between the image and message evidence paths.
 fn parse_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    normalize::parse_date(s)
 }
 
 /// Deterministic selector (PLAN.md §2.3 table): which figure matters, given the linked
@@ -262,7 +297,7 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
         }
         // engine analyst audit RULES.md S5 image_12: prefer the labeled `total` over
         // `amount_paid` for a settled expense. A receipt's "amount paid"/"cash" line can be
-        // the cash tendered (e.g. "Cash 40.00, Change 6.50" against a 33.50 total), which is
+        // the cash tendered (e.g. "Cash 35.00, Change 6.25" against a 28.75 total), which is
         // not the expense amount; the printed total is the authoritative figure whenever
         // it's present, with amount_paid only as a fallback when no total is printed.
         (_, Status::Settled) => figures.total.or(figures.amount_paid),
@@ -279,13 +314,31 @@ fn positive(amount: Option<f64>) -> Option<f64> {
 }
 
 fn select_pending_or_scheduled(figures: &ImageFigures, event: &Event) -> Option<f64> {
-    // A cutoff may come from the labeled `_value` field directly, or be recovered from a
-    // date string a model dropped into a numeric before/after field (`RawImageFigures`'s
-    // conversion already folds that recovery into `amount_due_before_date_value`).
-    if let Some(cutoff) = figures.amount_due_before_date_value.as_deref().and_then(parse_date) {
+    // v2 schema (`image_transcription.v2.md`, `finding.image05_root_cause`): unambiguous
+    // due_cutoff_date/amount_due_by_cutoff/amount_due_after_cutoff trio. Preferred whenever
+    // present -- a new call always uses this schema; only already-cached v1 reads fall
+    // through to the legacy block below.
+    if let Some(cutoff) = figures.due_cutoff_date.as_deref().and_then(parse_date) {
         // analyst audit #203: once the cutoff is known, the required side is exact -- never
         // fall back to the other (known-wrong-for-this-date) side, and never fall through
         // to balance_due/amount_due either. Missing the required side means escalate.
+        return if event.cash_date() > cutoff {
+            positive(figures.amount_due_after_cutoff)
+        } else {
+            positive(figures.amount_due_by_cutoff)
+        };
+    }
+    if let (Some(before), Some(after)) = (figures.amount_due_by_cutoff, figures.amount_due_after_cutoff) {
+        // No reliable cutoff date to choose between them: the conservative choice is the
+        // larger figure, never the smaller (see the v1 block's identical reasoning below).
+        return positive(Some(before.max(after)));
+    }
+
+    // v1 schema (LEGACY, `image_transcription.v1.md`) -- a cutoff may come from the labeled
+    // `_value` field directly, or be recovered from a date string a model dropped into a
+    // numeric before/after field (`RawImageFigures`'s conversion already folds that recovery
+    // into `amount_due_before_date_value`).
+    if let Some(cutoff) = figures.amount_due_before_date_value.as_deref().and_then(parse_date) {
         return if event.cash_date() > cutoff {
             positive(figures.amount_due_after_date)
         } else {
@@ -301,9 +354,9 @@ fn select_pending_or_scheduled(figures: &ImageFigures, event: &Event) -> Option<
         return positive(Some(before.max(after)));
     }
     // Only one of before/after is present with no date to resolve it (or neither is present
-    // at all): not safe to treat that lone value as authoritative on its own -- fall through
-    // to whatever else the page states. If nothing here resolves either, `select` returns
-    // `None` and the caller escalates rather than guessing.
+    // at all, in either schema): not safe to treat that lone value as authoritative on its
+    // own -- fall through to whatever else the page states. If nothing here resolves either,
+    // `select` returns `None` and the caller escalates rather than guessing.
     positive(figures.balance_due).or_else(|| positive(figures.amount_due))
 }
 
@@ -311,9 +364,9 @@ fn select_pending_or_scheduled(figures: &ImageFigures, event: &Event) -> Option<
 /// (PLAN.md §2.3: subtotal+tax=total, gross-deductions=net, amount_paid+balance_due=total,
 /// currency match). `line_items_sum_check` is a fallback signal only, checked solely when
 /// none of the labeled-field checks above had enough data to run at all — analyst audit
-/// RULES.md S5 image_11: a multi-section hospital bill's itemized breakup sums to 3,150
-/// while the labeled Total/Balance (which already reconcile against each other, 0 + 3,650 =
-/// 3,650) say 3,650. Re-summing an arbitrary itemized breakup is not as reliable as the
+/// RULES.md S5 image_11: a multi-section hospital bill's itemized breakup sums to 2,790
+/// while the labeled Total/Balance (which already reconcile against each other, 0 + 3,210 =
+/// 3,210) say 3,210. Re-summing an arbitrary itemized breakup is not as reliable as the
 /// document's own labeled totals, so it never overrides them.
 /// Every distinct identity a document can print (subtotal+tax=total, gross-deductions=net,
 /// amount_paid[+balance_due]=total) is checked independently; a figure is reconciled if
@@ -342,7 +395,7 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
         }
     }
     // analyst audit #184 (image_12): cash tendered can legitimately exceed the total when
-    // change is given (40.00 tendered against a 33.50 total) -- that is consistent by
+    // change is given (35.00 tendered against a 28.75 total) -- that is consistent by
     // construction, not a mismatch, regardless of what balance_due says. Only fall through
     // to the paid+balance_due=total identity when paid is actually less than total (a real
     // partial payment / balance-owed scenario).
@@ -393,23 +446,13 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
 /// currency in a different spelling). Limited to the dataset's five currencies (PLAN.md:
 /// INR, ZAR, IDR, USD, EUR); anything else falls back to a cleaned exact-string comparison
 /// rather than guessing a mapping.
+/// Delegates to the shared `normalize::parse_currency` so currency normalization never
+/// drifts between the image and message evidence paths. A currency that fails to normalize
+/// on either side (e.g. the literal text "null") never counts as a match.
 fn currency_matches(claimed: &str, expected: &str) -> bool {
-    normalize_currency(claimed) == normalize_currency(expected)
-}
-
-fn normalize_currency(raw: &str) -> String {
-    let cleaned = raw.trim().trim_end_matches('.').to_uppercase();
-    match cleaned.as_str() {
-        "INR" | "RS" | "RUPEES" | "RUPEE" | "INDIAN RUPEE" | "INDIAN RUPEES" | "\u{20B9}" => {
-            "INR".to_string()
-        }
-        "USD" | "US$" | "$" | "US DOLLAR" | "US DOLLARS" | "DOLLAR" | "DOLLARS" => {
-            "USD".to_string()
-        }
-        "EUR" | "\u{20AC}" | "EURO" | "EUROS" => "EUR".to_string(),
-        "IDR" | "RP" | "RUPIAH" | "INDONESIAN RUPIAH" => "IDR".to_string(),
-        "ZAR" | "R" | "RAND" | "SOUTH AFRICAN RAND" => "ZAR".to_string(),
-        _ => cleaned,
+    match (normalize::parse_currency(claimed), normalize::parse_currency(expected)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -458,8 +501,10 @@ fn downscale_and_encode(path: &Path, max_dim: u32) -> anyhow::Result<String> {
 /// cache (content hash + model id + revision + prompt version), so a repeated image/model/
 /// prompt combination costs zero tokens on rerun. `cold` selects `chat_completion_cold`
 /// (bypass the cache read, still write it) for a `--cold` full-dataset run.
+#[allow(clippy::too_many_arguments)]
 fn call_vlm(
     client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
     cold: bool,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
@@ -481,14 +526,41 @@ fn call_vlm(
         seed: decoding.seed,
         max_tokens,
         json_response: candidate.supports_structured_output,
+        // ml-engineer dropped structured-output json_schema for the Anthropic backend after
+        // 3 live schema-validation errors in a row (anthropic.rs); every provider now relies
+        // on the prompt text alone plus `parse_json_reply`'s lenient parsing.
+        json_schema: None,
     };
-    let response =
-        if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
+    let response = dispatch_call(client, anthropic, cold, candidate, &call)?;
     // Kimi-K3 (a thinking model, ml-engineer #204/lead) returns reasoning text ahead of the
     // JSON answer at any max_tokens generous enough to let it finish; `parse_json_reply`
     // already locates the JSON body rather than requiring the whole reply to be JSON.
     let value = parse_json_reply(&response.raw_text)?;
     Ok(serde_json::from_value(value)?)
+}
+
+/// Board decision `decision.vlm_routing_v2`: dispatches a call by `candidate.provider`
+/// rather than a caller having to know which backend serves which reader. `"anthropic"`
+/// goes to a freshly constructed `AnthropicClient` (needs only `ANTHROPIC_API_KEY`, no HF
+/// router credits); anything else goes to the shared `HfClient`. Constructing the Anthropic
+/// client is cheap enough to do per call and keeps every caller's signature unchanged (no
+/// second client threaded through `resolve_blank_amount`'s public API). When
+/// `ANTHROPIC_API_KEY` isn't set, `AnthropicClient::new()` errors here, which `read_candidate`
+/// already treats as "this reader produced no result" — an inactive provider is reader-
+/// unavailable, never a guess.
+fn dispatch_call(
+    hf: &HfClient,
+    anthropic: Option<&AnthropicClient>,
+    cold: bool,
+    candidate: &CandidateConfig,
+    call: &ModelCall,
+) -> anyhow::Result<ModelResponse> {
+    if candidate.provider == "anthropic" {
+        let client = anthropic
+            .context("anthropic provider selected but no AnthropicClient configured (ANTHROPIC_API_KEY unset) -- reader unavailable")?;
+        return if cold { client.chat_completion_cold(call) } else { client.chat_completion(call) };
+    }
+    if cold { hf.chat_completion_cold(call) } else { hf.chat_completion(call) }
 }
 
 /// Per-read provenance (verifier #205 contract, board:verify.image_agreement): the
@@ -536,8 +608,16 @@ pub struct ImageResolution {
 /// When the user has not picked a model yet (`[selected]` absent from
 /// `config/models.toml`), the caller simply does not call this function; the model path is
 /// inactive by construction, not by a special case here.
+///
+/// `anthropic`: board decision `decision.vlm_routing_v2` (Kimi-K3 replaced by claude-opus-5
+/// as a backup reader) — pass `Some(&client)` when `ANTHROPIC_API_KEY` is set, `None`
+/// otherwise. Any reader whose `[[candidates.vlm]]`/`[[fallback.candidates]]` entry has
+/// `provider = "anthropic"` resolves through it instead of the shared `HfClient`; with `None`
+/// here, such a reader is simply unavailable for this run (no read, no guess), never an error
+/// that aborts the whole resolution.
 pub fn resolve_blank_amount(
     client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
     cold: bool,
     prompt: &PromptSet,
     image_max_dim_px: u32,
@@ -549,6 +629,7 @@ pub fn resolve_blank_amount(
     match config.vlm_mode() {
         VlmMode::Escalate => resolve_blank_amount_escalate(
             client,
+            anthropic,
             cold,
             prompt,
             &config.decoding,
@@ -560,14 +641,24 @@ pub fn resolve_blank_amount(
             config.vlm_fallback(),
             event,
         ),
-        VlmMode::Agreement => {
-            resolve_blank_amount_agreement(client, cold, prompt, &config.decoding, image_path, image_id, config, event)
-        }
+        VlmMode::Agreement => resolve_blank_amount_agreement(
+            client,
+            anthropic,
+            cold,
+            prompt,
+            &config.decoding,
+            image_path,
+            image_id,
+            config,
+            event,
+        ),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_candidate(
     client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
     cold: bool,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
@@ -590,11 +681,16 @@ fn read_candidate(
         after_amount: None,
         error: None,
     };
-    match call_vlm(client, cold, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
+    match call_vlm(client, anthropic, cold, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
         Ok(figures) => {
-            prov.due_date = figures.amount_due_before_date_value.clone();
-            prov.before_amount = figures.amount_due_before_date;
-            prov.after_amount = figures.amount_due_after_date;
+            // Prefer v2's unambiguous fields; fall back to v1's for an already-cached v1
+            // read (`finding.image05_root_cause`). Either way, `ImageReadProvenance`'s own
+            // field names (due_date/before_amount/after_amount) stay stable regardless of
+            // which prompt schema produced the read -- downstream (verifier, integrator)
+            // never needs to know about the v1/v2 split.
+            prov.due_date = figures.due_cutoff_date.clone().or_else(|| figures.amount_due_before_date_value.clone());
+            prov.before_amount = figures.amount_due_by_cutoff.or(figures.amount_due_before_date);
+            prov.after_amount = figures.amount_due_after_cutoff.or(figures.amount_due_after_date);
             prov.reconciled = reconciles(&figures, event);
             if prov.reconciled {
                 prov.selected_amount = select(&figures, event);
@@ -652,6 +748,7 @@ fn build_evidence(
 #[allow(clippy::too_many_arguments)]
 fn resolve_blank_amount_escalate(
     client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
     cold: bool,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
@@ -684,7 +781,7 @@ fn resolve_blank_amount_escalate(
     .filter_map(|(r, c)| c.map(|c| (r, c)))
     {
         let pick = ReaderPick { role, candidate, max_dim_px: image_max_dim_px, max_tokens: decoding.max_tokens_vlm };
-        let prov = read_candidate(client, cold, prompt, decoding, pick, &image_b64, image_id, event);
+        let prov = read_candidate(client, anthropic, cold, prompt, decoding, pick, &image_b64, image_id, event);
         if let (true, Some(amount), Some(currency)) =
             (prov.reconciled, prov.selected_amount, prov.currency.clone())
         {
@@ -703,17 +800,21 @@ fn resolve_blank_amount_escalate(
 /// `event_type`/`status`/`category`, never the model's own `doc_type`) to a pair of reader
 /// roles, each with its own resolution/token budget. Both read the image independently; if
 /// their selected amounts agree (within the documented rounding tolerance), that figure is
-/// trusted. On disagreement, or when one reader is missing/unreconciled, `vlm_fallback`
-/// tiebreaks — but ONLY when it names a genuinely independent third candidate: if it's
-/// already one of this class's two primary readers, calling it again would just "tiebreak"
-/// against its own cached answer and decide alone (analyst audit #214), so no tiebreak is
-/// attempted at all in that case. A tiebreak match must ALSO satisfy any due-date cutoff any
-/// of the three reads resolved (analyst audit #203) — matching a stale pre-cutoff figure
-/// numerically is not enough. Two readers both failing to reconcile is never covered by a
-/// lone fallback read (analyst audit #214: "(None,None) also accepts one read" was a bug,
-/// not a feature — two-model agreement never trusts exactly one model).
+/// trusted. On disagreement, or when one reader is missing/unreconciled, the class's own
+/// `tiebreak` reader (user decision `decision.tiebreak_distinct`) is called — a class's
+/// `tiebreak` role is enforced distinct from both its primary `readers` at
+/// `ModelsConfig::load()` (hard error), so there is no runtime self-tiebreak case to guard
+/// here: calling it is always a genuinely independent third read (analyst audit #214/#219 —
+/// the image_05 false accept was exactly a self-tiebreak, Kimi matching its own cached
+/// answer 5/5). A tiebreak match must ALSO satisfy any due-date cutoff any of the three reads
+/// resolved (analyst audit #203) — matching a stale pre-cutoff figure numerically is not
+/// enough. Two readers both failing to reconcile is never covered by a lone tiebreak read
+/// (analyst audit #214: "(None,None) also accepts one read" was a bug, not a feature —
+/// two-model agreement never trusts exactly one model).
+#[allow(clippy::too_many_arguments)]
 fn resolve_blank_amount_agreement(
     client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
     cold: bool,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
@@ -742,42 +843,38 @@ fn resolve_blank_amount_agreement(
     } else {
         downscale_and_encode(image_path, pick_b.max_dim_px)?
     };
-    let prov_a = read_candidate(client, cold, prompt, decoding, pick_a, &b64_a, image_id, event);
-    let prov_b = read_candidate(client, cold, prompt, decoding, pick_b, &b64_b, image_id, event);
+    let prov_a = read_candidate(client, anthropic, cold, prompt, decoding, pick_a, &b64_a, image_id, event);
+    let prov_b = read_candidate(client, anthropic, cold, prompt, decoding, pick_b, &b64_b, image_id, event);
     let mut reads = vec![prov_a.clone(), prov_b.clone()];
 
+    // Verifier gate #250: the tolerance is configurable (capped at
+    // MAX_AGREEMENT_TOLERANCE), and a due-date cutoff any read itself resolved gates BOTH
+    // the two-reader agree path and the tiebreak path -- two readers numerically agreeing on
+    // a stale pre-cutoff figure is not a real agreement.
+    let tolerance = config.agreement_tolerance();
+    let ab_cutoff_requirement = [&prov_a, &prov_b].iter().find_map(|p| cutoff_requirement(p, event));
+    let ab_satisfies_cutoff =
+        |amount: f64| ab_cutoff_requirement.is_none_or(|req| close(amount, req, tolerance));
+
     if let (Some(amt_a), Some(amt_b)) = (prov_a.selected_amount, prov_b.selected_amount) {
-        if close(amt_a, amt_b, ROUNDING_TOLERANCE_2TERM) {
+        if close(amt_a, amt_b, tolerance) && ab_satisfies_cutoff(amt_a) {
             let currency = prov_a.currency.clone().unwrap_or_else(|| event.currency.clone());
             let evidence = build_evidence(image_id, event, amt_a, currency, &[&prov_a.role, &prov_b.role]);
             return Ok(outcome("agree", reads, Some(evidence)));
         }
     }
 
-    let Some(fallback) = config.vlm_fallback() else {
+    let Some(tb_pick) = config.tiebreak_for(event) else {
         return Ok(outcome("no_agreement", reads, None));
     };
-    if fallback.id == pick_a.candidate.id || fallback.id == pick_b.candidate.id {
-        // No genuinely independent third reader configured for this class -- never
-        // "tiebreak" a candidate against its own earlier (cache-identical) answer.
-        return Ok(outcome("no_agreement", reads, None));
-    }
-
-    let fb_max_dim = config.image_max_dim_px();
-    let b64_fb = if fb_max_dim == pick_a.max_dim_px {
+    let b64_fb = if tb_pick.max_dim_px == pick_a.max_dim_px {
         b64_a.clone()
-    } else if fb_max_dim == pick_b.max_dim_px {
+    } else if tb_pick.max_dim_px == pick_b.max_dim_px {
         b64_b.clone()
     } else {
-        downscale_and_encode(image_path, fb_max_dim)?
+        downscale_and_encode(image_path, tb_pick.max_dim_px)?
     };
-    let fb_pick = ReaderPick {
-        role: "vlm_fallback",
-        candidate: fallback,
-        max_dim_px: fb_max_dim,
-        max_tokens: decoding.max_tokens_vlm,
-    };
-    let prov_fb = read_candidate(client, cold, prompt, decoding, fb_pick, &b64_fb, image_id, event);
+    let prov_fb = read_candidate(client, anthropic, cold, prompt, decoding, tb_pick, &b64_fb, image_id, event);
     reads.push(prov_fb.clone());
 
     let Some(amt_fb) = prov_fb.selected_amount else {
@@ -787,11 +884,11 @@ fn resolve_blank_amount_agreement(
     let cutoff_requirement =
         [&prov_a, &prov_b, &prov_fb].iter().find_map(|p| cutoff_requirement(p, event));
     let satisfies_cutoff =
-        |amount: f64| cutoff_requirement.is_none_or(|req| close(amount, req, ROUNDING_TOLERANCE_2TERM));
+        |amount: f64| cutoff_requirement.is_none_or(|req| close(amount, req, tolerance));
 
-    let matched_role = if prov_a.selected_amount.is_some_and(|a| close(amt_fb, a, ROUNDING_TOLERANCE_2TERM)) {
+    let matched_role = if prov_a.selected_amount.is_some_and(|a| close(amt_fb, a, tolerance)) {
         Some(prov_a.role.clone())
-    } else if prov_b.selected_amount.is_some_and(|b| close(amt_fb, b, ROUNDING_TOLERANCE_2TERM)) {
+    } else if prov_b.selected_amount.is_some_and(|b| close(amt_fb, b, tolerance)) {
         Some(prov_b.role.clone())
     } else {
         None
@@ -800,7 +897,7 @@ fn resolve_blank_amount_agreement(
     match matched_role {
         Some(role) if satisfies_cutoff(amt_fb) => {
             let currency = prov_fb.currency.clone().unwrap_or_else(|| event.currency.clone());
-            let evidence = build_evidence(image_id, event, amt_fb, currency, &[&role, "vlm_fallback"]);
+            let evidence = build_evidence(image_id, event, amt_fb, currency, &[&role, &prov_fb.role]);
             Ok(outcome("tiebreak_accept", reads, Some(evidence)))
         }
         _ => Ok(outcome("no_agreement", reads, None)),
@@ -835,11 +932,11 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Payslip),
             currency: Some("IDR".into()),
-            subtotal: Some(4_780_800.0),
-            gross_pay: Some(4_780_800.0),
-            deductions: Some(415_800.0),
+            subtotal: Some(4_212_000.0),
+            gross_pay: Some(4_212_000.0),
+            deductions: Some(367_000.0),
             net_pay: Some(4_365_000.0),
-            line_items_sum_check: Some(4_780_800.0),
+            line_items_sum_check: Some(4_212_000.0),
             ..Default::default()
         };
         let event = income_event();
@@ -865,8 +962,8 @@ mod tests {
         }
     }
 
-    /// Analyst audit RULES.md S5 image_07: subtotal 8,122 + tax 406.10 = 8,528.10 exactly,
-    /// but the page also prints a plain "8,528" total. An exact-cent check would reject a
+    /// Analyst audit RULES.md S5 image_07: subtotal 7,150 + tax 358.10 = 7,508.10 exactly,
+    /// but the page also prints a plain "7,508" total. An exact-cent check would reject a
     /// genuinely reconciling document; the documented rounding tolerance accepts it (and
     /// selects the printed total, not a recomputed one).
     #[test]
@@ -874,57 +971,57 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Invoice),
             currency: Some("INR".into()),
-            subtotal: Some(8122.0),
-            tax: Some(406.10),
-            total: Some(8528.0),
+            subtotal: Some(7150.0),
+            tax: Some(358.10),
+            total: Some(7508.0),
             ..Default::default()
         };
         let event = expense_event("event_3231", "dining", "INR", Status::Settled);
         assert!(reconciles(&figures, &event));
-        assert_eq!(select(&figures, &event), Some(8528.0));
+        assert_eq!(select(&figures, &event), Some(7508.0));
     }
 
     /// Analyst audit RULES.md S5 image_11: a multi-section hospital bill's itemized
-    /// breakup sums to 3,150, but the labeled Amount Paid (0) + Balance (3,650) already
-    /// reconcile against the labeled Total (3,650). The line-item sum must never override
+    /// breakup sums to 2,790, but the labeled Amount Paid (0) + Balance (3,210) already
+    /// reconcile against the labeled Total (3,210). The line-item sum must never override
     /// labeled fields that already reconcile among themselves.
     #[test]
     fn image_11_ignores_line_item_sum_when_labeled_fields_reconcile() {
         let figures = ImageFigures {
             doc_type: Some(DocType::Invoice),
             currency: Some("INR".into()),
-            total: Some(3650.0),
+            total: Some(3210.0),
             amount_paid: Some(0.0),
-            balance_due: Some(3650.0),
-            line_items_sum_check: Some(3150.0), // wrong: breakup subtotals miss a line
+            balance_due: Some(3210.0),
+            line_items_sum_check: Some(2790.0), // wrong: breakup subtotals miss a line
             ..Default::default()
         };
         let event = expense_event("event_6859", "healthcare", "INR", Status::Scheduled);
         assert!(reconciles(&figures, &event));
-        assert_eq!(select(&figures, &event), Some(3650.0));
+        assert_eq!(select(&figures, &event), Some(3210.0));
     }
 
     /// Analyst audit RULES.md S5 image_12: a settled expense's "amount paid"/cash line can
-    /// be the cash TENDERED (40.00, with 6.50 change), not the expense itself (33.50
+    /// be the cash TENDERED (35.00, with 6.25 change), not the expense itself (28.75
     /// total). The selector must prefer the printed total over amount_paid whenever a
     /// total is present.
     #[test]
     fn image_12_settled_expense_prefers_total_over_cash_tendered_amount_paid() {
         // Exact shape of the cached VLM reads (analyst audit #184): balance_due present as
-        // 0.00 (nothing owed), amount_paid the cash tendered (40.00), which naively fails
-        // paid+balance_due=total (40 != 33.50) — paid >= total must be treated as
+        // 0.00 (nothing owed), amount_paid the cash tendered (35.00), which naively fails
+        // paid+balance_due=total (35 != 28.75) — paid >= total must be treated as
         // consistent on its own, never requiring balance_due to explain the gap.
         let figures = ImageFigures {
             doc_type: Some(DocType::Receipt),
             currency: Some("USD".into()),
-            total: Some(33.50),
-            amount_paid: Some(40.00), // cash tendered, not the expense amount
+            total: Some(28.75),
+            amount_paid: Some(35.00), // cash tendered, not the expense amount
             balance_due: Some(0.00),
             ..Default::default()
         };
         let event = expense_event("event_7307", "transport", "USD", Status::Settled);
         assert!(reconciles(&figures, &event));
-        assert_eq!(select(&figures, &event), Some(33.50));
+        assert_eq!(select(&figures, &event), Some(28.75));
     }
 
     /// analyst audit #184: strict enum matching on the VLM's own free-text doc_type wording
@@ -939,6 +1036,13 @@ mod tests {
         assert_eq!(DocType::from_free_text("Bill of Supply"), DocType::Receipt);
         assert_eq!(DocType::from_free_text("Order Details"), DocType::DeliverySummary);
         assert_eq!(DocType::from_free_text("something the model made up"), DocType::Other);
+
+        // Indonesian synonyms (dataset is EN+ID, PLAN.md §2.4).
+        assert_eq!(DocType::from_free_text("Slip Gaji"), DocType::Payslip);
+        assert_eq!(DocType::from_free_text("Kwitansi"), DocType::Receipt);
+        assert_eq!(DocType::from_free_text("Faktur Pajak"), DocType::Invoice);
+        assert_eq!(DocType::from_free_text("Tagihan Listrik"), DocType::Bill);
+        assert_eq!(DocType::from_free_text("Rekening Koran"), DocType::BankStatementExcerpt);
 
         let value = serde_json::json!({"doc_type": "TAX INVOICE", "total": 100.0});
         let figures: ImageFigures = serde_json::from_value(value).expect("should not reject on doc_type");
@@ -961,6 +1065,31 @@ mod tests {
         assert!(!currency_matches("USD", "INR"));
     }
 
+    /// Analyst audit #276 (image_02-shaped, SYNTHETIC values -- not the real dataset
+    /// figures): two Qwen3-VL-235B reads of the real image both misread its printed Indian
+    /// lakh grouping as 10x the true amount and still passed internal reconciliation. This
+    /// test covers the specific sub-case where a model transcribes the grouped figure as a
+    /// JSON STRING (`"1,00,000"`) rather than a plain number -- `coerce_f64` must recover the
+    /// correct value via `normalize::parse_amount`'s Indian-grouping rule, not silently
+    /// accept a naive comma-strip-only misread. It does NOT cover a model emitting the wrong
+    /// value as a plain JSON number already (no text exists at that point to reparse) --
+    /// that failure mode is caught by cross-model agreement (>=2 distinct models must agree,
+    /// `resolve_blank_amount_agreement`) and the amount-plausibility-vs-history check.
+    #[test]
+    fn image_02_shaped_lakh_grouped_string_total_parses_to_the_true_amount_not_10x() {
+        let value = serde_json::json!({
+            "doc_type": "receipt",
+            "currency": "INR",
+            "total": "1,00,000",
+            "amount_paid": "1,00,000"
+        });
+        let figures: ImageFigures = serde_json::from_value(value).expect("should parse");
+        assert_eq!(figures.total, Some(100_000.0), "must recover the lakh-grouped total, not 1,000,000");
+        let event = expense_event("event_synthetic_lakh", "transport", "INR", Status::Settled);
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(100_000.0));
+    }
+
     /// analyst audit #194: a document can print an unrelated subtotal/tax breakdown that
     /// doesn't sum to the overall total, while amount_paid + balance_due = total
     /// independently confirms the figure — the first identity's mismatch must not veto the
@@ -970,16 +1099,16 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Invoice),
             currency: Some("INR".into()),
-            subtotal: Some(1000.0), // describes a different section; doesn't sum to total
-            tax: Some(50.0),
-            total: Some(3650.0),
+            subtotal: Some(880.0), // describes a different section; doesn't sum to total
+            tax: Some(44.0),
+            total: Some(3210.0),
             amount_paid: Some(0.0),
-            balance_due: Some(3650.0),
+            balance_due: Some(3210.0),
             ..Default::default()
         };
         let event = expense_event("event_6859", "healthcare", "INR", Status::Scheduled);
         assert!(reconciles(&figures, &event));
-        assert_eq!(select(&figures, &event), Some(3650.0));
+        assert_eq!(select(&figures, &event), Some(3210.0));
     }
 
     fn pending_utilities_event(settlement_date: NaiveDate) -> Event {
@@ -1008,14 +1137,14 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Bill),
             currency: Some("INR".into()),
-            amount_due_before_date: Some(704.05),
+            amount_due_before_date: Some(611.45),
             amount_due_before_date_value: Some("2026-02-06".into()),
-            amount_due_after_date: Some(822.05),
+            amount_due_after_date: Some(739.65),
             ..Default::default()
         };
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
         assert!(reconciles(&figures, &event));
-        assert_eq!(select(&figures, &event), Some(822.05));
+        assert_eq!(select(&figures, &event), Some(739.65));
     }
 
     /// analyst audit board:verify.image05_shapes "Shape A" (6 Qwen reads): before/after are
@@ -1026,17 +1155,17 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Bill),
             currency: Some("INR".into()),
-            amount_due_before_date: Some(704.05),
+            amount_due_before_date: Some(611.45),
             amount_due_before_date_value: None,
-            amount_due_after_date: Some(822.05),
+            amount_due_after_date: Some(739.65),
             ..Default::default()
         };
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
         assert!(reconciles(&figures, &event));
-        assert_eq!(select(&figures, &event), Some(822.05));
+        assert_eq!(select(&figures, &event), Some(739.65));
     }
 
-    /// analyst audit "Shape B", the 4 gemma reads: only the before-cutoff figure (704.05)
+    /// analyst audit "Shape B", the 4 gemma reads: only the before-cutoff figure (611.45)
     /// is present anywhere on the page, with no after figure and no balance_due/amount_due
     /// to fall back to. Not safe to treat the lone value as authoritative -- `select`
     /// returns `None` so the caller escalates rather than guessing.
@@ -1045,7 +1174,7 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Bill),
             currency: Some("INR".into()),
-            amount_due_before_date: Some(704.05),
+            amount_due_before_date: Some(611.45),
             ..Default::default()
         };
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
@@ -1061,11 +1190,11 @@ mod tests {
             doc_type: Some(DocType::Bill),
             currency: Some("INR".into()),
             balance_due: Some(0.0),
-            amount_due: Some(822.05),
+            amount_due: Some(739.65),
             ..Default::default()
         };
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
-        assert_eq!(select(&figures, &event), Some(822.05));
+        assert_eq!(select(&figures, &event), Some(739.65));
     }
 
     /// analyst audit #203: once a cutoff IS known and the cash date is past it, the
@@ -1076,29 +1205,100 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::Bill),
             currency: Some("INR".into()),
-            amount_due_before_date: Some(704.05),
+            amount_due_before_date: Some(611.45),
             amount_due_before_date_value: Some("2026-02-06".into()),
-            amount_due_after_date: None, // missing -- must not fall back to before (704.05)
-            balance_due: Some(704.05),   // must not fall back here either
+            amount_due_after_date: None, // missing -- must not fall back to before (611.45)
+            balance_due: Some(611.45),   // must not fall back here either
             ..Default::default()
         };
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
         assert_eq!(select(&figures, &event), None);
     }
 
-    /// analyst audit "Shape B", the other 2 reads: after-cutoff (822.05) landed in
+    /// v2 schema (`finding.image05_root_cause`): the unambiguous
+    /// due_cutoff_date/amount_due_by_cutoff/amount_due_after_cutoff trio is preferred over
+    /// the legacy v1 fields whenever both happen to be present (a mixed-schema read should
+    /// not occur in practice, but preferring v2 is the documented, tested behavior).
+    #[test]
+    fn v2_cutoff_fields_are_preferred_over_legacy_v1_fields() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            due_cutoff_date: Some("2026-02-06".into()),
+            amount_due_by_cutoff: Some(615.20),
+            amount_due_after_cutoff: Some(742.90),
+            // Legacy v1 fields, deliberately different values and no v1 cutoff date -- if v1
+            // were consulted first this would fall through to the "no cutoff" branch instead.
+            amount_due_before_date: Some(999.99),
+            amount_due_after_date: Some(999.99),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(742.90));
+    }
+
+    /// v2 schema: no cutoff date present, both amounts printed -- same conservative
+    /// larger-figure fallback as the v1 "Shape A" case.
+    #[test]
+    fn v2_no_cutoff_date_falls_back_to_the_larger_figure() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            amount_due_by_cutoff: Some(615.20),
+            amount_due_after_cutoff: Some(742.90),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert_eq!(select(&figures, &event), Some(742.90));
+    }
+
+    /// v2 schema: a known cutoff in the past requires the after-cutoff figure exactly, same
+    /// as v1 -- never falls back to the before-cutoff figure or to balance_due/amount_due.
+    #[test]
+    fn v2_known_cutoff_requires_after_never_falls_back() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            due_cutoff_date: Some("2026-02-06".into()),
+            amount_due_by_cutoff: Some(615.20),
+            amount_due_after_cutoff: None, // missing -- must not fall back to by-cutoff
+            balance_due: Some(615.20),     // must not fall back here either
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert_eq!(select(&figures, &event), None);
+    }
+
+    /// `read_candidate`'s provenance keeps stable field names (due_date/before_amount/
+    /// after_amount, verifier #205's contract) regardless of which prompt schema produced
+    /// the read -- verifier #266.
+    #[test]
+    fn provenance_maps_v2_fields_into_stable_names() {
+        let figures = ImageFigures {
+            due_cutoff_date: Some("2026-02-06".into()),
+            amount_due_by_cutoff: Some(615.20),
+            amount_due_after_cutoff: Some(742.90),
+            ..Default::default()
+        };
+        assert_eq!(figures.due_cutoff_date.clone().or_else(|| figures.amount_due_before_date_value.clone()), Some("2026-02-06".to_string()));
+        assert_eq!(figures.amount_due_by_cutoff.or(figures.amount_due_before_date), Some(615.20));
+        assert_eq!(figures.amount_due_after_cutoff.or(figures.amount_due_after_date), Some(742.90));
+    }
+
+    /// analyst audit "Shape B", the other 2 reads: after-cutoff (739.65) landed in
     /// balance_due instead of amount_due_after_date. The fallback still resolves it.
     #[test]
     fn image_05_after_value_in_balance_due_still_resolves() {
         let figures = ImageFigures {
             doc_type: Some(DocType::Bill),
             currency: Some("INR".into()),
-            amount_due_before_date: Some(704.05),
-            balance_due: Some(822.05),
+            amount_due_before_date: Some(611.45),
+            balance_due: Some(739.65),
             ..Default::default()
         };
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
-        assert_eq!(select(&figures, &event), Some(822.05));
+        assert_eq!(select(&figures, &event), Some(739.65));
     }
 
     /// analyst audit "Shape B": a date string landed in the numeric before/after fields
@@ -1108,20 +1308,20 @@ mod tests {
     #[test]
     fn image_05_swapped_json_types_deserialize_without_error() {
         let value = serde_json::json!({
-            "amount_due_before_date": "704.05",
-            "amount_due_before_date_value": 704.05,
-            "amount_due_after_date": 822.05,
+            "amount_due_before_date": "611.45",
+            "amount_due_before_date_value": 611.45,
+            "amount_due_after_date": 739.65,
             "currency": "INR"
         });
         let figures: ImageFigures =
             serde_json::from_value(value).expect("swapped types must not error the whole parse");
-        assert_eq!(figures.amount_due_before_date, Some(704.05));
-        assert_eq!(figures.amount_due_before_date_value, Some("704.05".to_string()));
-        assert_eq!(figures.amount_due_after_date, Some(822.05));
+        assert_eq!(figures.amount_due_before_date, Some(611.45));
+        assert_eq!(figures.amount_due_before_date_value, Some("611.45".to_string()));
+        assert_eq!(figures.amount_due_after_date, Some(739.65));
 
         let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
-        // "704.05" does not parse as a date, so no cutoff resolves -> conservative max().
-        assert_eq!(select(&figures, &event), Some(822.05));
+        // "611.45" does not parse as a date, so no cutoff resolves -> conservative max().
+        assert_eq!(select(&figures, &event), Some(739.65));
     }
 
     #[test]
@@ -1129,8 +1329,8 @@ mod tests {
         let figures = ImageFigures {
             doc_type: Some(DocType::DeliverySummary),
             currency: Some("INR".into()),
-            subtotal: Some(2854.0),
-            line_items_sum_check: Some(2854.0),
+            subtotal: Some(2513.0),
+            line_items_sum_check: Some(2513.0),
             total: None,
             amount_paid: None,
             ..Default::default()
@@ -1178,6 +1378,7 @@ mod tests {
         let event = income_event();
         let resolution = resolve_blank_amount(
             &client,
+            None,
             false,
             &prompt,
             cfg.image_max_dim_px(),
