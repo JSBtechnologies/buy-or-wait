@@ -28,5 +28,5 @@ Generated from the final full-dataset run that produced `output.csv`. The run st
 - Prompt tokens: 31309
 - Completion tokens: 11703
 - Total tokens: 43012
-- Wall time: 53.31s
-- Estimated cost: $0.039835 (assumption: $2.69/hr H100, wall-time billed -- not per-token pricing; verify against the actual RunPod rate)
+- Wall time: 53.59s
+- Estimated cost: $0.040046 (assumption: $2.69/hr H100, wall-time billed -- not per-token pricing; verify against the actual RunPod rate)
