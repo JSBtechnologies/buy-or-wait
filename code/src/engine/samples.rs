@@ -227,7 +227,7 @@ mod image_preview {
     use crate::engine::{session::Session, types::*};
     use crate::model;
 
-    /// First bold number (`**79,679.26**`) in the RULES.md table row that names `event_id`.
+    /// First bold number (e.g. `**1,234.50**`) in the RULES.md table row that names `event_id`.
     fn audited_figure(md: &str, event_id: &str) -> Option<f64> {
         let row = md.lines().find(|l| l.starts_with('|') && l.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == event_id))?;
         row.split("**").skip(1).step_by(2).find_map(|t| t.replace(',', "").trim().parse::<f64>().ok())
