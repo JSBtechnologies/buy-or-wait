@@ -63,6 +63,22 @@ Resolution sweep detail (labeled-image field accuracy per candidate max dimensio
 - `google/gemma-4-31B-it`: 512px=70%, 768px=86%, 1024px=82%, 1536px=79%
 - `Qwen/Qwen3.5-397B-A17B`: 512px=0%, 768px=0%, 1024px=0%, 1536px=0%
 
+### LLM candidates (message -> typed records)
+
+| Model | Provider | Field accuracy vs gold (47 labeled) | Valid-JSON rate | Stability (3 runs) | Cross-model agreement | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen/Qwen3-235B-A22B-Instruct-2507 | deepinfra | 100.0% | 100.0% | 33.3% | N/A (all 47 gold messages labeled) | 82 | 1 | 2244 | $0.00001 | $0.0001 |
+| aisingapore/Gemma-SEA-LION-v4-27B-IT | publicai | 100.0% | 100.0% | 100.0% | N/A (all 47 gold messages labeled) | 77 | 2 | 1206 | $0.00002 | $0.0002 |
+| deepseek-ai/DeepSeek-V3.2 | deepinfra | 100.0% | 100.0% | 33.3% | N/A (all 47 gold messages labeled) | 75 | 2 | 3862 | $0.00002 | $0.0003 |
+| openai/gpt-oss-120b | deepinfra | UNAVAILABLE | UNAVAILABLE | UNAVAILABLE | — | — | — | — | — | — |
+
+**ml-engineer recommendation (LLM, non-binding — the user decides):** `aisingapore/Gemma-SEA-LION-v4-27B-IT` via `publicai`. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost; re-check against the actual field-accuracy/cost numbers above before deciding. Given production LLM volume is now just 1 message (`msg_86`), this pick matters far less than the VLM pick above.
+
+"Est. cost/full run" for messages uses 13 as a lower-bound proxy from the gold subset's distinct `record_type` shapes — now superseded by the lead's harder number: extraction's deterministic parser covers 214/215 messages, so production LLM volume is 1 message (`msg_86`), not 13.
+
+(Bake-off messages are batched one call per run for the whole 47-message gold subset, matching the batching lever being judged; a real per-user batch in production is far smaller — per-item token/cost figures above divide the batch call by its message count.)
+
+
 ## Step 4 — Usage report (`code/evaluation/usage_report.md`)
 
 Generated from the final full-dataset cold run's real usage records at ship

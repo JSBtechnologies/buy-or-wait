@@ -56,16 +56,26 @@ pub fn render(f: &DecisionFacts, rules: &Rules) -> String {
             // Variant B iff methods == {partial_payment}, partial allowed, safe > 0, no E [FIT].
             let only_partial = f.accepted_methods == [PaymentMethod::PartialPayment]
                 && rules.not_recommended_template == NotRecommendedTemplate::BIffPartialOnly;
-            if only_partial && f.allows_partial_payment && f.safe_amount > Money::ZERO && f.earliest_full_date.is_none() {
-                format!(
+            let due = long_date(f.desired_completion_date);
+            let extras = rules.not_recommended_template == NotRecommendedTemplate::BIffPartialOnly;
+            match f.earliest_full_date {
+                None if only_partial && f.allows_partial_payment && f.safe_amount > Money::ZERO => format!(
                     "Do not proceed with the {req} request. Although {} is available today, the full amount cannot be completed safely within 90 days.",
                     money(f.safe_amount)
-                )
-            } else {
-                format!(
-                    "Do not make this payment by {}. None of the available options keeps the {min} minimum protected.",
-                    long_date(f.desired_completion_date)
-                )
+                ),
+                // Not in the samples: a full payment does become safe, but only after the
+                // deadline. Say when, instead of implying it never becomes safe.
+                Some(e) if extras && e > f.desired_completion_date => format!(
+                    "Do not make this payment by {due}. Paying {req} in full only becomes safe on {}, after that date, and none of the available options keeps the {min} minimum protected sooner.",
+                    long_date(e)
+                ),
+                // A full payment would be safe by the deadline, but the user does not accept
+                // full payment (otherwise wait or full-now would have been recommended).
+                Some(e) if extras && !f.accepted_methods.contains(&PaymentMethod::FullPayment) => format!(
+                    "Do not make this payment by {due}. Paying {req} in full would be safe from {}, but full payment is not one of your accepted methods, and none of the other options keeps the {min} minimum protected.",
+                    long_date(e)
+                ),
+                _ => format!("Do not make this payment by {due}. None of the available options keeps the {min} minimum protected."),
             }
         }
     }
@@ -101,6 +111,10 @@ fn upper_first(s: &str) -> String {
 }
 
 fn lower_first(s: &str) -> String {
+    // Keep acronyms intact ("EV charging plan" stays "EV charging plan").
+    if s.chars().take(2).all(|ch| ch.is_uppercase()) {
+        return s.to_string();
+    }
     let mut c = s.chars();
     match c.next() {
         Some(first) => first.to_lowercase().collect::<String>() + c.as_str(),
