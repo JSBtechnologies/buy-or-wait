@@ -249,18 +249,43 @@ fn main() -> anyhow::Result<ExitCode> {
     // Every call `hf_client` made this run (empty until extraction wires a live call site
     // into `decide_one`); `write_usage_report` still renders every required section with
     // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
-    let pricing = load_pricing(Path::new("config/models.toml"))?;
+    let mut pricing = load_pricing(Path::new("config/models.toml"))?;
     let mut usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
     if let Some(client) = anthropic_client.as_ref() {
         usage_records.extend(client.usage_records());
     }
+    // AGENTS.md §6.5: the report must summarize the FINAL run's providers/models, calls,
+    // tokens, and cost -- OCR is a real model path, not a footnote, so its calls become
+    // ordinary `hf::Usage` records (one per page, matching how HF calls are counted) and a
+    // derived per-token `Pricing` entry, rather than a separate section the Overview/
+    // per-model table ignore. The self-hosted H100 is billed by wall time, not per token, so
+    // this rate is back-derived from that wall-time cost purely so the existing per-token
+    // cost math lands on the same total -- `append_ocr_cost_note` states the real assumption.
+    const OCR_MODEL_ID: &str = "baidu/Unlimited-OCR";
+    const OCR_PROVIDER: &str = "self-hosted vLLM (RunPod H100)";
+    const H100_HOURLY_USD: f64 = 2.69;
+    let ocr_wall_seconds: f64 = ocr_usage.iter().map(|u| u.seconds).sum();
+    let ocr_cost_usd = (ocr_wall_seconds / 3600.0) * H100_HOURLY_USD;
+    let ocr_total_tokens: u64 = ocr_usage.iter().map(|u| u.prompt_tokens + u.completion_tokens).sum();
+    if ocr_total_tokens > 0 {
+        let rate_per_m = ocr_cost_usd * 1_000_000.0 / ocr_total_tokens as f64;
+        pricing.insert(OCR_MODEL_ID.to_string(), hf::Pricing { input_per_m: rate_per_m, output_per_m: rate_per_m });
+    }
+    usage_records.extend(ocr_usage.iter().map(|u| hf::Usage {
+        model_id: OCR_MODEL_ID.to_string(),
+        provider: OCR_PROVIDER.to_string(),
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+        latency_ms: (u.seconds * 1000.0) as u64,
+        cache_hit: u.cache_hit,
+    }));
     hf::write_usage_report(
         Path::new("evaluation/usage_report.md"),
         &usage_records,
         &pricing,
         requests.len(),
     )?;
-    append_ocr_usage_report(Path::new("evaluation/usage_report.md"), &ocr_usage)?;
+    append_ocr_cost_note(Path::new("evaluation/usage_report.md"), H100_HOURLY_USD, ocr_wall_seconds, ocr_cost_usd)?;
 
     eprintln!("model cache stats: {:?}", model_cache.stats());
 
@@ -576,36 +601,24 @@ fn load_dotenv() {
     }
 }
 
-/// Appends an OCR section to `evaluation/usage_report.md` (fleet/specs/ocr_vllm_pipeline.md
-/// work item B4): calls, tokens, and an estimated cost. The HF/LLM path above is priced per
-/// token (`hf::Pricing`); the OCR endpoint is a self-hosted RunPod H100, priced by wall time
-/// instead, so this is a separate section rather than forcing it through `hf::Usage`.
-/// **Assumption, stated explicitly**: $2.69/hr, a commonly quoted RunPod H100 SXM secure-
-/// cloud on-demand rate as of this run -- adjust `H100_HOURLY_USD` if the actual pod's rate
-/// differs.
-fn append_ocr_usage_report(path: &Path, usage: &[buyorwait::extract::ocr::OcrUsage]) -> anyhow::Result<()> {
-    const H100_HOURLY_USD: f64 = 2.69;
-    let calls = usage.iter().filter(|u| !u.cache_hit).count();
-    let cache_hits = usage.iter().filter(|u| u.cache_hit).count();
-    let prompt_tokens: u64 = usage.iter().map(|u| u.prompt_tokens).sum();
-    let completion_tokens: u64 = usage.iter().map(|u| u.completion_tokens).sum();
-    let wall_seconds: f64 = usage.iter().map(|u| u.seconds).sum();
-    let cost_usd = (wall_seconds / 3600.0) * H100_HOURLY_USD;
-    let section = format!(
-        "\n## OCR ingestion (fleet/specs/ocr_vllm_pipeline.md)\n\n\
-         - Model: baidu/Unlimited-OCR (self-hosted vLLM, RunPod H100)\n\
-         - Pages OCR'd live: {calls} (cache hits: {cache_hits})\n\
-         - Prompt tokens: {prompt_tokens}\n\
-         - Completion tokens: {completion_tokens}\n\
-         - Total tokens: {}\n\
-         - Wall time: {wall_seconds:.2}s\n\
-         - Estimated cost: ${cost_usd:.6} (assumption: ${H100_HOURLY_USD:.2}/hr H100, wall-time \
-           billed -- not per-token pricing; verify against the actual RunPod rate)\n",
-        prompt_tokens + completion_tokens,
+/// Appends a one-line note to `evaluation/usage_report.md` stating the OCR cost assumption
+/// (fleet/specs/ocr_vllm_pipeline.md work item B4). The Overview and per-model breakdown
+/// above already carry OCR's real calls/tokens/cost as an ordinary `hf::Usage`/`Pricing`
+/// entry (main(), AGENTS.md §6.5) -- this note exists only because that per-token `Pricing`
+/// number is itself back-derived from a wall-time assumption, and the assumption needs to be
+/// visible, not just its result. **Stated explicitly**: $2.69/hr, a commonly quoted RunPod
+/// H100 SXM secure-cloud on-demand rate as of this run -- adjust the caller's
+/// `H100_HOURLY_USD` if the actual pod's rate differs.
+fn append_ocr_cost_note(path: &Path, hourly_usd: f64, wall_seconds: f64, cost_usd: f64) -> anyhow::Result<()> {
+    let note = format!(
+        "\n_OCR cost assumption: baidu/Unlimited-OCR (self-hosted vLLM, RunPod H100) is billed \
+         by wall time, not per token -- ${cost_usd:.6} = {wall_seconds:.2}s wall time \u{d7} \
+         ${hourly_usd:.2}/hr, shown above via a per-token rate back-derived to match; verify \
+         against the actual RunPod rate._\n"
     );
     let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
     use std::io::Write;
-    file.write_all(section.as_bytes())?;
+    file.write_all(note.as_bytes())?;
     Ok(())
 }
 

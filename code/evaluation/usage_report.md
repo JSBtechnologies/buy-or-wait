@@ -5,28 +5,20 @@ Generated from the final full-dataset run that produced `output.csv`. The run st
 ## Overview
 
 - Requests in this run: 250
-- Model calls: 0
-- Input tokens: 0
-- Output tokens: 0
-- Total tokens: 0
-- Cache hit rate: N/A (0 calls)
-- Avg tokens per request: 0.0
-- Avg cost per request: $0.000000
-- Estimated total cost: $0.000000
+- Model calls: 17
+- Input tokens: 31309
+- Output tokens: 11703
+- Total tokens: 43012
+- Cache hit rate: 0.0% (0/17 calls served from the §2.11 disk cache, 0 tokens/cost)
+- Avg tokens per request: 172.0
+- Avg cost per request: $0.000161
+- Estimated total cost: $0.040177
 
 ## Per-model breakdown
 
 | Model | Provider | Calls | Cache hits | Input tokens | Output tokens | Total tokens | Avg tokens/call | Est. cost |
 |---|---|---|---|---|---|---|---|---|
-| — | — | 0 | 0 (—) | 0 | 0 | 0 | 0.0 | $0.000000 |
-| **Overall** | — | 0 | 0 (0.0%) | 0 | 0 | 0 | 0.0 | $0.000000 |
+| baidu/Unlimited-OCR | self-hosted vLLM (RunPod H100) | 17 | 0 (0.0%) | 31309 | 11703 | 43012 | 2530.1 | $0.040177 |
+| **Overall** | — | 17 | 0 (0.0%) | 31309 | 11703 | 43012 | 2530.1 | $0.040177 |
 
-## OCR ingestion (fleet/specs/ocr_vllm_pipeline.md)
-
-- Model: baidu/Unlimited-OCR (self-hosted vLLM, RunPod H100)
-- Pages OCR'd live: 17 (cache hits: 0)
-- Prompt tokens: 31309
-- Completion tokens: 11703
-- Total tokens: 43012
-- Wall time: 53.59s
-- Estimated cost: $0.040046 (assumption: $2.69/hr H100, wall-time billed -- not per-token pricing; verify against the actual RunPod rate)
+_OCR cost assumption: baidu/Unlimited-OCR (self-hosted vLLM, RunPod H100) is billed by wall time, not per token -- $0.040177 = 53.77s wall time × $2.69/hr, shown above via a per-token rate back-derived to match; verify against the actual RunPod rate._

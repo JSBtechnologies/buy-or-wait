@@ -8,15 +8,18 @@ reverse-engineered numeric rules.
 ## Prerequisites
 
 - Rust (stable toolchain; developed against 1.96) and Cargo.
-- An `HF_TOKEN` environment variable holding a Hugging Face API token, for the model
-  bake-off (`bakeoff`) and any future live extraction calls. Never commit this value;
-  it is read from the environment only. Not required to build, or to run the batch
-  pipeline once the processed-data store is fully populated.
-- `OCR_BASE_URL` (required for live OCR ingestion; see "OCR ingestion" below),
-  optionally `OCR_MODEL` (default `baidu/Unlimited-OCR`) and `OCR_API_KEY`. These can
-  also go in a `.env` file next to this README or at the repo root (`KEY=VALUE` per
-  line, `#` comments ok) — loaded automatically, never overriding a variable already
-  set in the environment. `.env` is gitignored; never commit it.
+- `OCR_BASE_URL` — **required for a `--cold` run** (forces fresh OCR ingestion; see
+  "OCR ingestion" below). A warm run against an already-populated `store/ocr/` cache
+  does not need it. Optionally `OCR_MODEL` (default `baidu/Unlimited-OCR`) and
+  `OCR_API_KEY`. These can also go in a `.env` file next to this README or at the repo
+  root (`KEY=VALUE` per line, `#` comments ok) — loaded automatically, never
+  overriding a variable already set in the environment. `.env` is gitignored; never
+  commit it.
+- An `HF_TOKEN` environment variable holding a Hugging Face API token — **optional**
+  for the submitted pipeline (the shipped `config/models.toml` has no `[selected]`
+  VLM/LLM active, so the final run makes 0 HF calls). Needed only for the model
+  bake-off (`bakeoff`) or if a VLM/LLM is selected in `[selected]`. Never commit this
+  value; it is read from the environment only.
 - `../dataset/` present as shipped (this crate reads it with relative paths, so always
   run commands from this `code/` directory).
 
