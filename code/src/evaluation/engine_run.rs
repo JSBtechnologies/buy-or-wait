@@ -114,9 +114,20 @@ mod tests {
         let mut base = serde_json::to_value(Rules::default()).unwrap();
         let patch: serde_json::Value = serde_json::from_str(if patch.trim().is_empty() { "{}" } else { patch })
             .unwrap_or_else(|e| panic!("bad rules patch {patch:?}: {e}"));
+        let default = base.clone();
         for (k, v) in patch.as_object().expect("rules patch must be a JSON object") {
-            assert!(base.get(k).is_some(), "unknown Rules field {k}");
-            base[k] = v.clone();
+            if base.get(k).is_some() {
+                base[k] = v.clone();
+                continue;
+            }
+            // RULES names are serde aliases: find the canonical field(s) the alias sets.
+            let single: Rules = serde_json::from_value(serde_json::json!({ k.as_str(): v })).unwrap_or_else(|e| panic!("bad rules patch {k}: {e}"));
+            let single = serde_json::to_value(single).unwrap();
+            let set: Vec<String> = single.as_object().unwrap().iter().filter(|(f, x)| default.get(f.as_str()) != Some(*x)).map(|(f, _)| f.clone()).collect();
+            assert!(!set.is_empty(), "rules patch {k}={v} is unknown or equals the default (no field changed)");
+            for f in set {
+                base[f.as_str()] = single[f.as_str()].clone();
+            }
         }
         serde_json::from_value(base).unwrap()
     }
@@ -350,6 +361,31 @@ mod tests {
         println!("A={pa:?} B={pb:?}");
         let changed = rows_a.iter().zip(&rows_b).filter(|(x, y)| x != y).count();
         println!("ROWS CHANGED {changed}/{}{}", rows_a.len(), if changed == 0 { "  <- toggle had no effect on any sample row: check it is wired" } else { "" });
+        // Blast radius on the evaluation set (no labels): rows whose output changes, by field.
+        let (ra, rb) = (rules_with(&pa), rules_with(&pb));
+        let mut eval_changed: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        let eval = eval_requests();
+        for r in &eval {
+            let (Ok(x), Ok(y)) = (decide_with(&inp, r, ra.clone()), decide_with(&inp, r, rb.clone())) else {
+                *eval_changed.entry("engine_error").or_default() += 1;
+                continue;
+            };
+            let (x, y): (crate::evaluation::OutputRow, crate::evaluation::OutputRow) = ((&x.row).into(), (&y.row).into());
+            for (f, a, b) in [
+                ("any", format!("{x:?}"), format!("{y:?}")),
+                ("amount", x.amount_safe_to_pay.clone(), y.amount_safe_to_pay.clone()),
+                ("status", x.affordability_status.clone(), y.affordability_status.clone()),
+                ("method", x.recommended_payment_method.clone(), y.recommended_payment_method.clone()),
+                ("plan", x.payment_plan.clone(), y.payment_plan.clone()),
+                ("earliest", x.earliest_date_for_full_payment.clone(), y.earliest_date_for_full_payment.clone()),
+                ("changes", x.spending_changes_needed.clone(), y.spending_changes_needed.clone()),
+            ] {
+                if a != b {
+                    *eval_changed.entry(f).or_default() += 1;
+                }
+            }
+        }
+        println!("EVAL CHANGED of {}: {eval_changed:?}", eval.len());
         for (name, sa, sb) in [("tuning", &a.tuning, &b.tuning), ("held-out", &a.heldout, &b.heldout)] {
             for f in crate::evaluation::scorer::FIELDS {
                 let (x, y) = (sa.matched.get(f).copied().unwrap_or(0), sb.matched.get(f).copied().unwrap_or(0));
