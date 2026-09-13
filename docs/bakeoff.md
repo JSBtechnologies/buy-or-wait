@@ -78,6 +78,73 @@ Resolution sweep detail (labeled-image field accuracy per candidate max dimensio
 
 (Bake-off messages are batched one call per run for the whole 47-message gold subset, matching the batching lever being judged; a real per-user batch in production is far smaller — per-item token/cost figures above divide the batch call by its message count.)
 
+## Future refinement: fine-tuning / LoRA adapters
+
+Out of scope for this submission, but the natural next step if VLM figure
+accuracy needs to go beyond what a frozen general-purpose VLM gets from a
+prompt alone.
+
+**Training data.** Three sources, combined:
+- The 7 gold-labeled figures already in `docs/gold_subset.json` (expected
+  figures + expected selected field/amount) — far too few to train on
+  directly, but useful as a held-out eval set (see "Eval" below) and as a
+  template for what a labeled example looks like.
+- Analyst's broader per-image audit reference (RULES.md-adjacent, "9b123f6
+  image audit", all 16 images) plus the false-accept/false-reject cases
+  found during that audit (e.g. doc_type free-text variants, cash-tendered
+  vs total, multi-section reconciliation) — these are exactly the failure
+  modes a fine-tune should target, since they're documented, real, and
+  currently patched around in the deterministic selector/parser rather
+  than fixed at the model level.
+- **Synthetic receipts/payslips/invoices/bills.** 16 images (7 labeled) is
+  nowhere near enough to fine-tune on safely — a template-driven generator
+  (varying layout, currency, language, amounts, and specifically the
+  reconciliation-breaking patterns analyst found: cash-tendered-vs-total,
+  multi-section breakups, rounding at the cent) can produce hundreds to
+  thousands of labeled examples with the exact figure schema as ground
+  truth, at zero risk of leaking real user data.
+
+**Target.** A LoRA adapter on `Qwen/Qwen3-VL-30B-A3B-Instruct` (the
+cheapest, most stable primary-tier candidate in this bake-off — a good
+fine-tuning base since it's already close on raw accuracy and 100% stable/
+valid-JSON) or `Qwen/Qwen3-VL-235B-A22B-Instruct` (the larger primary pick)
+for the `image_transcription.v1` figure schema specifically. Scope the
+adapter narrowly (one schema, one task) rather than general-purpose
+instruction tuning — cheaper to train, cheaper to serve, and easier to
+eval against the exact gate this bake-off used.
+
+**Serving.** The HF router (`router.huggingface.co`) used throughout this
+bake-off does not serve custom LoRA adapters — it only routes to each
+provider's own hosted base models. A fine-tuned adapter would need either:
+- **HF Inference Endpoints** (dedicated, not the shared router) — supports
+  loading a LoRA adapter alongside its base model on a dedicated instance;
+  or
+- A provider that explicitly accepts custom adapters/weights (varies by
+  provider and changes over time — would need to be re-verified against
+  whichever provider's catalog at the time).
+
+Either path means giving up the router's multi-provider redundancy (the
+whole point of "≥2 live providers" in the backup gate above) for a single
+dedicated endpoint, which is itself a real operational tradeoff to weigh
+against the accuracy gain.
+
+**Eval.** Same methodology as this bake-off, not a new one: the same gold
+subset (once extraction's selector fixes are fully landed and RULES.md's
+per-image audit is stable — training against a moving eval target wastes
+the effort), the same 5-run stability check, and the same backup-gate
+criteria (valid-JSON, selected-figure accuracy vs the primary pick,
+reconciliation false-accept rate, N=5 stability). A fine-tune only earns
+its keep if it clears the primary bake-off winner on selected-figure
+accuracy — anything less isn't worth the serving-architecture tradeoff
+above.
+
+**Why out of scope now.** Time-boxed hackathon submission; a fine-tune
+needs a training pipeline, a synthetic-data generator, a dedicated serving
+path outside the router, and its own eval cycle — all real scope beyond
+"pick a model and call it," and none of it can happen before the 7-image
+gold subset is even finalized (still being corrected mid-bake-off as this
+document shows). Recorded here so it's not lost, not attempted under
+deadline pressure.
 
 ## Step 4 — Usage report (`code/evaluation/usage_report.md`)
 
