@@ -359,6 +359,16 @@ default_class = "settled_expense_receipt"
 # "agreeing".
 tolerance = 0.01
 
+# CORRECTED SHAPE (extraction #278/#281, board:decision.tiebreak_distinct_shape):
+# the previous version self-tiebroke -- each class's "tiebreak" was one of
+# its own 2 `readers`, which hard-errors at load. Every class now has its
+# own 2-reader AGREEMENT pair (`readers`) plus a SEPARATE, distinct third
+# `tiebreak` reader consulted only when the pair disagrees. Best-faith
+# reconstruction for `income_payslip` (not itself covered by the lead's 2
+# named examples: default/settled_expense_receipt and pending_bill_due_date)
+# -- mirrors the "default" class's shape since it historically used the
+# same plain 235B+gemma pairing; flagged for confirmation.
+
 [[vlm_routing.classes]]
 name = "income_payslip"
 event_types = ["income"]
@@ -368,32 +378,33 @@ readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
   { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
 ]
+tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
 
 [[vlm_routing.classes]]
 name = "pending_bill_due_date"
 event_types = []
 statuses = ["pending", "scheduled"]
 categories = []
-# Tiebreak = gemma (board decision.tiebreak_distinct, confirmed by the lead
-# despite gemma's known due-date-field weakness on this shape): a gemma read
-# only counts if it satisfies the due-date cutoff rule in the selector, so a
-# wrong pre-cutoff read (e.g. image_05's 704.05) can never be selected as
-# correct -- worst case is disagreement -> missing, which accuracy-first
-# (board decision.accuracy_first) explicitly accepts over a wrong value.
+# routing v2 (lead-specified exactly): readers = 235B@1024 + claude-opus-5@1024,
+# tiebreak = gemma@768. A gemma tiebreak read only counts if it satisfies the
+# due-date cutoff rule in the selector, so a wrong pre-cutoff read (e.g.
+# image_05's 704.05) can never be selected as correct -- worst case is
+# disagreement -> missing, which board decision.accuracy_first accepts.
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
-  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
+  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 },
 ]
+tiebreak = { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 }
 
 [[vlm_routing.classes]]
 name = "settled_expense_receipt"
 event_types = []
 statuses = ["settled"]
 categories = []
-# Tiebreak = claude-opus-5 (board decision.tiebreak_distinct): the default/
-# most common class gets the Claude backup as its distinct second reader
-# rather than reusing gemma on every class.
+# routing v2 (lead-specified exactly, this is default_class): readers =
+# 235B@1024 + gemma@768, tiebreak = claude-opus-5@1024.
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
-  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 },
+  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
 ]
+tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
