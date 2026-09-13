@@ -29,7 +29,13 @@ top_p = 1.0
 # small typed figure schema; the LLM only emits typed records or the 4-field
 # request struct. Neither ever writes decision_explanation (deterministic
 # template, 0 tokens) or free prose.
-max_tokens_vlm = 400
+# max_tokens_vlm raised 400 -> 1400 (ml-engineer, live N=5 run 2026-09-13): prompt v3's
+# line_items/charges_breakdown arrays (image_accuracy_plan.md §1/§2) made several images'
+# replies truncate mid-JSON at 400 tokens (image_02's 7-line charges_breakdown alone runs
+# past it; image_10's 20+ line_items array needs far more) -- v1/v2's flat-scalar schema
+# never needed this headroom, but v3's witness fields genuinely do. Verified against the
+# widest image (image_10, ~26 line items) plus margin.
+max_tokens_vlm = 1400
 max_tokens_llm = 300
 response_format = "json_object" # constrained via supports_structured_output where available
 
