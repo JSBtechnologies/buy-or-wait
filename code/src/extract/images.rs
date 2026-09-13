@@ -2344,12 +2344,9 @@ mod ocr_e2e {
     /// across 2 live runs) and prints the gate outcome for all 16 images. Not run by default,
     /// and never a committed fixture path -- the scratch directory lives outside `code/`.
     /// `cargo test -- --ignored all_16_images_gate_report_live -- --nocapture`.
-    #[test]
-    #[ignore]
-    fn all_16_images_gate_report_live() {
-        let fixtures_dir = Path::new("E:/projects/hackerrank-orchestrate-september26/scratch/ocr_baidu/vllm/r1");
-        #[allow(clippy::type_complexity)]
-        let cases: [(&str, EventType, &str, &str, (i32, u32, u32), (i32, u32, u32), Status); 16] = [
+    #[allow(clippy::type_complexity)]
+    fn all_16_cases() -> [(&'static str, EventType, &'static str, &'static str, (i32, u32, u32), (i32, u32, u32), Status); 16] {
+        [
             ("image_01", EventType::Income, "salary", "IDR", (2019, 8, 31), (2019, 8, 31), Status::Settled),
             ("image_02", EventType::Expense, "rent", "INR", (2023, 8, 11), (2023, 8, 16), Status::Scheduled),
             ("image_03", EventType::Expense, "groceries", "INR", (2026, 2, 27), (2026, 2, 27), Status::Settled),
@@ -2366,7 +2363,14 @@ mod ocr_e2e {
             ("image_14", EventType::Expense, "healthcare", "INR", (2025, 11, 2), (2025, 11, 2), Status::Settled),
             ("image_15", EventType::Expense, "transport", "INR", (2026, 6, 7), (2026, 6, 7), Status::Settled),
             ("image_16", EventType::Expense, "transport", "INR", (2026, 9, 3), (2026, 9, 3), Status::Settled),
-        ];
+        ]
+    }
+
+    #[test]
+    #[ignore]
+    fn all_16_images_gate_report_live() {
+        let fixtures_dir = Path::new("E:/projects/hackerrank-orchestrate-september26/scratch/ocr_baidu/vllm/r1");
+        let cases = all_16_cases();
 
         eprintln!("\n| image | outcome | figure | witness | notes |");
         eprintln!("|---|---|---|---|---|");
@@ -2394,6 +2398,108 @@ mod ocr_e2e {
                 figure.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
                 read.witness.clone().unwrap_or_else(|| "—".to_string()),
                 read.ocr_notes.join(";"),
+            );
+        }
+    }
+
+    /// LIVE two-cold-run ingest against the real RunPod vLLM endpoint (Phase A close-out,
+    /// bus topic bakeoff): runs `extract::ocr::OcrClient::ingest` (the actual production
+    /// entry point, not a pre-captured fixture) `--cold` over all 16 images, twice, each into
+    /// its own fresh cache directory, then gates each run through `resolve_blank_amount_ocr`
+    /// and compares run1 vs run2 for identical accepted figures AND byte-identical cached
+    /// `.md` pages. Requires `OCR_BASE_URL` (and optionally `OCR_API_KEY`) in the environment;
+    /// fires real network calls and real OCR compute, so it is never run by default:
+    /// `cargo test -- --ignored live_two_cold_runs_all_16 -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_two_cold_runs_all_16() {
+        use std::path::PathBuf;
+        let dataset_dir = Path::new("../dataset");
+        let cases = all_16_cases();
+
+        struct RunResult {
+            outcome: String,
+            figure: Option<f64>,
+            witness: Option<String>,
+            notes: Vec<String>,
+            page_bytes: Vec<String>,
+        }
+
+        let mut per_run: Vec<std::collections::HashMap<&str, RunResult>> = Vec::new();
+        for run in 1..=2u32 {
+            let cfg = crate::extract::ocr::OcrConfig::from_env().expect("OCR_BASE_URL must be set");
+            let cache_dir = PathBuf::from(format!("store/live_ocr_run{run}"));
+            let client = crate::extract::ocr::OcrClient::new(cfg, cache_dir).expect("building OcrClient");
+
+            let mut results = std::collections::HashMap::new();
+            for (image_id, event_type, category, currency, event_date, settlement_date, status) in cases {
+                eprintln!("[run {run}] ingesting {image_id} ...");
+                let image_path = dataset_dir.join("media/images").join(format!("{image_id}.png"));
+                let ocr = match client.ingest(image_id, &image_path, true) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("  {image_id} ingest FAILED: {e:#}");
+                        results.insert(
+                            image_id,
+                            RunResult {
+                                outcome: format!("error: {e:#}"),
+                                figure: None,
+                                witness: None,
+                                notes: vec![],
+                                page_bytes: vec![],
+                            },
+                        );
+                        continue;
+                    }
+                };
+                let ev = event(
+                    image_id,
+                    event_type,
+                    category,
+                    currency,
+                    NaiveDate::from_ymd_opt(event_date.0, event_date.1, event_date.2).unwrap(),
+                    NaiveDate::from_ymd_opt(settlement_date.0, settlement_date.1, settlement_date.2).unwrap(),
+                    status,
+                );
+                let resolution = resolve_blank_amount_ocr(&ocr, image_id, &ev);
+                let figure = resolution.evidence.as_ref().and_then(|e| match &e.fact {
+                    Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
+                    _ => None,
+                });
+                let read = &resolution.reads[0];
+                results.insert(
+                    image_id,
+                    RunResult {
+                        outcome: resolution.outcome.clone(),
+                        figure,
+                        witness: read.witness.clone(),
+                        notes: read.ocr_notes.clone(),
+                        page_bytes: ocr.pages.iter().map(|p| p.raw_text.clone()).collect(),
+                    },
+                );
+            }
+            per_run.push(results);
+        }
+
+        eprintln!("\n| image | outcome | figure | witness | ocr_notes | run1==run2 (figure) | run1==run2 (bytes) |");
+        eprintln!("|---|---|---|---|---|---|---|");
+        for (image_id, ..) in cases {
+            let r1 = &per_run[0][image_id];
+            let r2 = &per_run[1][image_id];
+            let figure_match = match (r1.figure, r2.figure) {
+                (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+                (None, None) => true,
+                _ => false,
+            };
+            let bytes_match = r1.page_bytes == r2.page_bytes;
+            eprintln!(
+                "| {image_id} | {} | {} | {} | {} | {} | {} |",
+                r1.outcome,
+                r1.figure.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
+                r1.witness.clone().unwrap_or_else(|| "—".to_string()),
+                r1.notes.join(";"),
+                figure_match,
+                bytes_match,
             );
         }
     }
