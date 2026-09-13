@@ -71,6 +71,12 @@ fn looks_like_secret(text: &str) -> Option<&'static str> {
     }
 }
 
+/// Findings from the evidence/image checks that count toward the decision.accuracy_first gate
+/// (every audit-gold finding counts as well).
+fn false_accepts_in(f: &[contract::Finding]) -> impl Iterator<Item = &contract::Finding> {
+    f.iter().filter(|x| super::false_accepts::FALSE_ACCEPT_CODES.contains(&x.code))
+}
+
 pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>) -> Result<Signoff> {
     let mut s = Signoff::default();
     let ds = Dataset::load(dataset_dir, &dataset_dir.join("requests.csv"))?;
@@ -125,9 +131,7 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
     // decision.accuracy_first: every false accept found by any check is collected for the hard gate.
     let mut false_accepts: Vec<String> = Vec::new();
     let mut gate_ran = true;
-    let collect = |f: &[super::contract::Finding], into: &mut Vec<String>| {
-        into.extend(f.iter().filter(|x| super::false_accepts::FALSE_ACCEPT_CODES.contains(&x.code)).map(|x| x.to_string()));
-    };
+    let collect = |f: &[super::contract::Finding], into: &mut Vec<String>| into.extend(false_accepts_in(f).map(|x| x.to_string()));
     match super::evidence_consistency::check(dataset_dir, &repo_for_code.join("code")) {
         Err(e) => {
             gate_ran = false;
@@ -299,5 +303,86 @@ mod tests {
         let s = run(&dir, &dir.join("output.csv"), &usage, None).unwrap();
         assert!(s.checks.iter().any(|(n, ok, _)| n == "usage report sections" && *ok));
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Mutation (analyst #276): a self-consistent 10x lakh misread by one reader must fail the
+    /// accuracy gate on BOTH the no-single-read-acceptance rule (IA4) and the audit-gold comparison
+    /// (FA1). The reference and the 10x figure come from RULES.md at test time; routing is
+    /// extraction's [vlm_routing] shape (explicit tiebreaks, tolerance 0.01).
+    #[test]
+    fn ten_x_single_read_fails_agreement_and_gold() {
+        use serde_json::{json, Value};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let dataset = repo.join("dataset");
+        let Some(gold) = super::super::false_accepts::gold(Some(&repo)) else { return };
+        let image = "image_02";
+        let g = &gold[image];
+        let ds = Dataset::load(&dataset, &dataset.join("requests.csv")).unwrap();
+        assert!(matches!(ds.events[&g.event_id].status.as_str(), "pending" | "scheduled"), "fixture expects a pending-bill class image");
+        let truth = g.amounts[0] as f64 / 100.0;
+        let misread = truth * 10.0;
+        assert!(!g.amounts.contains(&(g.amounts[0] * 10)), "10x must not be an accepted alt rendering");
+
+        const Q: &str = "Qwen/Qwen3-VL-235B-A22B-Instruct";
+        const G: &str = "google/gemma-4-31B-it";
+        const C: &str = "claude-opus-5";
+        let config = format!(
+            "[selected]\nvlm_primary = \"{Q}\"\nvlm_escalation = \"{G}\"\nvlm_fallback = \"{C}\"\n\n\
+             [vlm_routing]\ndefault_class = \"settled_expense_receipt\"\ntolerance = 0.01\n\n\
+             [[vlm_routing.classes]]\nname = \"pending_bill_due_date\"\nevent_types = []\nstatuses = [\"pending\", \"scheduled\"]\ncategories = []\n\
+             readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }} ]\n\
+             tiebreak = {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }}\n\n\
+             [[vlm_routing.classes]]\nname = \"settled_expense_receipt\"\nstatuses = [\"settled\"]\n\
+             readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }} ]\n\
+             tiebreak = {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }}\n"
+        );
+        let read = |role: &str, model: &str, px: u32, tokens: u32, ok: bool, amt: Option<f64>| {
+            json!({"role": role, "model_id": model, "model_revision": "x", "max_dim_px": px, "max_tokens": tokens, "reconciled": ok,
+                   "selected_amount": amt, "currency": "INR", "due_date": null, "before_amount": null, "after_amount": null, "error": null})
+        };
+        // Runs the gate's image contributors on a temp code dir; returns (false-accept codes, gold facts checked).
+        let gate = |tag: &str, reads: Vec<Value>, outcome: &str, applied: f64| -> (Vec<&'static str>, usize) {
+            let code = std::env::temp_dir().join(format!("verifier_10x_{tag}_{}", std::process::id()));
+            std::fs::create_dir_all(code.join("store/processed/image_reads")).unwrap();
+            std::fs::create_dir_all(code.join("store/processed/evidence")).unwrap();
+            let evidence = json!({"record_id": format!("{image}#{outcome}:vlm_primary"), "source": "Image", "observed_at": "2024-01-01T00:00:00",
+                "fact": {"EventAmount": {"event_id": g.event_id, "amount": (applied * crate::engine::money::SCALE as f64).round() as i64, "currency": "INR"}}});
+            let prov = json!({"image_id": image, "class": "pending_bill_due_date", "mode": "agreement", "reads": reads, "outcome": outcome, "evidence": evidence});
+            std::fs::write(code.join(format!("store/processed/image_reads/{image}.json")), prov.to_string()).unwrap();
+            std::fs::write(code.join("store/processed/evidence/request_x.json"), json!([evidence]).to_string()).unwrap();
+            std::fs::write(code.join("models.toml"), &config).unwrap();
+            let agreement = super::super::image_agreement::check(&code, &dataset, &code.join("models.toml")).unwrap();
+            assert!(!agreement.iter().any(|f| f.code.starts_with("IA9") || f.code == "IA0_provenance_unreadable"), "fixture config/provenance invalid: {agreement:?}");
+            let (gold_f, n) = super::super::false_accepts::image_gold_findings(&code, Some(&repo)).unwrap();
+            std::fs::remove_dir_all(&code).ok();
+            (false_accepts_in(&agreement).chain(gold_f.iter()).map(|f| f.code).collect(), n)
+        };
+        let fails_both = |codes: &[&str]| codes.contains(&"IA4_no_agreement") && codes.contains(&"FA1_image_amount_wrong");
+
+        // 1. One reconciled 10x read, recorded and applied as an agreement.
+        let (c, n) = gate("single", vec![read("vlm_primary", Q, 1024, 400, true, Some(misread))], "agree", misread);
+        assert!(n == 1 && fails_both(&c), "{c:?}");
+
+        // 2. Agreeing-looking: the same 235B read again under the second reader's role.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(misread));
+        let (c, _) = gate("selfagree", vec![q.clone(), read("vlm_fallback", Q, 1024, 4000, true, Some(misread))], "agree", misread);
+        assert!(fails_both(&c), "{c:?}");
+
+        // 3. The second reader failed (no figure): still a single read.
+        let (c, _) = gate("otherfailed", vec![q.clone(), read("vlm_fallback", C, 1024, 4000, false, None)], "agree", misread);
+        assert!(fails_both(&c), "{c:?}");
+
+        // 4. The second reader reads the true figure: disagreement, no tiebreak -> nothing may be applied.
+        let (c, _) = gate("disagree", vec![q.clone(), read("vlm_fallback", C, 1024, 4000, true, Some(truth))], "agree", misread);
+        assert!(fails_both(&c), "{c:?}");
+
+        // 5. Defense in depth: two routed models make the same 10x error (agreement accepts it);
+        //    the audit-gold comparison alone still fails the gate.
+        let (c, _) = gate("twomodels", vec![q, read("vlm_fallback", C, 1024, 4000, false, None), read("vlm_escalation", G, 768, 400, true, Some(misread))], "tiebreak_accept", misread);
+        assert_eq!(c, vec!["FA1_image_amount_wrong"], "{c:?}");
+
+        // Control: routed agreement on the true figure passes the gate.
+        let (c, _) = gate("control", vec![read("vlm_primary", Q, 1024, 400, true, Some(truth)), read("vlm_fallback", C, 1024, 4000, true, Some(truth))], "agree", truth);
+        assert!(c.is_empty(), "{c:?}");
     }
 }

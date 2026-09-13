@@ -306,6 +306,27 @@ mod tests {
         );
     }
 
+    /// PRIVATE verifier diagnosis (held-out): full forecast composition for VERIFIER_DIAG ids.
+    /// Output stays in the verifier terminal; never post ids/values from held-out rows.
+    #[test]
+    #[ignore]
+    fn private_forecast_dump() {
+        let Ok(ids) = std::env::var("VERIFIER_DIAG") else { return };
+        let inp = inputs();
+        for r in samples().into_iter().chain(eval_requests()).filter(|r| ids.split(',').any(|x| x == r.id)) {
+            let d = decide(&inp, &r).unwrap();
+            let f = &d.facts;
+            println!("=== {} start {} M {} reserved {} trough {} @{} horizon_end {} safe {} E {:?}", r.id, f.starting_balance.to_f64(), f.minimum_balance.to_f64(), f.reserved_pending_total.to_f64(), f.trough_balance.to_f64(), f.trough_date, f.horizon_end, f.safe_amount.to_f64(), f.earliest_full_date);
+            for st in &d.streams.streams {
+                let amts: Vec<f64> = st.occurrences.iter().map(|o| o.amount.to_f64()).collect();
+                println!("  STREAM {:?} {} {:?} {:?} n={} proj={} amounts={:?}", st.kind, st.category, st.description, st.cadence, amts.len(), st.projected_amount.to_f64(), amts);
+            }
+            for fl in &d.baseline.flows {
+                println!("  FLOW {} {:>12.2} {:<16} {:?}", fl.date, fl.amount.to_f64(), fl.category, fl.source);
+            }
+        }
+    }
+
     /// Overfit guard: VERIFIER_RULES_A / VERIFIER_RULES_B are JSON patches over Rules::default().
     /// Prints aggregate per-field counts for both splits and the B−A delta. No per-request detail.
     #[test]
