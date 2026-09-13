@@ -4,7 +4,7 @@
 //! The ledger is a durable data model: it is `Serialize`/`Deserialize` so the store can
 //! persist it per user (§2.11), and every entry records *why* it does or does not move cash.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,13 @@ pub enum Fact {
     // ---- about one supplied event row --------------------------------------------------
     /// The figure for a row with a blank amount (image selector output).
     EventAmount { event_id: String, amount: Money, currency: String },
+    /// The row's image failed closed, but at least one validated read selected a figure
+    /// (`amount` = the largest). Reserved against a pending/scheduled debit only; never fills
+    /// the row's amount, which stays missing.
+    UnverifiedEventAmount { event_id: String, amount: Money, currency: String, reason: String },
+    /// Witness detail for an accepted image figure: the printed final amount (`accepted`, the
+    /// truth) next to the recomputed one (`computed`), e.g. 8,528 paid vs 8,528.10 summed.
+    AmountWitness { event_id: String, accepted: Money, computed: Money, currency: String, witness: String },
     /// The row's transaction was explicitly cancelled / reversed.
     EventCancelled { event_id: String },
     /// The row explicitly settled (optionally with its final amount / date).
@@ -104,6 +111,8 @@ impl Fact {
     pub fn event_id(&self) -> Option<&str> {
         match self {
             Fact::EventAmount { event_id, .. }
+            | Fact::UnverifiedEventAmount { event_id, .. }
+            | Fact::AmountWitness { event_id, .. }
             | Fact::EventCancelled { event_id }
             | Fact::EventSettled { event_id, .. }
             | Fact::EventAmended { event_id, .. }
@@ -111,6 +120,11 @@ impl Fact {
             | Fact::OwnAccountTransfer { event_id } => Some(event_id),
             _ => None,
         }
+    }
+
+    /// Image side-facts (unverified reserve, witness totals) that never set a row's amount.
+    fn is_image_note(&self) -> bool {
+        matches!(self, Fact::UnverifiedEventAmount { .. } | Fact::AmountWitness { .. })
     }
 
     /// Conflict rule 1: explicit cancellation, settlement, or amendment wins.
@@ -208,6 +222,30 @@ pub struct RejectedEvidence {
     pub reason: String,
 }
 
+/// A failed-closed image figure held against a blank pending/scheduled debit (image accuracy
+/// plan §4). The entry itself stays `AmountSource::Missing`; only the forecast reads this.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UnverifiedReserve {
+    pub event_id: String,
+    pub record_id: String,
+    /// Event currency.
+    pub amount: Money,
+    pub currency: String,
+    pub home_amount: Money,
+    pub reason: String,
+}
+
+/// Printed final amount next to its recomputed witness for an accepted image figure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AmountWitnessRecord {
+    pub event_id: String,
+    pub record_id: String,
+    pub accepted: Money,
+    pub computed: Money,
+    pub currency: String,
+    pub witness: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Ledger {
     pub home_currency: String,
@@ -216,6 +254,12 @@ pub struct Ledger {
     pub adjustments: Vec<EvidenceRecord>,
     pub rejected: Vec<RejectedEvidence>,
     pub issues: Vec<LedgerIssue>,
+    /// Failed-closed image figures reserved per event id (largest validated read).
+    #[serde(default)]
+    pub unverified: BTreeMap<String, UnverifiedReserve>,
+    /// Witness totals for accepted image figures, ordered by event id then record id.
+    #[serde(default)]
+    pub witnesses: Vec<AmountWitnessRecord>,
     #[serde(skip)]
     index: HashMap<String, usize>,
 }
@@ -248,7 +292,13 @@ impl Ledger {
         ledger.resolve_lifecycles();
         ledger.apply_evidence(evidence, rates);
         ledger.convert_amounts(rates);
+        ledger.apply_image_notes(evidence, rates);
         ledger
+    }
+
+    /// Home-currency reserve for a failed-closed image figure on this event, if any.
+    pub fn unverified_home(&self, event_id: &str) -> Option<Money> {
+        self.unverified.get(event_id).map(|r| r.home_amount)
     }
 
     pub fn reindex(&mut self) {
@@ -346,6 +396,9 @@ impl Ledger {
                 .cmp(&(b.fact.is_explicit(), b.observed_at, &b.record_id))
         });
         for rec in ordered {
+            if rec.fact.is_image_note() {
+                continue; // applied after amounts settle, in `apply_image_notes`
+            }
             let Some(event_id) = rec.fact.event_id() else {
                 // Accuracy first (board decision.accuracy_first): a forecast-level fact that
                 // cannot be applied exactly is rejected and recorded, never half-applied.
@@ -363,6 +416,121 @@ impl Ledger {
                 self.reject(rec, reason);
             }
         }
+    }
+
+    /// Unverified reserves and amount witnesses, applied once every cancellation, amendment,
+    /// verified figure and conversion is final, in record-id order (deterministic).
+    fn apply_image_notes(&mut self, evidence: &[EvidenceRecord], rates: &dyn RateProvider) {
+        let mut notes: Vec<&EvidenceRecord> = evidence.iter().filter(|r| r.fact.is_image_note()).collect();
+        notes.sort_by(|a, b| a.record_id.cmp(&b.record_id));
+        for rec in notes {
+            let event_id = rec.fact.event_id().unwrap_or_default();
+            let Some(i) = self.index.get(event_id).copied() else {
+                self.reject(rec, format!("unknown event {event_id}"));
+                continue;
+            };
+            let result = match &rec.fact {
+                Fact::UnverifiedEventAmount { amount, currency, reason, .. } => {
+                    self.reserve_unverified(i, rec, *amount, currency, reason, rates)
+                }
+                Fact::AmountWitness { accepted, computed, currency, witness, .. } => {
+                    self.record_witness(i, rec, *accepted, *computed, currency, witness)
+                }
+                _ => Err("not an image note".into()),
+            };
+            if let Err(reason) = result {
+                self.reject(rec, reason);
+            }
+        }
+        self.witnesses.sort_by(|a, b| (&a.event_id, &a.record_id).cmp(&(&b.event_id, &b.record_id)));
+    }
+
+    fn reserve_unverified(
+        &mut self,
+        i: usize,
+        rec: &EvidenceRecord,
+        amount: Money,
+        currency: &str,
+        reason: &str,
+        rates: &dyn RateProvider,
+    ) -> Result<(), String> {
+        let e = &self.entries[i];
+        if e.event.amount.is_some() || e.amount.is_some() {
+            return Err("row already has an amount".into());
+        }
+        if e.event.direction != Direction::Debit {
+            return Err("unverified figure only reserves debits".into());
+        }
+        if !matches!(e.treatment, CashTreatment::Reserved | CashTreatment::Scheduled) {
+            return Err(format!("unverified figure only reserves pending/scheduled rows, treatment {:?}", e.treatment));
+        }
+        if !same_currency(currency, &e.event.currency) {
+            return Err(currency_mismatch(currency, &e.event.currency));
+        }
+        if amount <= Money::ZERO {
+            return Err("non-positive figure".into());
+        }
+        let Some(home_amount) = to_home(amount, &e.event.currency, &self.home_currency, e.cash_date, rates) else {
+            return Err(format!("no {}->{} rate on {}", e.event.currency, self.home_currency, e.cash_date));
+        };
+        let reserve = UnverifiedReserve {
+            event_id: e.event.id.clone(),
+            record_id: rec.record_id.clone(),
+            amount,
+            currency: e.event.currency.clone(),
+            home_amount,
+            reason: reason.to_string(),
+        };
+        // Largest figure wins; on a tie the earlier record id (already held) stays.
+        match self.unverified.get(&reserve.event_id) {
+            Some(held) if held.amount >= amount => Err(format!("superseded by larger unverified figure {}", held.record_id)),
+            Some(held) => {
+                let loser = RejectedEvidence {
+                    record_id: held.record_id.clone(),
+                    reason: format!("superseded by larger unverified figure {}", rec.record_id),
+                };
+                self.rejected.push(loser);
+                self.unverified.insert(reserve.event_id.clone(), reserve);
+                Ok(())
+            }
+            None => {
+                self.unverified.insert(reserve.event_id.clone(), reserve);
+                Ok(())
+            }
+        }
+    }
+
+    fn record_witness(
+        &mut self,
+        i: usize,
+        rec: &EvidenceRecord,
+        accepted: Money,
+        computed: Money,
+        currency: &str,
+        witness: &str,
+    ) -> Result<(), String> {
+        let e = &self.entries[i];
+        if !matches!(e.amount_source, AmountSource::Evidence(_)) {
+            return Err("witness without an accepted image figure".into());
+        }
+        if e.amount != Some(accepted) {
+            return Err(format!("witness accepted {accepted} != applied figure {:?}", e.amount));
+        }
+        if !same_currency(currency, &e.event.currency) {
+            return Err(currency_mismatch(currency, &e.event.currency));
+        }
+        if computed <= Money::ZERO {
+            return Err("non-positive computed total".into());
+        }
+        self.witnesses.push(AmountWitnessRecord {
+            event_id: e.event.id.clone(),
+            record_id: rec.record_id.clone(),
+            accepted,
+            computed,
+            currency: e.event.currency.clone(),
+            witness: witness.to_string(),
+        });
+        Ok(())
     }
 
     fn reject(&mut self, rec: &EvidenceRecord, reason: String) {
@@ -473,8 +641,8 @@ fn apply_fact(entry: &mut LedgerEntry, rec: &EvidenceRecord) -> Result<(), Strin
     let id = rec.record_id.clone();
     match &rec.fact {
         Fact::EventAmount { amount, currency, .. } => {
-            if currency != &entry.event.currency {
-                return Err(format!("currency {currency} != event currency {}", entry.event.currency));
+            if !same_currency(currency, &entry.event.currency) {
+                return Err(currency_mismatch(currency, &entry.event.currency));
             }
             if *amount <= Money::ZERO {
                 return Err("non-positive figure".into());
@@ -528,6 +696,31 @@ fn apply_fact(entry: &mut LedgerEntry, rec: &EvidenceRecord) -> Result<(), Strin
     }
     entry.applied_evidence.push(id);
     Ok(())
+}
+
+/// Printed currency marks to ISO codes. Same table as extraction's
+/// `extract::normalize::parse_currency` (OCR branch); the engine keeps its own copy so a raw
+/// mark that slips past extraction still compares correctly.
+fn normalize_currency(raw: &str) -> Option<&'static str> {
+    let upper = raw.trim().trim_end_matches('.').to_uppercase();
+    Some(match upper.as_str() {
+        "INR" | "RS" | "RUPEES" | "RUPEE" | "INDIAN RUPEE" | "INDIAN RUPEES" | "\u{20B9}" => "INR",
+        "USD" | "US$" | "$" | "US DOLLAR" | "US DOLLARS" | "DOLLAR" | "DOLLARS" => "USD",
+        "EUR" | "\u{20AC}" | "EURO" | "EUROS" => "EUR",
+        "IDR" | "RP" | "RUPIAH" | "RUPIAHS" | "INDONESIAN RUPIAH" => "IDR",
+        "ZAR" | "R" | "RAND" | "SOUTH AFRICAN RAND" => "ZAR",
+        _ => return None,
+    })
+}
+
+/// Evidence currencies arrive as printed (`Rs`, `₹`, `$`): compare the normalized code with
+/// the event currency, never the raw string. Codes the table does not know compare as-is.
+fn same_currency(raw: &str, event_currency: &str) -> bool {
+    normalize_currency(raw).unwrap_or(raw.trim()).eq_ignore_ascii_case(event_currency.trim())
+}
+
+fn currency_mismatch(raw: &str, event_currency: &str) -> String {
+    format!("currency {raw} (normalized {:?}) != event currency {event_currency}", normalize_currency(raw))
 }
 
 /// Convert with the rate row for `date` in the stated direction; fall back to the inverse

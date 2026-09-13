@@ -149,6 +149,8 @@ fn evidence_records_serde_round_trip() {
     let m = Money::from_f64(1422.85);
     let facts = vec![
         Fact::EventAmount { event_id: "event_1".into(), amount: m, currency: "INR".into() },
+        Fact::UnverifiedEventAmount { event_id: "event_1".into(), amount: m, currency: "INR".into(), reason: "no_witness".into() },
+        Fact::AmountWitness { event_id: "event_1".into(), accepted: m, computed: m, currency: "INR".into(), witness: "sum".into() },
         Fact::EventCancelled { event_id: "event_1".into() },
         Fact::EventSettled { event_id: "event_1".into(), amount: Some(m), date: Some(d("2025-08-01")) },
         Fact::EventAmended { event_id: "event_1".into(), amount: None, date: Some(d("2025-08-01")) },
@@ -453,4 +455,240 @@ fn scheduled_replace_scope_lifecycle_or_amount() {
     assert_eq!(run(4830.0, false, &rules), 2);
     assert_eq!(run(7300.0, false, &rules), 1);
     assert_eq!(run(4830.0, true, &rules), 1);
+}
+
+// ---- image accuracy plan work item 2: normalized currency, unverified reserve, witnesses ----
+
+use super::ledger::{AmountSource, EvidenceRecord, EvidenceSource, Fact};
+
+fn blank(id: u32, ty: EventType, dir: Direction, cat: &str, date: &str, settles: &str, status: Status) -> Event {
+    let mut e = ev(id, ty, "image-backed row", cat, dir, 0.0, date, status);
+    e.amount = None;
+    e.settlement_date = Some(d(settles));
+    e
+}
+
+fn image_rec(record_id: &str, fact: Fact) -> EvidenceRecord {
+    EvidenceRecord { record_id: record_id.into(), source: EvidenceSource::Image, observed_at: d("2024-01-01").and_hms_opt(0, 0, 0).unwrap(), fact }
+}
+
+fn accepted(amount: f64, currency: &str) -> Fact {
+    Fact::EventAmount { event_id: "event_1".into(), amount: Money::from_f64(amount), currency: currency.into() }
+}
+
+fn unverified(amount: f64, currency: &str) -> Fact {
+    Fact::UnverifiedEventAmount { event_id: "event_1".into(), amount: Money::from_f64(amount), currency: currency.into(), reason: "no_witness".into() }
+}
+
+fn build_with(events: &[Event], evidence: &[EvidenceRecord], rd: &str, rates: &RateTable) -> (Ledger, Forecast) {
+    let rules = Rules::default();
+    let ledger = Ledger::build("INR", events, evidence, rates, &rules);
+    let streams = recurrence::detect(&ledger, d(rd), &rules);
+    let inputs = ForecastInputs {
+        ledger: &ledger,
+        streams: &streams,
+        opening_balance: Money::from_units(100_000),
+        minimum_balance: Money::ZERO,
+        start: d(rd),
+        rates,
+        rules: &rules,
+    };
+    let f = Forecast::build(&inputs, &[]);
+    (ledger, f)
+}
+
+fn event_flows(f: &Forecast) -> Vec<(NaiveDate, Money)> {
+    f.flows
+        .iter()
+        .filter(|x| matches!(&x.source, FlowSource::Reserved { event_id } | FlowSource::Scheduled { event_id } if event_id == "event_1"))
+        .map(|x| (x.date, x.amount))
+        .collect()
+}
+
+/// A blank row with no accepted figure must stay unproven: Missing, no amount, no home amount
+/// (evaluation::mirror BA3/BA4 invariants).
+fn assert_still_missing(ledger: &Ledger) {
+    let e = ledger.get("event_1").unwrap();
+    assert_eq!(e.amount_source, AmountSource::Missing);
+    assert_eq!((e.amount, e.home_amount), (None, None));
+}
+
+#[test]
+fn currency_symbol_normalized_before_apply() {
+    let rates = RateTable::default();
+    let events = [blank(1, EventType::Expense, Direction::Debit, "telecom", "2025-07-30", "2025-08-09", Status::Pending)];
+    for cur in ["Rs", "Rs.", "\u{20B9}", "INR", "inr", " Rupees "] {
+        let (ledger, f) = build_with(&events, &[image_rec("image_05#agree", accepted(822.05, cur))], "2025-08-01", &rates);
+        assert!(ledger.rejected.is_empty(), "{cur}: {:?}", ledger.rejected);
+        assert_eq!(ledger.get("event_1").unwrap().amount_source, AmountSource::Evidence("image_05#agree".into()), "{cur}");
+        assert_eq!(f.trough().0, Money::from_units(100_000) - Money::from_f64(822.05), "{cur}");
+    }
+    // A dollar figure never lands on a rupee row.
+    let (ledger, f) = build_with(&events, &[image_rec("image_05#agree", accepted(822.05, "$"))], "2025-08-01", &rates);
+    assert_eq!(ledger.rejected.len(), 1);
+    assert!(ledger.rejected[0].reason.contains("USD"), "{}", ledger.rejected[0].reason);
+    assert_still_missing(&ledger);
+    assert!(event_flows(&f).is_empty());
+}
+
+#[test]
+fn usd_symbol_applies_on_usd_row_with_dated_rate() {
+    let mut e = blank(1, EventType::Expense, Direction::Debit, "transport", "2024-09-15", "2024-09-20", Status::Scheduled);
+    e.currency = "USD".into();
+    let (ledger, f) = build_with(&[e], &[image_rec("image_12#agree", accepted(33.50, "$"))], "2024-09-15", &rates());
+    assert!(ledger.rejected.is_empty(), "{:?}", ledger.rejected);
+    // 33.50 * 83.33 = 2,791.555 (latest USD->INR row on or before 2024-09-20)
+    assert_eq!(event_flows(&f), vec![(d("2024-09-20"), -Money(27_915_550))]);
+}
+
+#[test]
+fn failed_closed_pending_debit_is_reserved() {
+    use super::session::Session;
+    let events = vec![blank(1, EventType::Expense, Direction::Debit, "telecom", "2026-01-30", "2026-02-09", Status::Pending)];
+    let profile = Profile {
+        home_currency: "INR".into(),
+        current_available_balance: Money::from_units(10_000),
+        minimum_balance_to_keep: Money::from_units(1_000),
+        financial_priorities: vec![],
+        protected_categories: vec![],
+        reducible_categories: vec![],
+        stoppable_categories: vec![],
+        accepted_methods: vec![PaymentMethod::FullPayment],
+        max_installment_months: None,
+    };
+    let spec = RequestSpec { amount: Money::from_units(20_000), deadline: d("2026-03-01"), request_type: "purchase".into(), allows_partial_payment: false };
+    let mut session = Session::open("user_x", profile, events, Arc::new(RateTable::default()), Rules::default());
+    let without = session.decide("request_x", d("2026-02-01"), &spec, &[]).unwrap();
+    session.apply_evidence(vec![image_rec("image_05#unverified", unverified(822.05, "\u{20B9}"))]);
+    let with = session.decide("request_x", d("2026-02-01"), &spec, &[]).unwrap();
+
+    assert_still_missing(session.ledger());
+    assert_eq!(with.facts.missing_amounts, vec!["event_1".to_string()]);
+    assert_eq!(with.facts.reserved_event_ids, vec!["event_1".to_string()]);
+    let r = &with.facts.unverified_reserve;
+    assert_eq!(r.len(), 1);
+    assert_eq!((r[0].event_id.as_str(), r[0].record_id.as_str(), r[0].amount, r[0].home_amount), ("event_1", "image_05#unverified", Money::from_f64(822.05), Money::from_f64(822.05)));
+    assert_eq!(r[0].currency, "INR");
+    assert!(without.facts.unverified_reserve.is_empty());
+    // The reserve is a real debit in the projection and trough drivers, and costs safe amount.
+    assert_eq!(with.facts.trough_balance, without.facts.trough_balance - Money::from_f64(822.05));
+    assert!(with.facts.trough_drivers.iter().any(|t| t.kind == "reserved" && t.component == "event_1" && t.total == -Money::from_f64(822.05)));
+    assert!(with.facts.safe_amount < without.facts.safe_amount, "{} vs {}", with.facts.safe_amount, without.facts.safe_amount);
+    assert!(with.facts.applied_evidence.is_empty());
+}
+
+#[test]
+fn failed_closed_scheduled_debit_reserved_on_cash_date() {
+    let events = [blank(1, EventType::Expense, Direction::Debit, "rent", "2025-08-01", "2025-08-20", Status::Scheduled)];
+    let (ledger, f) = build_with(&events, &[image_rec("image_02#unverified", unverified(100_000.0, "INR"))], "2025-08-05", &RateTable::default());
+    assert_still_missing(&ledger);
+    assert_eq!(event_flows(&f), vec![(d("2025-08-20"), -Money::from_units(100_000))]);
+    assert_eq!(f.low[(d("2025-08-19") - d("2025-08-05")).num_days() as usize], Money::from_units(100_000));
+    assert_eq!(f.low[(d("2025-08-20") - d("2025-08-05")).num_days() as usize], Money::ZERO);
+}
+
+#[test]
+fn unverified_largest_read_wins_in_any_order() {
+    let events = [blank(1, EventType::Expense, Direction::Debit, "rent", "2025-08-01", "2025-08-20", Status::Scheduled)];
+    let a = image_rec("image_02#unverified:a", unverified(90_000.0, "INR"));
+    let b = image_rec("image_02#unverified:b", unverified(100_000.0, "INR"));
+    let rates = RateTable::default();
+    let (l1, f1) = build_with(&events, &[a.clone(), b.clone()], "2025-08-05", &rates);
+    let (l2, f2) = build_with(&events, &[b.clone(), a.clone()], "2025-08-05", &rates);
+    assert_eq!(l1, l2);
+    assert_eq!(f1, f2);
+    let held = &l1.unverified["event_1"];
+    assert_eq!((held.record_id.as_str(), held.amount), ("image_02#unverified:b", Money::from_units(100_000)));
+    assert_eq!(l1.rejected.len(), 1);
+    assert_eq!(l1.rejected[0].record_id, "image_02#unverified:a");
+    // Tie: the earlier record id stays.
+    let c = image_rec("image_02#unverified:c", unverified(100_000.0, "INR"));
+    let (l3, _) = build_with(&events, &[c, b], "2025-08-05", &rates);
+    assert_eq!(l3.unverified["event_1"].record_id, "image_02#unverified:b");
+}
+
+#[test]
+fn verified_figure_overrides_unverified() {
+    let events = [blank(1, EventType::Expense, Direction::Debit, "rent", "2025-08-01", "2025-08-20", Status::Scheduled)];
+    let evidence = [image_rec("image_02#unverified", unverified(120_000.0, "INR")), image_rec("image_02#agree", accepted(100_000.0, "INR"))];
+    let (ledger, f) = build_with(&events, &evidence, "2025-08-05", &RateTable::default());
+    assert_eq!(ledger.get("event_1").unwrap().amount, Some(Money::from_units(100_000)));
+    assert!(ledger.unverified.is_empty());
+    assert_eq!(ledger.rejected.len(), 1);
+    assert_eq!(ledger.rejected[0].record_id, "image_02#unverified");
+    assert_eq!(event_flows(&f), vec![(d("2025-08-20"), -Money::from_units(100_000))]);
+}
+
+#[test]
+fn unverified_never_reserves_credit_settled_or_cancelled() {
+    let rates = RateTable::default();
+    let rd = "2025-08-05";
+    let cases = [
+        blank(1, EventType::Income, Direction::Credit, "salary", "2025-08-01", "2025-08-20", Status::Scheduled),
+        blank(1, EventType::Refund, Direction::Credit, "refund", "2025-08-01", "2025-08-20", Status::Pending),
+        blank(1, EventType::Expense, Direction::Debit, "dining", "2025-07-10", "2025-07-10", Status::Settled),
+    ];
+    for e in cases {
+        let (ledger, f) = build_with(&[e.clone()], &[image_rec("image_x#unverified", unverified(500.0, "INR"))], rd, &rates);
+        assert!(ledger.unverified.is_empty(), "{:?}", e.status);
+        assert_eq!(ledger.rejected.len(), 1, "{:?}", e.status);
+        assert_still_missing(&ledger);
+        assert!(event_flows(&f).is_empty());
+    }
+    let cancel = EvidenceRecord {
+        record_id: "message_01#0".into(),
+        source: EvidenceSource::Message { source_type: "merchant".into() },
+        observed_at: d("2025-08-02").and_hms_opt(9, 0, 0).unwrap(),
+        fact: Fact::EventCancelled { event_id: "event_1".into() },
+    };
+    let pending = blank(1, EventType::Expense, Direction::Debit, "telecom", "2025-08-01", "2025-08-09", Status::Pending);
+    let (ledger, f) = build_with(&[pending], &[image_rec("image_x#unverified", unverified(500.0, "INR")), cancel], rd, &rates);
+    assert!(ledger.unverified.is_empty());
+    assert!(event_flows(&f).is_empty());
+}
+
+#[test]
+fn unverified_foreign_row_converted_with_dated_rate_or_rejected() {
+    let mut usd = blank(1, EventType::Expense, Direction::Debit, "transport", "2024-09-15", "2024-09-20", Status::Scheduled);
+    usd.currency = "USD".into();
+    let (ledger, f) = build_with(&[usd.clone()], &[image_rec("image_12#unverified", unverified(33.50, "$"))], "2024-09-15", &rates());
+    assert_eq!(ledger.unverified["event_1"].home_amount, Money(27_915_550));
+    assert_eq!(event_flows(&f), vec![(d("2024-09-20"), -Money(27_915_550))]);
+    // No rate on the cash date: never guessed.
+    let (ledger, f) = build_with(&[usd], &[image_rec("image_12#unverified", unverified(33.50, "$"))], "2024-09-15", &RateTable::default());
+    assert!(ledger.unverified.is_empty());
+    assert!(ledger.rejected[0].reason.contains("rate"), "{}", ledger.rejected[0].reason);
+    assert!(event_flows(&f).is_empty());
+}
+
+#[test]
+fn image_07_dual_totals_recorded() {
+    let rates = RateTable::default();
+    let events = [blank(1, EventType::Expense, Direction::Debit, "dining", "2025-07-10", "2025-07-10", Status::Settled)];
+    let witness = |acc: f64| {
+        image_rec(
+            "image_07#witness",
+            Fact::AmountWitness {
+                event_id: "event_1".into(),
+                accepted: Money::from_f64(acc),
+                computed: Money::from_f64(8528.10),
+                currency: "\u{20B9}".into(),
+                witness: "8122 + 203.05 + 203.05".into(),
+            },
+        )
+    };
+    let paid = image_rec("image_07#agree", accepted(8528.0, "INR"));
+    let (ledger, _) = build_with(&events, &[witness(8528.0), paid.clone()], "2025-08-01", &rates);
+    assert_eq!(ledger.get("event_1").unwrap().amount, Some(Money::from_units(8528)));
+    assert!(ledger.rejected.is_empty(), "{:?}", ledger.rejected);
+    assert_eq!(ledger.witnesses.len(), 1);
+    let w = &ledger.witnesses[0];
+    assert_eq!((w.accepted, w.computed, w.currency.as_str()), (Money::from_units(8528), Money::from_f64(8528.10), "INR"));
+    // A witness that disagrees with the applied figure, or has no applied figure, is rejected.
+    let (ledger, _) = build_with(&events, &[witness(8528.10), paid], "2025-08-01", &rates);
+    assert!(ledger.witnesses.is_empty());
+    assert_eq!(ledger.get("event_1").unwrap().amount, Some(Money::from_units(8528)));
+    let (ledger, _) = build_with(&events, &[witness(8528.0)], "2025-08-01", &rates);
+    assert!(ledger.witnesses.is_empty());
+    assert_still_missing(&ledger);
 }
