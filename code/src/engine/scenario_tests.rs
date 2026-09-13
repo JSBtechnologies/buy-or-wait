@@ -69,10 +69,13 @@ fn ev(id: u32, ty: EventType, desc: &str, cat: &str, dir: Direction, amt: f64, d
 }
 
 fn forecast_for(events: &[Event], rd: &str) -> Forecast {
-    let rules = Rules::default();
+    forecast_with(events, rd, &Rules::default())
+}
+
+fn forecast_with(events: &[Event], rd: &str, rules: &Rules) -> Forecast {
     let rates = Arc::new(RateTable::default());
-    let ledger = Ledger::build("INR", events, &[], rates.as_ref(), &rules);
-    let streams = recurrence::detect(&ledger, d(rd), &rules);
+    let ledger = Ledger::build("INR", events, &[], rates.as_ref(), rules);
+    let streams = recurrence::detect(&ledger, d(rd), rules);
     let inputs = ForecastInputs {
         ledger: &ledger,
         streams: &streams,
@@ -80,7 +83,7 @@ fn forecast_for(events: &[Event], rd: &str) -> Forecast {
         minimum_balance: Money::ZERO,
         start: d(rd),
         rates: rates.as_ref(),
-        rules: &rules,
+        rules,
     };
     Forecast::build(&inputs, &[])
 }
@@ -311,4 +314,114 @@ fn trough_drivers_reconcile_to_the_trough() {
     assert_eq!(tdate, d("2025-08-15"));
     assert!(drivers.iter().all(|d| d.category != "salary"));
     assert_eq!(drivers[0].category, "rent");
+}
+
+/// Verifier class A plumbing: per-kind same-day placement is config-only, moves the day's low,
+/// and trough drivers still reconcile under either placement.
+#[test]
+fn same_day_placement_per_debit_kind() {
+    use super::forecast::{Flow, FlowSource};
+    use super::rules::{DebitKind, Placement};
+    let start = d("2025-08-01");
+    let flow = |date: &str, amt: i64, cat: &str, src: FlowSource| Flow { date: d(date), amount: Money::from_units(amt), category: cat.into(), source: src };
+    let flows = vec![
+        flow("2025-08-15", -300, "groceries", FlowSource::Stream { stream_id: "var:groceries".into() }),
+        flow("2025-08-15", -200, "utilities", FlowSource::Stream { stream_id: "rec:debit:utilities:Bill".into() }),
+        flow("2025-08-15", 1000, "salary", FlowSource::Stream { stream_id: "rec:credit:salary:Payroll".into() }),
+    ];
+    let mut rules = Rules::default();
+    let build = |rules: &Rules| {
+        Forecast::from_flows_placed(start, Money::from_units(600), Money::ZERO, Money::ZERO, flows.clone(), 31, &|f| {
+            rules.placement_of(super::forecast::debit_kind(f, &[]))
+        })
+    };
+    // Default: both debits before the salary -> low 100 on the 15th.
+    let f = build(&rules);
+    assert_eq!(f.trough(), (Money::from_units(100), d("2025-08-15")));
+    // Variable spend after credits: only the bill precedes the salary -> low 400.
+    rules.same_day_placement.variable_spend = Placement::AfterCredits;
+    assert_eq!(rules.placement_of(DebitKind::VariableSpend), Placement::AfterCredits);
+    assert_eq!(rules.placement_of(DebitKind::FixedBill), Placement::BeforeCredits);
+    let f2 = build(&rules);
+    assert_eq!(f2.trough(), (Money::from_units(400), d("2025-08-15")));
+    for fc in [&f, &f2] {
+        let (trough, _) = fc.trough();
+        let sum: Money = fc.trough_drivers().iter().map(|t| t.total).sum();
+        assert_eq!(fc.opening_balance + sum, trough);
+    }
+    // JSON patch with the RULES-style name.
+    let patched: Rules = serde_json::from_str(r#"{"SAME_DAY_PLACEMENT":{"scheduled":"after_credits"}}"#).unwrap();
+    assert_eq!(patched.placement_of(DebitKind::Scheduled), Placement::AfterCredits);
+    assert_eq!(patched.placement_of(DebitKind::VariableSpend), Placement::BeforeCredits);
+}
+
+/// RULES S8.1 SALARY_DAY_ORDER=fixed_bills_after_credit: on salary day a fixed bill lands after
+/// the credit, while a flexible bill and variable spend stay before it.
+#[test]
+fn salary_day_order_fixed_bills_after_credit() {
+    use super::rules::{DebitKind::*, Placement::*};
+    let rules: Rules = serde_json::from_str(r#"{"SALARY_DAY_ORDER":"fixed_bills_after_credit"}"#).unwrap();
+    for (kind, want) in [(FixedBill, AfterCredits), (Scheduled, AfterCredits), (Reserved, AfterCredits), (FlexibleBill, BeforeCredits), (VariableSpend, BeforeCredits), (Evidence, BeforeCredits)] {
+        assert_eq!(rules.placement_of(kind), want, "{kind:?}");
+    }
+    let all: Rules = serde_json::from_str(r#"{"SALARY_DAY_ORDER":"bills_after_credit"}"#).unwrap();
+    assert_eq!(all.placement_of(FlexibleBill), AfterCredits);
+    assert_eq!(all.placement_of(VariableSpend), BeforeCredits);
+
+    // Salary 5,000 and a fixed 3,000 bill on the 15th, a flexible 800 bill on the 15th too.
+    let mut events = history(EventType::Income, "Payroll credit", "salary", Direction::Credit, 5000.0, 15, 1);
+    events.extend(history(EventType::Expense, "Monthly entertainment spend", "entertainment", Direction::Debit, 3000.0, 15, 11));
+    let mut flex = history(EventType::Expense, "Cinema and events", "leisure", Direction::Debit, 800.0, 15, 21);
+    flex.iter_mut().for_each(|e| e.flexibility = Flexibility::Reducible);
+    events.extend(flex);
+    let base = forecast_for(&events, "2025-08-01");
+    let moved = forecast_with(&events, "2025-08-01", &rules);
+    let day = base.day(d("2025-08-15")).unwrap();
+    // Default: 100,000 - 3,800 before the salary. Fixed bill after: only the 800 precedes it.
+    assert_eq!(base.low[day], Money::from_units(96_200));
+    assert_eq!(moved.low[day], Money::from_units(99_200));
+    assert_eq!(base.balance[day], moved.balance[day]);
+    for f in [&base, &moved] {
+        let sum: Money = f.trough_drivers().iter().map(|t| t.total).sum();
+        assert_eq!(f.opening_balance + sum, f.trough().0);
+    }
+}
+
+/// RULES S8.2 VAR_LONG_PHASE=from_request: a >=21-day variable stream restarts at rd + 2.
+#[test]
+fn var_long_phase_from_request_restarts_at_request_date() {
+    let mk = |id, desc: &str, date: &str| ev(id, EventType::Expense, desc, "transport", Direction::Debit, 600.0, date, Status::Settled);
+    // Two descriptions, 28-day gaps -> interval stream every 28 days, last row 2025-07-26.
+    let events = vec![mk(1, "Fuel", "2025-05-03"), mk(2, "Train pass", "2025-05-31"), mk(3, "Fuel", "2025-06-28"), mk(4, "Train pass", "2025-07-26")];
+    let dates = |rules: &Rules| -> Vec<NaiveDate> {
+        forecast_with(&events, "2025-08-01", rules).flows.iter().filter(|f| f.category == "transport").map(|f| f.date).collect()
+    };
+    assert_eq!(dates(&Rules::default())[0], d("2025-08-23"));
+    let rules: Rules = serde_json::from_str(r#"{"VAR_LONG_PHASE":"from_request"}"#).unwrap();
+    assert_eq!(dates(&rules), vec![d("2025-08-03"), d("2025-08-31"), d("2025-09-28"), d("2025-10-26")]);
+    // Below the minimum step the phase is unchanged.
+    let short: Rules = serde_json::from_str(r#"{"VAR_LONG_PHASE":"from_request","var_long_min_step":29}"#).unwrap();
+    assert_eq!(dates(&short)[0], d("2025-08-23"));
+}
+
+/// RULES S8.3 SCHEDULED_REPLACE_SCOPE=lifecycle_or_amount: an unlinked scheduled debit far from
+/// the stream estimate is additive; within 10% (or linked) it still replaces the cycle.
+#[test]
+fn scheduled_replace_scope_lifecycle_or_amount() {
+    use Direction::*;
+    let rules: Rules = serde_json::from_str(r#"{"SCHEDULED_REPLACE_SCOPE":"lifecycle_or_amount"}"#).unwrap();
+    let run = |amount: f64, linked: bool, rules: &Rules| -> usize {
+        let mut events = history(EventType::Expense, "Municipal utilities", "utilities", Debit, 8000.0, 10, 1);
+        events.push(ev(8, EventType::Expense, "Municipal utilities", "utilities", Debit, 8000.0, "2025-07-20", Status::Failed));
+        let mut s = ev(9, EventType::Expense, "Scheduled utility debit", "utilities", Debit, amount, "2025-08-05", Status::Scheduled);
+        if linked {
+            s.linked_event_id = Some("event_8".into());
+        }
+        events.push(s);
+        forecast_with(&events, "2025-08-01", rules).flows.iter().filter(|f| f.category == "utilities" && f.date <= d("2025-08-31")).count()
+    };
+    assert_eq!(run(4830.0, false, &Rules::default()), 1);
+    assert_eq!(run(4830.0, false, &rules), 2);
+    assert_eq!(run(7300.0, false, &rules), 1);
+    assert_eq!(run(4830.0, true, &rules), 1);
 }
