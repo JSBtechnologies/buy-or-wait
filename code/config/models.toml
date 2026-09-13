@@ -292,24 +292,34 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# PENDING ACTIVATION (board decision.selected_activation_question, 2026-09-12):
-# [selected] deliberately left ABSENT below. 9d96dcd's [selected] was riding
-# into extraction's lockstep and would have reached `main` before the lead
-# is ready to announce activation. The chosen values are recorded here as a
-# commented block so nothing is lost; activating them is a separate,
-# single commit the lead announces explicitly once ready:
+# PENDING ACTIVATION (work item 1, image_accuracy_plan.md: integrator adds
+# `[selected]` for real; `main.rs` also still needs its resolve_blank_amount
+# call fixed and prompt v3 loaded first, image_accuracy_plan.md context).
+# `[selected]` stays deliberately ABSENT here so a stray `cargo run` by any
+# other agent never fires live model calls through main.rs's still-unfixed
+# call site. ml-engineer's own Phase A N=5 harness (`bin/bakeoff.rs`) proves
+# the OCR path against a LOCAL copy of this file with `[selected]` injected,
+# never against this committed one -- see docs/bakeoff.md for that run.
+#
+# HF-only, no vlm_fallback (RULES.md S8: the Anthropic org cap blocks
+# claude-opus-5 until 2026-10-01 -- a final user ruling, so it is dropped
+# from `[selected]` entirely here rather than left in as an inert fallback
+# slot). `extract::images::resolve_blank_amount_agreement` (image_accuracy_
+# plan.md §2 witness gate) no longer calls a third/tiebreak model at all: it
+# reads `vlm_primary`@1024px and `vlm_escalation`@768px, and only escalates
+# resolution (`vlm_primary`@1536px, `vlm_escalation`@1024px) on a failed
+# gate -- never a different model. Values to activate, unchanged since
+# `decision.vlm_setup`:
 #
 #   [selected]
 #   vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
 #   vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px
-#   vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (failed the backup gate), claude-opus-5 IN -- USER ACCEPTED (board decision.backup_gate, criterion 5 [>=2 providers] waived for a direct-API model): 90.6% field accuracy (best of any VLM tested), 100% valid-JSON, 83.3% selected-figure accuracy, 83.3% reconciliation, 0 false-accepts (docs/bakeoff.md)
-#   vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
-#   image_max_dim_px = 1024
-#   llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai
-#   llm_fallback = "deepseek-ai/DeepSeek-V4-Pro-0813"    # deepinfra, passed its backup-gate check
+#   vlm_mode = "agreement"                              # images.rs's Agreement-mode fn IS the witness gate
+#   image_max_dim_px = 1024                             # global default; the gate's own per-role resolutions above take precedence
+#   llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai (board decision.vlm_setup, unchanged)
 #
-# [[fallback.candidates]] (catalog), [vlm_routing] (routing table), and all
-# pricing stay live/unchanged below -- only the activation switch moved.
+# `[[fallback.candidates]]` (catalog) and `[vlm_routing]` stay live/unchanged
+# below -- only the activation switch moved, and vlm_fallback is dropped.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -348,6 +358,16 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 # not yet screened for claude-opus-5 specifically -- a known gap.
 # ---------------------------------------------------------------------------
 
+# INERT under the Phase A witness gate (image_accuracy_plan.md §2): the table below is the
+# OLD per-class-routing + tiebreak design (`extract::model_config::readers_for`/`tiebreak_for`/
+# `classify_event`, still compiled and unit-tested in model_config.rs). `extract::images::
+# resolve_blank_amount_agreement` no longer calls any of those three functions -- it reads
+# `vlm_primary`/`vlm_escalation` from `[selected]` directly with a flat, class-independent
+# HF-only read budget (module doc, images.rs). Left in place, unmodified, for
+# `evaluation::image_agreement` (verifier's signoff tool, which parses this table itself and is
+# not wired into the runtime pipeline) until Phase B's verifier realigns it to the new
+# architecture (image_accuracy_plan.md work item 5) -- do not treat this table as describing
+# current production routing.
 [vlm_routing]
 default_class = "settled_expense_receipt"
 # Verifier gate #250: cross-model agreement/tiebreak matching tolerance

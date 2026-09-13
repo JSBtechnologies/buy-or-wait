@@ -15,6 +15,7 @@ pub mod model_config;
 pub mod normalize;
 pub mod prompts;
 pub mod retrieval;
+pub mod witness;
 
 use anyhow::Result;
 

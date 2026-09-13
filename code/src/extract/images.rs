@@ -25,6 +25,7 @@ use crate::extract::model_config::{
 use crate::extract::normalize;
 use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
+use crate::extract::witness;
 use anyhow::Context as _;
 
 use crate::anthropic::AnthropicClient;
@@ -126,6 +127,25 @@ pub struct ImageFigures {
     pub document_date: Option<String>,
     pub period_label: Option<String>,
     pub line_items_sum_check: Option<f64>,
+    /// v3 schema (`image_transcription.v3.md`, image_accuracy_plan.md §1/§2 witness gate): a
+    /// distinctly-labeled "Grand Total" line, when the page prints one separate from `total`
+    /// (e.g. image_07: subtotal-style "Total" plus a "Grand Total" after service charges). Used
+    /// only as another final-label witness/contradiction field (`extract::witness`); `None`
+    /// when the page has no such separate line.
+    pub grand_total: Option<f64>,
+    /// v3 schema: the printed "amount in words" line verbatim (e.g. "Rupees Seven Hundred Four
+    /// and Five Paise Only"), parsed by `extract::witness::words_to_number` -- never converted
+    /// here, since the words parser needs the raw phrase, not a pre-parsed number.
+    pub amount_in_words: Option<String>,
+    /// v3 schema: every individual line-item amount printed on the page, copied verbatim and
+    /// normalized independently (never a model-computed sum) -- `extract::witness::find_witness`
+    /// re-sums these itself rather than trusting the model's own arithmetic (v1/v2's
+    /// `line_items_sum_check` did the latter). Empty when the page prints no itemized list.
+    pub line_items: Vec<f64>,
+    /// v3 schema: a separate itemized list for charges/taxes/deductions distinct from
+    /// `line_items` (e.g. image_07's two 203.05 service-charge lines added to a subtotal),
+    /// verbatim and independently normalized. Empty when the page prints no such breakdown.
+    pub charges_breakdown: Vec<f64>,
 }
 
 impl<'de> Deserialize<'de> for ImageFigures {
@@ -187,6 +207,14 @@ struct RawImageFigures {
     period_label: Option<Value>,
     #[serde(default)]
     line_items_sum_check: Option<Value>,
+    #[serde(default)]
+    grand_total: Option<Value>,
+    #[serde(default)]
+    amount_in_words: Option<Value>,
+    #[serde(default)]
+    line_items: Option<Value>,
+    #[serde(default)]
+    charges_breakdown: Option<Value>,
 }
 
 /// Accepts a JSON number as-is, or a numeric-looking string via `normalize::parse_amount`
@@ -198,6 +226,20 @@ fn coerce_f64(v: &Option<Value>, currency_hint: Option<&str>) -> Option<f64> {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => normalize::parse_amount(s, currency_hint, false),
         _ => None,
+    }
+}
+
+/// Each element of a JSON array coerced the same way `coerce_f64` coerces a single value
+/// (number, or numeric-looking string via `normalize::parse_amount`); a non-array value, a
+/// missing field, or an individual element that doesn't parse is simply dropped (never a hard
+/// error and never a guessed 0) -- `extract::witness::find_witness` sums whatever survives.
+fn coerce_f64_array(v: &Option<Value>, currency_hint: Option<&str>) -> Vec<f64> {
+    match v.as_ref() {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| coerce_f64(&Some(item.clone()), currency_hint))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -261,6 +303,10 @@ impl From<RawImageFigures> for ImageFigures {
             document_date: coerce_string(&raw.document_date),
             period_label: coerce_string(&raw.period_label),
             line_items_sum_check: coerce_f64(&raw.line_items_sum_check, currency_hint),
+            grand_total: coerce_f64(&raw.grand_total, currency_hint),
+            amount_in_words: coerce_string(&raw.amount_in_words),
+            line_items: coerce_f64_array(&raw.line_items, currency_hint),
+            charges_breakdown: coerce_f64_array(&raw.charges_breakdown, currency_hint),
         }
     }
 }
@@ -433,12 +479,16 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
         // attempt (paid, total) but not enough to confirm or reject the gap; left un-passed,
         // same as a failed attempt, so it cannot by itself validate the figure.
     }
+    // image_accuracy_plan.md §2: a breakdown that does NOT sum to the target is a note, never
+    // a rejection (pages are often cut off) -- so this identity only ever sets `any_ran` when
+    // it actually PASSES; a mismatch here must never by itself make `any_ran && !any_passed`
+    // true.
     if !any_passed {
         if let (Some(sum), Some(target)) =
             (figures.line_items_sum_check, figures.subtotal.or(figures.total))
         {
-            any_ran = true;
             if close(sum, target, ROUNDING_TOLERANCE_2TERM) {
+                any_ran = true;
                 any_passed = true;
             }
         }
@@ -634,6 +684,7 @@ fn call_vlm(
     client: &HfClient,
     anthropic: Option<&AnthropicClient>,
     cold: bool,
+    run_idx: Option<u32>,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
     candidate: &CandidateConfig,
@@ -659,7 +710,7 @@ fn call_vlm(
         // on the prompt text alone plus `parse_json_reply`'s lenient parsing.
         json_schema: None,
     };
-    let response = dispatch_call(client, anthropic, cold, candidate, &call)?;
+    let response = dispatch_call(client, anthropic, cold, run_idx, candidate, &call)?;
     // Kimi-K3 (a thinking model, ml-engineer #204/lead) returns reasoning text ahead of the
     // JSON answer at any max_tokens generous enough to let it finish; `parse_json_reply`
     // already locates the JSON body rather than requiring the whole reply to be JSON.
@@ -680,6 +731,7 @@ fn dispatch_call(
     hf: &HfClient,
     anthropic: Option<&AnthropicClient>,
     cold: bool,
+    run_idx: Option<u32>,
     candidate: &CandidateConfig,
     call: &ModelCall,
 ) -> anyhow::Result<ModelResponse> {
@@ -688,7 +740,14 @@ fn dispatch_call(
             .context("anthropic provider selected but no AnthropicClient configured (ANTHROPIC_API_KEY unset) -- reader unavailable")?;
         return if cold { client.chat_completion_cold(call) } else { client.chat_completion(call) };
     }
-    if cold { hf.chat_completion_cold(call) } else { hf.chat_completion(call) }
+    match (cold, run_idx) {
+        // image_accuracy_plan.md §"Live N=5": persist every run's raw response under its own
+        // file (hf.rs's `chat_completion_cold_numbered`), never silently overwritten by the
+        // next run in the same stability sweep.
+        (true, Some(idx)) => hf.chat_completion_cold_numbered(call, idx),
+        (true, None) => hf.chat_completion_cold(call),
+        (false, _) => hf.chat_completion(call),
+    }
 }
 
 /// Per-read provenance (verifier #205 contract, board:verify.image_agreement): the
@@ -714,6 +773,16 @@ pub struct ImageReadProvenance {
     pub before_amount: Option<f64>,
     pub after_amount: Option<f64>,
     pub error: Option<String>,
+    /// image_accuracy_plan.md §2 witness gate: the independent identity (line-item sum,
+    /// subtotal+tax, gross-deductions, paid+balance, amount-in-words, a repeated final label,
+    /// or a witnessed cutoff relationship) that proved `selected_amount` on THIS read's own
+    /// figures, if any. Only ever populated when `selected_amount.is_some()`.
+    pub witness: Option<String>,
+    /// image_accuracy_plan.md §2: the first final-labeled field on THIS read's own figures
+    /// that disagrees with `selected_amount` beyond tolerance, if any (`(field, value)` as
+    /// `"field=value"`). A non-summing itemized breakdown is never reported here (module doc,
+    /// `extract::witness`) -- only Total/Grand Total/Amount Due/Balance Due/Net Pay count.
+    pub contradiction: Option<String>,
 }
 
 /// Full resolution for one blank-amount event: every read attempted, the outcome, and the
@@ -765,11 +834,66 @@ pub fn resolve_blank_amount(
     event: &Event,
     history: &[Event],
 ) -> anyhow::Result<ImageResolution> {
+    resolve_blank_amount_inner(
+        client, anthropic, cold, None, prompt, image_max_dim_px, image_path, image_id, config, event, history,
+    )
+}
+
+/// Same as `resolve_blank_amount`, but persists every live call this resolution makes under
+/// its own numbered file (`hf::HfClient::chat_completion_cold_numbered`) instead of the
+/// canonical cache entry alone -- image_accuracy_plan.md §"Live N=5": ml-engineer's stability
+/// sweep (`bin/bakeoff.rs`) needs every run's raw response on disk for review, not just the
+/// last run's (which would otherwise silently overwrite runs 1..N-1, same cache key by
+/// construction). `resolve_blank_amount`'s own public signature stays exactly as main.rs
+/// already calls it; only this bake-off-only entry point takes `run_idx`.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_blank_amount_numbered_run(
+    client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
+    prompt: &PromptSet,
+    image_max_dim_px: u32,
+    image_path: &Path,
+    image_id: &str,
+    config: &ModelsConfig,
+    event: &Event,
+    history: &[Event],
+    run_idx: u32,
+) -> anyhow::Result<ImageResolution> {
+    resolve_blank_amount_inner(
+        client,
+        anthropic,
+        true,
+        Some(run_idx),
+        prompt,
+        image_max_dim_px,
+        image_path,
+        image_id,
+        config,
+        event,
+        history,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_blank_amount_inner(
+    client: &HfClient,
+    anthropic: Option<&AnthropicClient>,
+    cold: bool,
+    run_idx: Option<u32>,
+    prompt: &PromptSet,
+    image_max_dim_px: u32,
+    image_path: &Path,
+    image_id: &str,
+    config: &ModelsConfig,
+    event: &Event,
+    history: &[Event],
+) -> anyhow::Result<ImageResolution> {
     match config.vlm_mode() {
         VlmMode::Escalate => resolve_blank_amount_escalate(
             client,
             anthropic,
             cold,
+            run_idx,
             prompt,
             &config.decoding,
             image_max_dim_px,
@@ -786,6 +910,7 @@ pub fn resolve_blank_amount(
             client,
             anthropic,
             cold,
+            run_idx,
             prompt,
             &config.decoding,
             image_path,
@@ -802,6 +927,7 @@ fn read_candidate(
     client: &HfClient,
     anthropic: Option<&AnthropicClient>,
     cold: bool,
+    run_idx: Option<u32>,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
     pick: ReaderPick<'_>,
@@ -825,8 +951,10 @@ fn read_candidate(
         before_amount: None,
         after_amount: None,
         error: None,
+        witness: None,
+        contradiction: None,
     };
-    match call_vlm(client, anthropic, cold, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
+    match call_vlm(client, anthropic, cold, run_idx, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
         Ok(figures) => {
             // Prefer v2's unambiguous fields; fall back to v1's for an already-cached v1
             // read (`finding.image05_root_cause`). Either way, `ImageReadProvenance`'s own
@@ -843,9 +971,17 @@ fn read_candidate(
             prov.doc_checks = validate_doc(&figures, event, candidate_amount, typical_amount, doc_validation);
             if prov.reconciled && prov.doc_checks.passed() {
                 prov.selected_amount = candidate_amount;
-                if prov.selected_amount.is_some() {
+                if let Some(amount) = prov.selected_amount {
                     prov.currency =
                         Some(figures.currency.clone().unwrap_or_else(|| event.currency.clone()));
+                    // image_accuracy_plan.md §2 witness gate: computed on THIS read's own raw
+                    // figures, never across reads -- a non-summing breakdown never rejects
+                    // (`find_witness` only ever reports a passing identity), and a real
+                    // final-label contradiction is recorded for the caller to veto on.
+                    prov.witness = witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM)
+                        .map(|k| k.label().to_string());
+                    prov.contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM)
+                        .map(|(field, value)| format!("{field}={value}"));
                 }
             }
         }
@@ -936,6 +1072,7 @@ fn resolve_blank_amount_escalate(
     client: &HfClient,
     anthropic: Option<&AnthropicClient>,
     cold: bool,
+    run_idx: Option<u32>,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
     image_max_dim_px: u32,
@@ -970,7 +1107,7 @@ fn resolve_blank_amount_escalate(
     {
         let pick = ReaderPick { role, candidate, max_dim_px: image_max_dim_px, max_tokens: decoding.max_tokens_vlm };
         let prov = read_candidate(
-            client, anthropic, cold, prompt, decoding, pick, &image_b64, image_id, event, history, doc_validation,
+            client, anthropic, cold, run_idx, prompt, decoding, pick, &image_b64, image_id, event, history, doc_validation,
         );
         if let (true, Some(amount), Some(currency)) =
             (prov.reconciled, prov.selected_amount, prov.currency.clone())
@@ -984,28 +1121,31 @@ fn resolve_blank_amount_escalate(
     Ok(outcome("no_reconciling_read", reads, None))
 }
 
-/// Two-model agreement (user decision `decision.vlm_setup`, board:verify.image_agree_preaudit
-/// + board:verify.image_agree_audit): `config.readers_for(event)` routes this event's class
-/// (income/payslip, pending/scheduled bill, or settled expense/receipt — from
-/// `event_type`/`status`/`category`, never the model's own `doc_type`) to a pair of reader
-/// roles, each with its own resolution/token budget. Both read the image independently; if
-/// their selected amounts agree (within the documented rounding tolerance), that figure is
-/// trusted. On disagreement, or when one reader is missing/unreconciled, the class's own
-/// `tiebreak` reader (user decision `decision.tiebreak_distinct`) is called — a class's
-/// `tiebreak` role is enforced distinct from both its primary `readers` at
-/// `ModelsConfig::load()` (hard error), so there is no runtime self-tiebreak case to guard
-/// here: calling it is always a genuinely independent third read (analyst audit #214/#219 —
-/// the image_05 false accept was exactly a self-tiebreak, Kimi matching its own cached
-/// answer 5/5). A tiebreak match must ALSO satisfy any due-date cutoff any of the three reads
-/// resolved (analyst audit #203) — matching a stale pre-cutoff figure numerically is not
-/// enough. Two readers both failing to reconcile is never covered by a lone tiebreak read
-/// (analyst audit #214: "(None,None) also accepts one read" was a bug, not a feature —
-/// two-model agreement never trusts exactly one model).
+/// HF-only witness gate (image_accuracy_plan.md §2, RULES.md S8: the Anthropic org cap blocks
+/// a tiebreak model until 2026-10-01, so Phase A never routes through a third/backup model at
+/// all -- this supersedes the per-class routing-table + tiebreak design the doc comments above
+/// still describe; Phase B may reinstate a distinct tiebreak reader once one is actually
+/// available). The two models named by `[selected]` (`vlm_primary`, `vlm_escalation`) each read
+/// the image independently at a fixed base resolution (1024px / 768px). A figure is trusted
+/// only once some pair of reads:
+/// - select the same normalized amount within tolerance, and agree on any due-date cutoff
+///   (analyst #317 "invented-cutoff hole");
+/// - satisfies that cutoff requirement, if any read resolved one;
+/// - carries at least one independent witness on EITHER side proving that amount
+///   (`extract::witness::find_witness` — a non-summing breakdown is a note, never a veto);
+/// - carries no final-label contradiction on EITHER side (`extract::witness::
+///   final_label_contradicts`).
+/// If the base pair doesn't clear the gate, up to two more reads are added at a second
+/// resolution (`vlm_primary`@1536px, `vlm_escalation`@1024px, image_accuracy_plan.md §2 "Read
+/// budget"), and every pair among the reads attempted so far is re-checked, stopping as soon as
+/// any pair passes. Two readers both failing to reconcile, or reconciling with no witness, is
+/// never covered by adding more of the SAME two models past the 4-read budget (never a guess).
 #[allow(clippy::too_many_arguments)]
 fn resolve_blank_amount_agreement(
     client: &HfClient,
     anthropic: Option<&AnthropicClient>,
     cold: bool,
+    run_idx: Option<u32>,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
     image_path: &Path,
@@ -1014,99 +1154,85 @@ fn resolve_blank_amount_agreement(
     event: &Event,
     history: &[Event],
 ) -> anyhow::Result<ImageResolution> {
-    let class = config.classify_event(event).to_string();
     let outcome = |outcome: &str, reads: Vec<ImageReadProvenance>, evidence: Option<EvidenceRecord>| ImageResolution {
         image_id: image_id.to_string(),
-        class: Some(class.clone()),
-        mode: "agreement".to_string(),
+        class: None,
+        mode: "witness".to_string(),
         reads,
         outcome: outcome.to_string(),
         evidence,
     };
 
-    let Some((pick_a, pick_b)) = config.readers_for(event) else {
+    let (Some(primary), Some(escalation)) = (config.vlm_primary(), config.vlm_escalation()) else {
         return Ok(outcome("no_route", vec![], None));
     };
 
-    let b64_a = downscale_and_encode(image_path, pick_a.max_dim_px)?;
-    let b64_b = if pick_b.max_dim_px == pick_a.max_dim_px {
-        b64_a.clone()
-    } else {
-        downscale_and_encode(image_path, pick_b.max_dim_px)?
-    };
-    let prov_a = read_candidate(
-        client, anthropic, cold, prompt, decoding, pick_a, &b64_a, image_id, event, history, &config.doc_validation,
-    );
-    let prov_b = read_candidate(
-        client, anthropic, cold, prompt, decoding, pick_b, &b64_b, image_id, event, history, &config.doc_validation,
-    );
-    let mut reads = vec![prov_a.clone(), prov_b.clone()];
+    // image_accuracy_plan.md §2 "Read budget (HF-only)": the two base reads, then up to two
+    // more at a second resolution if the gate isn't met yet -- never a third model.
+    const BASE_PRIMARY_DIM: u32 = 1024;
+    const BASE_ESCALATION_DIM: u32 = 768;
+    const EXTRA_PRIMARY_DIM: u32 = 1536;
+    const EXTRA_ESCALATION_DIM: u32 = 1024;
+    let budget: [(&str, &CandidateConfig, u32); 4] = [
+        ("vlm_primary", primary, BASE_PRIMARY_DIM),
+        ("vlm_escalation", escalation, BASE_ESCALATION_DIM),
+        ("vlm_primary_extra", primary, EXTRA_PRIMARY_DIM),
+        ("vlm_escalation_extra", escalation, EXTRA_ESCALATION_DIM),
+    ];
 
-    // Verifier gate #250: the tolerance is configurable (capped at
-    // MAX_AGREEMENT_TOLERANCE), and a due-date cutoff any read itself resolved gates BOTH
-    // the two-reader agree path and the tiebreak path -- two readers numerically agreeing on
-    // a stale pre-cutoff figure is not a real agreement.
     let tolerance = config.agreement_tolerance();
-    let ab_cutoff_requirement = [&prov_a, &prov_b].iter().find_map(|p| cutoff_requirement(p, event));
-    let ab_satisfies_cutoff =
-        |amount: f64| ab_cutoff_requirement.is_none_or(|req| close(amount, req, tolerance));
+    let mut reads: Vec<ImageReadProvenance> = Vec::new();
 
-    if let (Some(amt_a), Some(amt_b)) = (prov_a.selected_amount, prov_b.selected_amount) {
-        if close(amt_a, amt_b, tolerance) && ab_satisfies_cutoff(amt_a) && cutoff_dates_agree(&prov_a, &prov_b) {
-            let currency = prov_a.currency.clone().unwrap_or_else(|| event.currency.clone());
-            let evidence = build_evidence(image_id, event, amt_a, currency, &[&prov_a.role, &prov_b.role]);
-            return Ok(outcome("agree", reads, Some(evidence)));
+    for (role, candidate, max_dim_px) in budget {
+        let b64 = downscale_and_encode(image_path, max_dim_px)?;
+        let pick = ReaderPick { role, candidate, max_dim_px, max_tokens: decoding.max_tokens_vlm };
+        let prov = read_candidate(
+            client, anthropic, cold, run_idx, prompt, decoding, pick, &b64, image_id, event, history, &config.doc_validation,
+        );
+        reads.push(prov);
+
+        if let Some((amount, currency, roles)) = find_witnessed_pair(&reads, event, tolerance) {
+            let role_refs: Vec<&str> = roles.iter().map(String::as_str).collect();
+            let evidence = build_evidence(image_id, event, amount, currency, &role_refs);
+            return Ok(outcome("witness_accept", reads, Some(evidence)));
         }
     }
 
-    let Some(tb_pick) = config.tiebreak_for(event) else {
-        return Ok(outcome("no_agreement", reads, None));
-    };
-    let b64_fb = if tb_pick.max_dim_px == pick_a.max_dim_px {
-        b64_a.clone()
-    } else if tb_pick.max_dim_px == pick_b.max_dim_px {
-        b64_b.clone()
-    } else {
-        downscale_and_encode(image_path, tb_pick.max_dim_px)?
-    };
-    let prov_fb = read_candidate(
-        client, anthropic, cold, prompt, decoding, tb_pick, &b64_fb, image_id, event, history, &config.doc_validation,
-    );
-    reads.push(prov_fb.clone());
+    Ok(outcome("no_agreement", reads, None))
+}
 
-    let Some(amt_fb) = prov_fb.selected_amount else {
-        return Ok(outcome("no_agreement", reads, None));
-    };
-
-    let cutoff_requirement =
-        [&prov_a, &prov_b, &prov_fb].iter().find_map(|p| cutoff_requirement(p, event));
-    let satisfies_cutoff =
-        |amount: f64| cutoff_requirement.is_none_or(|req| close(amount, req, tolerance));
-
-    // Analyst #317 ("invented-cutoff hole"): the matched primary read must also agree with
-    // the tiebreak on the parsed due-date cutoff, not just the amount -- otherwise the
-    // tiebreak could invent (or drop) a cutoff the matched read doesn't share and still
-    // "win" on a coincidental amount match.
-    let matched_role = if prov_a.selected_amount.is_some_and(|a| close(amt_fb, a, tolerance))
-        && cutoff_dates_agree(&prov_a, &prov_fb)
-    {
-        Some(prov_a.role.clone())
-    } else if prov_b.selected_amount.is_some_and(|b| close(amt_fb, b, tolerance))
-        && cutoff_dates_agree(&prov_b, &prov_fb)
-    {
-        Some(prov_b.role.clone())
-    } else {
-        None
-    };
-
-    match matched_role {
-        Some(role) if satisfies_cutoff(amt_fb) => {
-            let currency = prov_fb.currency.clone().unwrap_or_else(|| event.currency.clone());
-            let evidence = build_evidence(image_id, event, amt_fb, currency, &[&role, &prov_fb.role]);
-            Ok(outcome("tiebreak_accept", reads, Some(evidence)))
+/// The first pair (in read order) that clears the full witness gate: agreeing amounts, agreeing
+/// (and satisfied) cutoff, at least one witness between the pair, and no contradiction on
+/// either side (image_accuracy_plan.md §2). `None` when no such pair exists among the reads
+/// attempted so far — the caller adds more reads (up to the budget) and re-checks.
+fn find_witnessed_pair(
+    reads: &[ImageReadProvenance],
+    event: &Event,
+    tolerance: f64,
+) -> Option<(f64, String, Vec<String>)> {
+    for i in 0..reads.len() {
+        for j in (i + 1)..reads.len() {
+            let (a, b) = (&reads[i], &reads[j]);
+            let (Some(amt_a), Some(amt_b)) = (a.selected_amount, b.selected_amount) else { continue };
+            if !close(amt_a, amt_b, tolerance) || !cutoff_dates_agree(a, b) {
+                continue;
+            }
+            let cutoff_req = [a, b].iter().find_map(|p| cutoff_requirement(p, event));
+            if cutoff_req.is_some_and(|req| !close(amt_a, req, tolerance)) {
+                continue;
+            }
+            if a.contradiction.is_some() || b.contradiction.is_some() {
+                continue;
+            }
+            if a.witness.is_none() && b.witness.is_none() {
+                continue;
+            }
+            let currency =
+                a.currency.clone().or_else(|| b.currency.clone()).unwrap_or_else(|| event.currency.clone());
+            return Some((amt_a, currency, vec![a.role.clone(), b.role.clone()]));
         }
-        _ => Ok(outcome("no_agreement", reads, None)),
     }
+    None
 }
 
 #[cfg(test)]
@@ -1524,6 +1650,8 @@ mod tests {
             before_amount: None,
             after_amount: None,
             error: None,
+            witness: None,
+            contradiction: None,
         }
     }
 
@@ -1591,7 +1719,7 @@ mod tests {
             json_response: false,
             json_schema: None,
         };
-        let result = dispatch_call(&hf, None, false, &candidate, &call);
+        let result = dispatch_call(&hf, None, false, None, &candidate, &call);
         assert!(result.is_err(), "an unavailable anthropic provider must error, never panic or silently succeed");
     }
 
