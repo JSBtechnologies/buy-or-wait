@@ -479,6 +479,28 @@ fn flow_description(f: &Flow, inp: &ForecastInputs) -> Option<String> {
     }
 }
 
+/// Whether a scheduled debit is a cycle of the category's recurring expense, so a rent/bill
+/// change applies to it: linked (retry/lifecycle), same description as a stream of that
+/// category, or within `scheduled_replace_amount_pct` of its estimate (RULES S8.3). A one-off
+/// row beside the cycle (request_16 "Outstanding rent balance" vs "Monthly rent") keeps its
+/// own amount. With no stream in the category the row is treated as the cycle.
+fn is_cycle_row(event_id: &str, category: &str, inp: &ForecastInputs) -> bool {
+    let Some(e) = inp.ledger.get(event_id) else { return false };
+    let streams: Vec<&Stream> =
+        inp.streams.streams.iter().filter(|s| s.category == category && s.direction == Direction::Debit).collect();
+    if streams.is_empty() || e.event.linked_event_id.is_some() {
+        return true;
+    }
+    let amount = e.home_amount.or_else(|| inp.ledger.unverified_home(event_id));
+    streams.iter().any(|s| {
+        s.description.as_deref().is_some_and(|d| descriptions_match(d, &e.event.description))
+            || amount.is_some_and(|a| {
+                let est = s.projected_amount;
+                (a - est).abs().0 as i128 * 100 <= est.abs().0 as i128 * inp.rules.scheduled_replace_amount_pct as i128
+            })
+    })
+}
+
 fn descriptions_match(a: &str, b: &str) -> bool {
     let (a, b) = (a.to_lowercase(), b.to_lowercase());
     !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
@@ -580,7 +602,11 @@ fn apply_adjustments(flows: &mut Vec<Flow>, inp: &ForecastInputs, start: NaiveDa
                         && f.amount < Money::ZERO
                         // None: from the next occurrence after the message (lead, blocker #32).
                         && f.date >= effective.unwrap_or(rec.observed_at.date())
-                        && matches!(f.source, FlowSource::Stream { .. } | FlowSource::Scheduled { .. })
+                        && match &f.source {
+                            FlowSource::Stream { .. } => true,
+                            FlowSource::Scheduled { event_id } => is_cycle_row(event_id, category, inp),
+                            _ => false,
+                        }
                 });
                 for f in targets {
                     let new_mag = match (amount, percent) {
