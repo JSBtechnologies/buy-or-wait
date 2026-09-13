@@ -100,7 +100,17 @@ pub fn image_gold_findings(code_dir: &Path, repo_root: Option<&Path>) -> Result<
             match gold.get(image) {
                 None => out.push(finding("FA2_unverifiable_image_fact", format!("{image} has no audit reference"))),
                 Some(g) if g.event_id != event => out.push(finding("FA2_unverifiable_image_fact", format!("{image} fact targets {event}, reference is for {}", g.event_id))),
-                Some(g) if !cents.map(|c| g.amounts.contains(&c)).unwrap_or(false) => out.push(finding(
+                // User rulings name one figure per image (AGENT_RULES §8: image_07 = 8,528, the
+                // Grand Total): an analyst "alt" rendering is never accepted as equal.
+                Some(g) if cents.is_some_and(|c| g.amounts[1..].contains(&c)) => out.push(finding(
+                    "FA3_image_amount_alt",
+                    format!(
+                        "{image} ({event}) applied the alt rendering {:?}; the ruled figure is {}",
+                        cents.map(super::data::fmt_cents_2dp),
+                        super::data::fmt_cents_2dp(g.amounts[0])
+                    ),
+                )),
+                Some(g) if cents != Some(g.amounts[0]) => out.push(finding(
                     "FA1_image_amount_wrong",
                     format!(
                         "{image} ({event}) applied {:?}, analyst reference {:?}: model and analyst disagree, investigate (not auto-corrected)",
@@ -116,7 +126,15 @@ pub fn image_gold_findings(code_dir: &Path, repo_root: Option<&Path>) -> Result<
 }
 
 /// Codes from other checks that are false accepts under decision.accuracy_first.
-pub const FALSE_ACCEPT_CODES: [&str; 5] = ["EC4_unexpected_fact", "EC5_model_record_ungrounded", "IA4_no_agreement", "IA5_accepted_amount", "IA11_nonpositive_cash_moving"];
+pub const FALSE_ACCEPT_CODES: [&str; 7] = [
+    "EC4_unexpected_fact",
+    "EC5_model_record_ungrounded",
+    "IA4_no_agreement",
+    "IA5_accepted_amount",
+    "IA11_nonpositive_cash_moving",
+    "IA15_accept_without_witness",
+    "IA17_final_label_contradiction",
+];
 
 #[cfg(test)]
 mod tests {
@@ -167,8 +185,9 @@ mod tests {
     fn wrong_unverifiable_or_unreferenced_image_amounts_fail() {
         let Some(g) = gold(Some(&repo())) else { return };
         for (image, ref_) in &g {
-            for a in &ref_.amounts {
-                assert!(with_fact(&format!("ok{image}{a}"), image, &ref_.event_id, *a, Some(&repo())).is_empty(), "{image}");
+            assert!(with_fact(&format!("ok{image}"), image, &ref_.event_id, ref_.amounts[0], Some(&repo())).is_empty(), "{image}");
+            for a in &ref_.amounts[1..] {
+                assert_eq!(with_fact(&format!("alt{image}{a}"), image, &ref_.event_id, *a, Some(&repo())), vec!["FA3_image_amount_alt"], "{image}");
             }
             // Off by one cent or by a whole unit: model and analyst disagree.
             let off = ref_.amounts[0] + 1;
