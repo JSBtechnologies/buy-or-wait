@@ -32,7 +32,8 @@
 //! reconciled and selected a figure, the figure is > 0 for pending/scheduled events, and it
 //! equals the due-date cutoff requirement when any read of the image resolved one (after-cutoff
 //! amount iff the cash date is after the due date). Accept: both class readers count and agree
-//! within tolerance → agree; else a counting tiebreak read agrees with a counting reader →
+//! within tolerance AND on the parsed due cutoff (both absent counts as equal; analyst #317) →
+//! agree; else a counting tiebreak read agrees with a counting reader on amount and cutoff →
 //! tiebreak; else nothing is accepted (missing, never a guess).
 
 use std::collections::HashMap;
@@ -275,6 +276,16 @@ fn requirement(r: &Read, e: &Event) -> Cutoff {
     }
 }
 
+/// Parsed due cutoff for agreement: absent (missing, empty, "null") = Ok(None); a raw value that
+/// does not parse is kept as its own key so it never equals an absent or parsed cutoff.
+fn cutoff_key(r: &Read) -> Result<Option<NaiveDate>, String> {
+    match r.due_date.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) if s.eq_ignore_ascii_case("null") => Ok(None),
+        Some(s) => parse_day(s).map(Some).ok_or_else(|| s.to_string()),
+    }
+}
+
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol + 1e-9
 }
@@ -324,22 +335,27 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, e: &Event) -> (&
             None => r.selected_amount,
         }
     };
-    let mut reader_amounts = Vec::new();
+    // Counted reads must agree on the amount AND on the parsed due cutoff (analyst #317: an
+    // invented cutoff plus one coincident error must escalate, not accept).
+    let mut reader_amounts: Vec<Option<(f64, &Read)>> = Vec::new();
     for slot in &class.readers {
         match p.reads.iter().find(|r| r.role == slot.role && r.model_id == slot.model) {
             None => {
                 notes.push(format!("{} read missing", slot.role));
                 reader_amounts.push(None);
             }
-            Some(r) => reader_amounts.push(counts(r, slot, &mut notes)),
+            Some(r) => reader_amounts.push(counts(r, slot, &mut notes).map(|a| (a, r))),
         }
     }
     if reader_amounts.len() == 2 {
-        if let (Some(a), Some(b)) = (reader_amounts[0], reader_amounts[1]) {
-            if close(a, b, tol) {
+        if let (Some((a, ra)), Some((b, rb))) = (reader_amounts[0], reader_amounts[1]) {
+            if !close(a, b, tol) {
+                notes.push("readers disagree".into());
+            } else if cutoff_key(ra) != cutoff_key(rb) {
+                notes.push(format!("readers agree on {a} but not on the due cutoff ({:?} vs {:?})", cutoff_key(ra), cutoff_key(rb)));
+            } else {
                 return ("agree", Some(a), notes);
             }
-            notes.push("readers disagree".into());
         }
     }
     if let Some(tb) = &class.tiebreak {
@@ -347,10 +363,10 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, e: &Event) -> (&
             let reader_models: Vec<&str> = class.readers.iter().map(|r| r.model.as_str()).collect();
             if let Some(tr) = p.reads.iter().find(|r| !reader_models.contains(&r.model_id.as_str())) {
                 if let Some(f) = counts(tr, tb, &mut notes) {
-                    if reader_amounts.iter().flatten().any(|a| close(*a, f, tol)) {
+                    if reader_amounts.iter().flatten().any(|(a, ra)| close(*a, f, tol) && cutoff_key(ra) == cutoff_key(tr)) {
                         return ("tiebreak", Some(f), notes);
                     }
-                    notes.push(format!("tiebreak {f} matches no counting reader"));
+                    notes.push(format!("tiebreak {f} (cutoff {:?}) matches no counting reader on amount and due cutoff", cutoff_key(tr)));
                 }
             }
         }
@@ -622,7 +638,7 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
     fn agreement_tiebreak_and_routing_violations() {
         // Pending bill: 235B + claude (provider anthropic) agree on the after-cutoff figure.
         let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25)));
+        let c = cut(anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25))), "06-Feb-2026", 120.75, 150.25);
         assert!(errors(&run("a", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG)).is_empty());
 
         // Both agree on the before-cutoff figure although the cash date is after due: no accept.
@@ -634,7 +650,7 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         // Readers disagree; gemma tiebreak (distinct, @768) matches 235B's after-cutoff figure: accept.
         let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
         let c = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
-        let g = read("vlm_escalation", G, 768, 400, true, Some(150.25));
+        let g = cut(read("vlm_escalation", G, 768, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
         assert!(errors(&run("c", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c, g], "tiebreak_accept", Some(150.25)), CONFIG)).is_empty());
 
         // gemma tiebreak at 1024 px (global default instead of its own 768): not routed, no accept.
@@ -682,7 +698,7 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         assert!(e.contains(&"IA4_no_agreement") && !e.contains(&"IA13_unmapped_cutoff_field") && !e.contains(&"IA0_provenance_unreadable"), "{e:?}");
         // ...and on the after-cutoff figure: accept.
         let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", Some(120.75), Some(150.25));
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25)));
+        let c = anthropic(v2(read("vlm_fallback", C, 1024, 1500, true, Some(150.25)), "2026-02-06", Some(120.75), Some(150.25)));
         assert!(errors(&run("v2b", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG)).is_empty());
         // v2: after the cutoff with no after-cutoff amount -> nothing valid, never the by-cutoff figure.
         let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", Some(120.75), None);
@@ -697,6 +713,31 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
         let e = errors(&run("r", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
         assert!(e.contains(&"IA13_unmapped_cutoff_field"), "{e:?}");
+
+        // Analyst #317: counted reads must also agree on the parsed due cutoff.
+        // Same amount, different cutoff dates -> no accept.
+        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
+        let c = cut(anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25))), "2026-02-07", 120.75, 150.25);
+        let e = errors(&run("dc1", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA6_outcome_mismatch"), "{e:?}");
+        // Invented cutoff: one reader adds a cutoff the other page read does not have; same figure -> no accept.
+        let inv = cut(read("vlm_primary", Q, 1024, 400, true, Some(900.0)), "2023-01-01", 800.0, 900.0);
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(900.0)));
+        let e = errors(&run("dc2", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv.clone(), c.clone()], "agree", Some(900.0)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
+        // ...and a coincident tiebreak error (same figure, no cutoff) sides with the non-inventing reader: accept is legitimate.
+        let g = read("vlm_escalation", G, 768, 400, true, Some(900.0));
+        assert!(errors(&run("dc3", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv.clone(), c, g.clone()], "tiebreak_accept", Some(900.0)), CONFIG)).is_empty());
+        // Tiebreak without cutoff matching only the inventing reader (other reader failed): no accept.
+        let cf = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
+        let e = errors(&run("dc4", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv, cf, g], "tiebreak_accept", Some(900.0)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
+        // An unparseable cutoff never equals an absent one.
+        let mut q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
+        q["due_date"] = json!("CHARGED ON");
+        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
+        let e = errors(&run("dc5", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "agree", Some(812.40)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
 
         // Wrong class recorded.
         let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
