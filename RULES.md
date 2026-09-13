@@ -677,3 +677,5 @@ No rule change: a pending/scheduled row with a blank amount reserves its image a
 | `SALARY_DAY_ORDER` | debits_first | fixed_bills_after_credit | Σ\|err\| 0.366 → 0.297, E 16 = 16 |
 | `VAR_LONG_PHASE` | last_settled | from_request | Σ\|err\| 0.297 → 0.334, E 16 → 17 (tuning-negative; A/B only) |
 | `SCHEDULED_REPLACE_SCOPE` | category_window | lifecycle_or_amount | 0 tuning rows change |
+
+Engine implementation 4d52e8f (analyst-reviewed): patches `{"SALARY_DAY_ORDER":"fixed_bills_after_credit"}`, `{"VAR_LONG_PHASE":"from_request"}` (var_long_min_step 21), `{"SCHEDULED_REPLACE_SCOPE":"lifecycle_or_amount"}` (scheduled_replace_amount_pct 10). A bill counts as flexible when its stream's latest row is not `fixed`. Under A, fixed bills, scheduled rows and reserved pending debits go after the credit; variable spend, flexible bills and evidence flows stay before it. A scheduled debit with no amount does not replace the cycle. Engine tuning mean |outflow err| over the 14 amount rows: default 2.62%, A 2.13%, A+E 2.39% (E 16 → 17), A+D 2.13%. These equal this table's Σ/14 (0.366, 0.297, 0.334). Status, method and plan stay at 17 under every config.
