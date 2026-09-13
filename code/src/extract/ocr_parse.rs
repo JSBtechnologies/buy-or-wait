@@ -76,6 +76,13 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
     let mut out = Vec::new();
     let mut pending_label: Option<String> = None;
     for (is_table, row) in rows {
+        // Whether the row's own LAST cell (before empty cells are dropped below) actually held
+        // text. A wide table row can have its final ("Total") column blank (image_06: the total
+        // itself was dropped, leaving only SGST/CGST sub-columns) -- in that case the last
+        // SURVIVING fragment after filtering is NOT the row's final column and must not be
+        // trusted as one (`rightmost_amount_token` in `push_row`). Contrast image_15, whose
+        // final column is genuinely populated (its own row total, e.g. 9,580.00).
+        let last_cell_present = is_table && row.last().is_some_and(|c| !c.trim().is_empty());
         let mut cells: Vec<String> = row.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
         if cells.is_empty() {
             continue;
@@ -89,7 +96,7 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
         // the row, before the rest of this row's normal (label, value) extraction runs.
         cells.retain(|cell| {
             if let Some((label, value)) = split_words_marker(cell) {
-                push_row(&mut out, page, &label, &value, currency_hint);
+                push_row(&mut out, page, &label, &value, currency_hint, false);
                 false
             } else {
                 true
@@ -114,7 +121,7 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
         if pending_label.is_none() && cells.len() == 1 {
             if let Some((label, value)) = cells[0].split_once(':') {
                 if !label.trim().is_empty() && !value.trim().is_empty() {
-                    push_row(&mut out, page, label.trim(), value.trim(), currency_hint);
+                    push_row(&mut out, page, label.trim(), value.trim(), currency_hint, false);
                     continue;
                 }
             }
@@ -129,7 +136,7 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
             let right: Vec<&str> = cells[1].lines().map(str::trim).filter(|l| !l.is_empty()).collect();
             if left.len() > 1 && left.len() == right.len() {
                 for (label, value_raw) in left.into_iter().zip(right) {
-                    push_row(&mut out, page, label, value_raw, currency_hint);
+                    push_row(&mut out, page, label, value_raw, currency_hint, false);
                 }
                 continue;
             }
@@ -147,8 +154,12 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
             }
             continue;
         }
-        for (label, value_raw) in pairs {
-            push_row(&mut out, page, &label, &value_raw, currency_hint);
+        let last_idx = pairs.len() - 1;
+        for (i, (label, value_raw)) in pairs.into_iter().enumerate() {
+            // Only the LAST pair in the row can possibly run through to the row's own final
+            // cell; only there does `last_cell_present` mean anything (see above).
+            let allow_rightmost = last_cell_present && i == last_idx;
+            push_row(&mut out, page, &label, &value_raw, currency_hint, allow_rightmost);
         }
     }
     out
@@ -161,15 +172,24 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
 fn split_words_marker(cell: &str) -> Option<(String, String)> {
     let tokens: Vec<(usize, usize)> = token_byte_ranges(cell);
     for (i, &(start, end)) in tokens.iter().enumerate() {
-        if i == 0 || !cell[start..end].eq_ignore_ascii_case("words") {
+        if i == 0 {
+            continue;
+        }
+        // A trailing colon/punctuation glued to the token itself ("Words:") must not defeat
+        // the match -- only the leading alphabetic run of the token is compared.
+        let token = &cell[start..end];
+        let alpha_end = start + token.find(|c: char| !c.is_alphabetic()).unwrap_or(token.len());
+        if !cell[start..alpha_end].eq_ignore_ascii_case("words") {
             continue;
         }
         let (prev_start, prev_end) = tokens[i - 1];
-        if !cell[prev_start..prev_end].eq_ignore_ascii_case("in") {
+        let prev_token = &cell[prev_start..prev_end];
+        let prev_alpha_end = prev_start + prev_token.find(|c: char| !c.is_alphabetic()).unwrap_or(prev_token.len());
+        if !cell[prev_start..prev_alpha_end].eq_ignore_ascii_case("in") {
             continue;
         }
-        let label = cell[..end].trim().to_string();
-        let value = cell[end..].trim().to_string();
+        let label = cell[..alpha_end].trim().to_string();
+        let value = cell[end..].trim_start_matches(|c: char| c == ':' || c.is_whitespace()).trim().to_string();
         if !value.is_empty() {
             return Some((label, value));
         }
@@ -196,13 +216,28 @@ fn token_byte_ranges(s: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn push_row(out: &mut Vec<LabeledValue>, page: u32, label: &str, value_raw: &str, currency_hint: Option<&str>) {
+fn push_row(out: &mut Vec<LabeledValue>, page: u32, label: &str, value_raw: &str, currency_hint: Option<&str>, allow_rightmost: bool) {
     let value_raw = value_raw.trim().to_string();
     let amount = crate::extract::normalize::parse_amount(&value_raw, currency_hint, false)
         .or_else(|| join_rs_ps_cells(&value_raw, currency_hint))
-        .or_else(|| rightmost_amount_token(&value_raw, currency_hint));
+        .or_else(|| if allow_rightmost { rightmost_amount_token(&value_raw, currency_hint) } else { None });
     let date = if amount.is_none() { crate::extract::normalize::parse_date(&value_raw) } else { None };
     out.push(LabeledValue { page, label: label.trim().to_string(), value_raw, amount, date });
+}
+
+/// User ruling `ruling.total_or_witnessed_sum` point 3 (image_15): a row merged from many
+/// numeric table columns (e.g. a per-line-item breakdown with tax sub-columns) fails to parse
+/// as one amount as a whole; the correct per-row amount is the LAST (right-most) column. Only
+/// used as a last resort after a whole-string parse and a Rs/Ps cell-join both fail, AND only
+/// when the caller's `allow_rightmost` confirms the row's own final cell was actually populated
+/// (image_06: the final "Total" column was blank -- its dropped value must never be replaced by
+/// an earlier SGST/CGST sub-column that happens to survive empty-cell filtering).
+fn rightmost_amount_token(value_raw: &str, currency_hint: Option<&str>) -> Option<f64> {
+    let parts: Vec<&str> = value_raw.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    crate::extract::normalize::parse_amount(parts[parts.len() - 1], currency_hint, false)
 }
 
 /// User ruling `ruling.total_or_witnessed_sum` point 3 (image_14): a Rs/Ps amount split
@@ -223,19 +258,6 @@ fn join_rs_ps_cells(value_raw: &str, currency_hint: Option<&str>) -> Option<f64>
     let paise: f64 = last.parse().ok()?;
     let paise = if last.len() == 1 { paise * 10.0 } else { paise };
     Some(whole + paise / 100.0)
-}
-
-/// User ruling point 3 (image_15): a final-labeled row with many numeric columns (a
-/// sub-total/tax/total breakdown merged into one joined string by the row-pairing logic
-/// above) -- take the RIGHT-MOST amount, the convention this dataset's tables use for the
-/// column under a Total/Amount header. Only used once every other parse of the full joined
-/// string has already failed, so a normal single amount is never second-guessed.
-fn rightmost_amount_token(value_raw: &str, currency_hint: Option<&str>) -> Option<f64> {
-    let parts: Vec<&str> = value_raw.split_whitespace().collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    crate::extract::normalize::parse_amount(parts[parts.len() - 1], currency_hint, false)
 }
 
 fn ranges_overlap(a1: i64, a2: i64, b1: i64, b2: i64) -> bool {
@@ -338,7 +360,38 @@ fn parse_html_table(table_html: &str) -> Vec<Vec<String>> {
         rows.push(parse_html_cells(tr_body));
         rest = &rest[tr_close + "</tr>".len()..];
     }
-    rows
+    dedupe_repeated_row_blocks(rows)
+}
+
+/// Drops a contiguous block of rows that is an exact byte-for-byte repeat of the block
+/// immediately before it (image_06: the model's own transcript repeats one item row and its
+/// delivery-charge row back-to-back -- `Sr.5`/`Delivery and other charges` each appear twice,
+/// identical cell-for-cell, inflating the line-item sum by a duplicate 290.60 and breaking the
+/// `amount_in_words` witness on the true sum). Generic on row CONTENT, never an image id or
+/// position: only a block that repeats itself verbatim is ever dropped, so legitimately
+/// identical charges that are NOT adjacent repeats of the same block (image_06's four separate
+/// 1.60 delivery-charge rows, each paired with a distinct item row) are untouched. Checked at
+/// decreasing block sizes first so the largest exact repeat wins over a smaller coincidental one.
+fn dedupe_repeated_row_blocks(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    const MAX_BLOCK: usize = 8;
+    let n = rows.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let max_block = ((n - i) / 2).min(MAX_BLOCK);
+        let repeat = (1..=max_block).rev().find(|&block| rows[i..i + block] == rows[i + block..i + 2 * block]);
+        match repeat {
+            Some(block) => {
+                out.extend_from_slice(&rows[i..i + block]);
+                i += 2 * block;
+            }
+            None => {
+                out.push(rows[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn parse_html_cells(tr_body: &str) -> Vec<String> {
