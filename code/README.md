@@ -16,10 +16,10 @@ reverse-engineered numeric rules.
   overriding a variable already set in the environment. `.env` is gitignored; never
   commit it.
 - An `HF_TOKEN` environment variable holding a Hugging Face API token — **optional**
-  for the submitted pipeline (the shipped `config/models.toml` has no `[selected]`
-  VLM/LLM active, so the final run makes 0 HF calls). Needed only for the model
-  bake-off (`bakeoff`) or if a VLM/LLM is selected in `[selected]`. Never commit this
-  value; it is read from the environment only.
+  for the submitted pipeline (the shipped `config/models.toml` has no `[selected]` LLM
+  active, so the final run makes 0 HF calls). Needed only if an LLM is selected in
+  `[selected]` for message extraction. Never commit this value; it is read from the
+  environment only.
 - `../dataset/` present as shipped (this crate reads it with relative paths, so always
   run commands from this `code/` directory).
 
@@ -66,9 +66,9 @@ CARGO_TARGET_DIR=target cargo run --release -- --requests ../dataset/sample_requ
 ## OCR ingestion
 
 Every image in `../dataset/images.csv` is OCR'd at the start of the batch pipeline and
-cached at `store/ocr/<image_id>/` (cache-first; `--cold` forces a re-OCR). This replaces
-the earlier fixed-key VLM image reads (`fleet/specs/ocr_vllm_pipeline.md`); that path
-stays compiled but inactive unless `[selected].vlm_primary` is also set.
+cached at `store/ocr/<image_id>/` (cache-first; `--cold` forces a re-OCR). This is the
+only image path (`fleet/specs/ocr_vllm_pipeline.md`); the earlier fixed-key VLM image
+path and the Anthropic client were removed entirely (board:cleanup.remove_vlm_anthropic).
 
 Serving is a vLLM OpenAI-compatible endpoint — the POC runs on a RunPod H100:
 
