@@ -107,11 +107,13 @@ pub struct Selected {
     /// confirm or override this once results land.
     pub image_max_dim_px: Option<u32>,
     /// User decision `decision.vlm_setup`: `"agreement"` (two independent reads of the
-    /// image must select the same amount before it's trusted, tiebroken by `vlm_fallback`
-    /// on disagreement) or `"escalate"` (the original primary -> escalation -> fallback
-    /// chain, PLAN.md §2.3, accepting the first reconciling read). Unset defaults to
-    /// `"escalate"` — the already-tested, backward-compatible path — so `vlm_mode` must be
-    /// set explicitly to opt into agreement mode.
+    /// image must select the same amount before it's trusted, tiebroken by the class's own
+    /// distinct `tiebreak` reader on disagreement) or `"escalate"` (the original primary ->
+    /// escalation -> fallback chain, PLAN.md §2.3, accepting the first reconciling read).
+    /// Accuracy directive (analyst #276): unset now defaults to `"agreement"` -- a lone
+    /// model's internally-reconciled read is not trustworthy on its own (two same-model
+    /// image_02 reads both misread an Indian lakh grouping by 10x and still reconciled), so
+    /// `vlm_mode` must be set explicitly to `"escalate"` to opt OUT of agreement mode.
     pub vlm_mode: Option<String>,
 }
 
@@ -388,10 +390,17 @@ impl ModelsConfig {
         self.vlm_routing.tolerance.unwrap_or(MAX_AGREEMENT_TOLERANCE)
     }
 
+    /// USER DIRECTIVE (accuracy is the only focus, analyst #276: two same-model reads of
+    /// image_02 both misread an Indian lakh grouping by 10x and still reconciled internally
+    /// -- proof that a single model's reconciled read is not enough on its own). Unset (or
+    /// unrecognized) now defaults to `Agreement`, not `Escalate`: an unactivated or
+    /// half-configured `[selected]` must never silently fall back to a mode that can accept
+    /// a lone model's read. `"escalate"` is still available as an explicit, deliberate
+    /// opt-out for anyone who wants the single-reader chain back.
     pub fn vlm_mode(&self) -> VlmMode {
         match self.selected.vlm_mode.as_deref() {
-            Some("agreement") => VlmMode::Agreement,
-            _ => VlmMode::Escalate,
+            Some("escalate") => VlmMode::Escalate,
+            _ => VlmMode::Agreement,
         }
     }
 
@@ -608,19 +617,31 @@ mod tests {
         }
     }
 
+    /// Accuracy directive (analyst #276: two same-model image_02 reads both misread an
+    /// Indian lakh grouping by 10x and still reconciled internally -- proof a lone model's
+    /// reconciled read is not trustworthy on its own). Unset, or any value other than the
+    /// explicit "escalate" opt-out, must resolve to `Agreement`, never the single-reader
+    /// `Escalate` chain -- a half-configured `[selected]` must never silently expose a
+    /// single-read acceptance path.
     #[test]
-    fn vlm_mode_defaults_to_escalate_and_reads_agreement_explicitly() {
-        let escalate: ModelsConfig = toml::from_str(
+    fn vlm_mode_defaults_to_agreement_and_requires_an_explicit_escalate_opt_out() {
+        let unset: ModelsConfig = toml::from_str(
             "[decoding]\ntemperature=0.0\nseed=42\nmax_tokens_vlm=1\nmax_tokens_llm=1\n[image_preprocessing]\ncandidate_max_dimensions_px=[1]\n[candidates]\nvlm=[]\nllm=[]\n",
         )
         .unwrap();
-        assert_eq!(escalate.vlm_mode(), VlmMode::Escalate);
+        assert_eq!(unset.vlm_mode(), VlmMode::Agreement);
 
-        let agreement: ModelsConfig = toml::from_str(
+        let explicit_agreement: ModelsConfig = toml::from_str(
             "[decoding]\ntemperature=0.0\nseed=42\nmax_tokens_vlm=1\nmax_tokens_llm=1\n[image_preprocessing]\ncandidate_max_dimensions_px=[1]\n[selected]\nvlm_mode=\"agreement\"\n[candidates]\nvlm=[]\nllm=[]\n",
         )
         .unwrap();
-        assert_eq!(agreement.vlm_mode(), VlmMode::Agreement);
+        assert_eq!(explicit_agreement.vlm_mode(), VlmMode::Agreement);
+
+        let explicit_escalate: ModelsConfig = toml::from_str(
+            "[decoding]\ntemperature=0.0\nseed=42\nmax_tokens_vlm=1\nmax_tokens_llm=1\n[image_preprocessing]\ncandidate_max_dimensions_px=[1]\n[selected]\nvlm_mode=\"escalate\"\n[candidates]\nvlm=[]\nllm=[]\n",
+        )
+        .unwrap();
+        assert_eq!(explicit_escalate.vlm_mode(), VlmMode::Escalate);
     }
 
     /// Built-in routing (user decision `decision.vlm_setup`): classification comes only
