@@ -597,3 +597,83 @@ Enumerated by scratch scans (no labels used): all 215 `messages.csv` texts, all 
 - Dates: `11/08/23`→2023-08-11; `01/10/2025`→2025-10-01; `03/09/2026`→2026-09-03; `07-06-2026`→2026-06-07; `06-Feb-2026`→2026-02-06.
 - Not amounts: `08208064299`, `899763619907000`, `EMP-0001`.
 - Ambiguous day/month rule: for a slash or dash date where both parts are ≤ 12, prefer day-first (all 16 pages are day-first) and confirm it against the linked event date. If they disagree, leave the date unresolved (a flagged missing value beats a wrong one, `decision.accuracy_first`).
+
+
+---
+
+## S8. Held-out amount root-cause classes (verifier #282) → candidate rules with named toggles
+
+Method: each class is tested on tuning 01–18 with the S3 replay (the same configuration as S3.6: eom+2 horizon, bill mean of last 3, variable mean of all, IV_SKIP_DAYS=2, message salary facts), plus a structural count over all 275 users. No held-out ids or labels were used. Metric: outflow-relative error (§S3.6) and E exact. Every toggle is **default off**; the verifier A/Bs each once on held-out (`risk.overfit`).
+
+### S8.1 Class A (~56%): salary-day ordering → toggle `SALARY_DAY_ORDER`
+
+Values: `debits_first` (default, current S2.3) | `fixed_bills_after_credit` (proposed) | `bills_after_credit` | `credits_first`.
+
+```
+fixed_bills_after_credit, within one calendar day:
+    1. Interval (variable-spend) occurrences and flexible monthly bills (flexibility reducible / stoppable / reducible_or_stoppable)
+    2. credits (salary, scheduled income)
+    3. fixed monthly bills (flexibility fixed, constant or variable amount), pending / scheduled debits
+plan payments: unchanged, after every row of the day (S3.5)
+```
+
+Scope answers (lead's questions):
+- **Recurring bills vs variable spend.** Salary-day variable spend must stay *before* the credit. Tuning 04 (groceries), 13 (transport) and 18 (dining) are all binding on salary day; moving them after the credit breaks 04 (+8.7% → +26.6% safe), 13 (+5.9% → +16.3%) and 18 (−1.6% → +16.9%). So the "variable ~18%" part of class A is **not** supported by tuning, and no rule is proposed for it.
+- **Which recurring bills.** Flexibility separates the cases. The salary-day bill the labels exclude is `fixed` (06 "Monthly entertainment spend", 15 "Food delivery membership"). The one the label keeps is `reducible` (02 "Cinema and events"). Moving *all* bills after the credit (`bills_after_credit`) breaks 02 (−0.9% → +8.2% outflow).
+- **Salary row status.** Not a discriminator on tuning: 02/06/15/18 are projected streams, and the only scheduled salary (13) coincides with a variable debit, which stays before the credit either way.
+- **Plan payments:** unaffected (S3.5 already pays after the day's rows).
+
+Tuning evidence (outflow err, E exact):
+
+| config | E exact | Σ\|outflow err\| | 02 | 06 | 15 | 18 | 04 | 13 |
+|---|---|---|---|---|---|---|---|---|
+| debits_first (default) | 16 | 0.366 | −0.9% | −7.6% | −2.9% | −1.2% | +5.6% | +2.4% |
+| **fixed_bills_after_credit** | 16 | **0.297** | −0.9% | **−0.9%** | +2.7% | −1.2% | +5.6% | +2.4% |
+| bills_after_credit | 16 | 0.370 | +8.2% | −0.9% | +2.7% | −1.2% | +5.6% | +2.4% |
+| credits_first | 16 | 0.640 | +8.2% | −0.9% | +2.7% | +12.5% | +17.0% | +6.7% |
+
+No tuning row gets worse in magnitude under `fixed_bills_after_credit` (15 changes sign at the same size, −2.9% → +2.7%). Structure: 29 users have a fixed monthly bill on a salary day-of-month (tuning 2, held-out 3, eval 24).
+
+### S8.2 Class E (~28%): long-interval variable-spend phase → toggle `VAR_LONG_PHASE`
+
+Values: `last_settled` (default: next = last + step) | `from_request` (for step ≥ 21: first occurrence at rd + IV_SKIP_DAYS, then every step) | `rate` (for step ≥ 21: amount/step per day from rd + IV_SKIP_DAYS).
+
+Tuning evidence (with `SALARY_DAY_ORDER=fixed_bills_after_credit`; tuning users with ≥21-day streams: 02, 03, 07, 09, 11, 12):
+
+| config | E exact | Σ\|outflow err\| | 02 | 03 | 07 | 11 |
+|---|---|---|---|---|---|---|
+| last_settled (default) | 16 | 0.297 | −0.9% | +4.6% | −1.8% | −0.7% (E ✗) |
+| from_request | **17** | 0.334 | **−8.6%** | **+0.6%** | −1.8% | −0.7% (**E ✓**) |
+| rate | 16 | 0.373 | −4.2% | +5.6% | +2.7% | +3.1% |
+| sub-cadence 14 (rate-preserving) | 16 | 0.380 | −6.1% | +4.1% | −4.1% | +2.0% |
+
+Verdict: **no variant generalizes on tuning.** `from_request` fixes 03 and 11's E but breaks 02; the same "6 days since the last occurrence" shape (02 dining, 03 transport) needs opposite treatment. Offer `from_request` to the verifier as a single held-out A/B, with the tuning cost stated; do not change the default on tuning evidence. Structure: 86 users have a ≥21-day variable stream (tuning 6, held-out 2, eval 78), so a wrong global change is expensive.
+
+### S8.3 Class D (~8%): scheduled-row replacement too broad → toggle `SCHEDULED_REPLACE_SCOPE`
+
+Values: `category_window` (default, S3.4c: same category, ±15 days) | `lifecycle_or_amount` (proposed).
+
+```
+lifecycle_or_amount: a scheduled DEBIT replaces the stream occurrence in its cycle only if
+    (a) it has linked_event_id (it is the retry / lifecycle of an earlier row of that bill), or
+    (b) |amount − stream estimate| <= 10% of the estimate
+  otherwise it is an additional one-off on its own date (both count).
+scheduled salary credits keep category_window replacement (tuning 13/17 and request_86 shape need it).
+```
+
+Structural evidence, all 13 scheduled non-salary debits that meet a same-category monthly occurrence within ±15 days (275 users):
+- 7 `Scheduled bill payment retry` rows, **all linked** to a failed attempt, amount within 0–11% of the stream (13,800 vs 13,765.59; 166 vs 167.65; 82 vs 84.24; 129 vs 116.08; 73 vs 75.91; 42 vs 41.26), 0–4 days from the projection → genuinely that cycle's bill: replace.
+- 6 unlinked rows differ by 19–55% and fall 4–6 days before the projection: `Scheduled utility debit` 4,830 vs 7,964.82, 1,964.60 vs 2,359.63, 1,335,700 vs 2,783,858.84, 1,806,900 vs 2,556,144.70; `Scheduled insurance payment` 6,080 vs 4,790 (plus one held-out row of the same shape); `Scheduled school fee` 3,517.80 vs 2,945.80. The verifier's class says the labels keep both → additive.
+- Tuning has 0 rows of either shape (tuning 04's scheduled school fee has no stream to replace), so there is no tuning cost; the evidence is structural plus conflict rule 4 (keeping both is the financially safer reading).
+
+### S8.4 Class B (~6.5%): unreserved blank-amount pending bill
+
+No rule change: a pending/scheduled row with a blank amount reserves its image amount once the agreement path accepts one (S5; images 02/05/10/11 are the cash-moving set). Until then the row is `missing_amounts` and flagged, never 0 (`decision.accuracy_first`).
+
+### S8.5 Hand-off
+
+| toggle | default | proposed value to A/B | expected tuning effect |
+|---|---|---|---|
+| `SALARY_DAY_ORDER` | debits_first | fixed_bills_after_credit | Σ\|err\| 0.366 → 0.297, E 16 = 16 |
+| `VAR_LONG_PHASE` | last_settled | from_request | Σ\|err\| 0.297 → 0.334, E 16 → 17 (tuning-negative; A/B only) |
+| `SCHEDULED_REPLACE_SCOPE` | category_window | lifecycle_or_amount | 0 tuning rows change |
