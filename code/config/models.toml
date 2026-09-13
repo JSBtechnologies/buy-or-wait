@@ -332,18 +332,20 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 # default is the fix for Kimi-K3 as a thinking model, PLAN.md §3 -- see
 # docs/bakeoff.md "Backup models" for the probe evidence).
 #
-# `pending_bill_due_date` excludes gemma-4-31B-it as escalation reader:
-# analyst's pre-audit (board:verify.image_agree_preaudit) found it drops
-# due-date fields on that document shape 4/4, silently falling back to the
-# pre-cutoff amount even when the correct, later, larger figure applies
-# (image_05) -- so that class routes to vlm_fallback instead. Board decision
-# .vlm_routing_v2: Kimi-K3 OUT (failed the backup gate), claude-opus-5 IN
-# (role resolves via [selected].vlm_fallback above, updated to match).
-# claude-opus-5's max_tokens=4000 follows the lead's spec (adaptive thinking
-# is on by default on Opus 5 and counts toward output, same class of problem
-# as Kimi-K3's reasoning-token truncation); max_dim_px=1024 is a default
-# match to vlm_primary, not yet screened for claude-opus-5 specifically --
-# a known gap, same as Kimi-K3's was.
+# Per-class tiebreak assignment (board decision.tiebreak_distinct, confirmed
+# by the lead): each class gets a DISTINCT second reader rather than reusing
+# the same one everywhere. `pending_bill_due_date` -> gemma-4-31B-it: despite
+# analyst's pre-audit finding it drops due-date fields on that shape 4/4
+# (falling back to the pre-cutoff amount, e.g. image_05's 704.05), the
+# selector only accepts a gemma read when it satisfies the due-date cutoff
+# rule -- a wrong pre-cutoff read can never be selected, worst case is
+# disagreement -> missing, which board decision.accuracy_first explicitly
+# prefers over a wrong value. `settled_expense_receipt` (default) ->
+# claude-opus-5 (board decision.vlm_routing_v2/claude_backup: Kimi-K3 OUT,
+# failed the backup gate; claude-opus-5 IN). claude-opus-5's max_tokens=4000
+# follows the lead's spec (adaptive thinking is on by default on Opus 5 and
+# counts toward output); max_dim_px=1024 is a default match to vlm_primary,
+# not yet screened for claude-opus-5 specifically -- a known gap.
 # ---------------------------------------------------------------------------
 
 [vlm_routing]
@@ -370,9 +372,15 @@ name = "pending_bill_due_date"
 event_types = []
 statuses = ["pending", "scheduled"]
 categories = []
+# Tiebreak = gemma (board decision.tiebreak_distinct, confirmed by the lead
+# despite gemma's known due-date-field weakness on this shape): a gemma read
+# only counts if it satisfies the due-date cutoff rule in the selector, so a
+# wrong pre-cutoff read (e.g. image_05's 704.05) can never be selected as
+# correct -- worst case is disagreement -> missing, which accuracy-first
+# (board decision.accuracy_first) explicitly accepts over a wrong value.
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
-  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 },
+  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
 ]
 
 [[vlm_routing.classes]]
@@ -380,7 +388,10 @@ name = "settled_expense_receipt"
 event_types = []
 statuses = ["settled"]
 categories = []
+# Tiebreak = claude-opus-5 (board decision.tiebreak_distinct): the default/
+# most common class gets the Claude backup as its distinct second reader
+# rather than reusing gemma on every class.
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
-  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
+  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 },
 ]
