@@ -267,3 +267,31 @@ fn income_date_moved_reanchors_every_later_month() {
     assert_eq!(run("2025-08-23", "2025-08-05"), vec![d("2025-08-23"), d("2025-09-23"), d("2025-10-23")]);
     assert_eq!(run("2025-08-31", "2025-08-05"), vec![d("2025-08-31"), d("2025-09-30"), d("2025-10-31")]);
 }
+
+/// board decision.accuracy_first: malformed forecast-level facts are rejected and recorded,
+/// never half-applied; a valid one is kept.
+#[test]
+fn malformed_forecast_facts_are_rejected_not_applied() {
+    use super::ledger::{EvidenceRecord, EvidenceSource, Fact};
+    let at = d("2025-08-01").and_hms_opt(9, 0, 0).unwrap();
+    let rec = |id: &str, fact: Fact| EvidenceRecord {
+        record_id: id.into(),
+        source: EvidenceSource::Message { source_type: "employer".into() },
+        observed_at: at,
+        fact,
+    };
+    let evidence = vec![
+        rec("ok", Fact::IncomeAmountChange { category: "salary".into(), amount: Money::from_units(10), currency: "INR".into(), effective: d("2025-09-01") }),
+        rec("zero", Fact::IncomeStarts { category: "salary".into(), amount: Money::ZERO, currency: "INR".into(), first_date: d("2025-09-01") }),
+        rec("no_rate", Fact::NextIncomeAmount { category: "salary".into(), amount: Money::from_units(10), currency: "GBP".into(), date: None }),
+        rec("both", Fact::ExpenseAmountChange { category: "rent".into(), amount: Some(Money::from_units(1)), percent: Some(5.0), currency: None, effective: None }),
+        rec("pct", Fact::ExpenseAmountChange { category: "rent".into(), amount: None, percent: Some(-150.0), currency: None, effective: None }),
+        rec("nocat", Fact::IncomeEnded { category: " ".into(), effective: d("2025-09-01"), description: None }),
+    ];
+    let ledger = Ledger::build("INR", &[], &evidence, &RateTable::default(), &Rules::default());
+    let kept: Vec<&str> = ledger.adjustments.iter().map(|a| a.record_id.as_str()).collect();
+    let mut rejected: Vec<&str> = ledger.rejected.iter().map(|r| r.record_id.as_str()).collect();
+    rejected.sort();
+    assert_eq!(kept, vec!["ok"]);
+    assert_eq!(rejected, vec!["both", "no_rate", "nocat", "pct", "zero"]);
+}
