@@ -164,6 +164,11 @@ struct Args {
     /// selector fix) against already-obtained model outputs. Requires the
     /// same `--cache-dir` used for the original run.
     rescore_from_cache: bool,
+    /// `--image-prompt <filename>`: which file under `--prompts-dir` to load
+    /// for image transcription. Defaults to v1 for backward compatibility;
+    /// the v2 re-read (board `finding.image05_root_cause`) passes
+    /// `image_transcription.v2.md`.
+    image_prompt: String,
 }
 
 fn parse_args() -> Args {
@@ -187,6 +192,7 @@ fn parse_args() -> Args {
         runs: get("runs", "5").parse().unwrap_or(5),
         fixed_resolution: map.get("fixed-resolution").and_then(|v| v.parse().ok()),
         rescore_from_cache: get("rescore-from-cache", "false") == "true",
+        image_prompt: get("image-prompt", "image_transcription.v1.md"),
     }
 }
 
@@ -508,7 +514,20 @@ struct VlmCandidateReport {
     stats: RunStats,
     stability_rate: f64,
     pricing: Pricing,
+    /// True only when the circuit breaker tripped before a single usable
+    /// call succeeded (zero real data at all) -- the whole row renders as
+    /// UNAVAILABLE. Distinct from `partial_note` below: a candidate that got
+    /// SOME real data before tripping must never have that data discarded
+    /// (lead directive, board:blocker.anthropic_usage_limit -- "real data
+    /// must never be discarded").
     unavailable: bool,
+    /// Set when the circuit breaker stopped the run early but real data was
+    /// already gathered (e.g. a mid-run rate/usage-limit wall): describes
+    /// exactly how much of the requested N runs actually completed, so the
+    /// report never silently presents a partial N as a full one. `None` for
+    /// both a fully unavailable candidate and a candidate that completed
+    /// every requested run.
+    partial_note: Option<String>,
     selector_results: Vec<PerImageSelectorResult>,
 }
 
@@ -690,9 +709,15 @@ fn run_vlm_candidate(
     // --- full pass at chosen resolution: N runs over all 16 images ---
     let mut stats = RunStats::default();
     let mut per_image_outputs: HashMap<String, Vec<Option<Value>>> = HashMap::new();
+    // Set when the circuit breaker trips mid-run so the caller can report
+    // exactly how far the candidate got, rather than silently discarding
+    // whatever real data was already gathered (lead directive,
+    // board:blocker.anthropic_usage_limit).
+    let mut stopped_early: Option<String> = None;
     if !unavailable {
         consecutive_failures = 0;
         'runs: for run_idx in 0..runs {
+            let mut images_done_this_run = 0usize;
             for img in &gold.images {
                 eprintln!("  [{}] run {}/{runs}: calling {} ...", candidate.id, run_idx + 1, img.image_id);
                 let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
@@ -701,6 +726,7 @@ fn run_vlm_candidate(
                 let parsed = match outcome {
                     Ok((parsed, usage)) => {
                         consecutive_failures = 0;
+                        images_done_this_run += 1;
                         stats.record_usage(&usage);
                         if parsed.is_some() {
                             stats.valid_json += 1;
@@ -717,8 +743,22 @@ fn run_vlm_candidate(
                         stats.record_failure();
                         consecutive_failures += 1;
                         if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
-                            eprintln!("  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> marking unavailable, skipping rest", candidate.id);
-                            unavailable = true;
+                            eprintln!(
+                                "  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> stopping early (run {}/{runs}, {images_done_this_run}/{} images done this run); preserving real data gathered so far, never discarding it",
+                                candidate.id, run_idx + 1, gold.images.len()
+                            );
+                            stopped_early = Some(if run_idx == 0 {
+                                format!(
+                                    "stopped mid-run 1/{runs} after {images_done_this_run}/{} images (0 complete runs) -- {CIRCUIT_BREAKER_THRESHOLD} consecutive call failures",
+                                    gold.images.len()
+                                )
+                            } else {
+                                format!(
+                                    "runs 1-{run_idx} complete + run {}/{runs} stopped after {images_done_this_run}/{} images -- {CIRCUIT_BREAKER_THRESHOLD} consecutive call failures",
+                                    run_idx + 1,
+                                    gold.images.len()
+                                )
+                            });
                             break 'runs;
                         }
                         None
@@ -737,6 +777,15 @@ fn run_vlm_candidate(
             }
         }
     }
+    // The circuit breaker tripping mid-run means unavailable (zero real data
+    // at all -- e.g. the very first call failed) only when NOTHING usable
+    // was gathered; any candidate with at least one successful call keeps
+    // its real stats/selector_results and is reported as partial, never
+    // discarded wholesale (lead directive, board:blocker.anthropic_usage_limit).
+    if stopped_early.is_some() && stats.calls == stats.failed_calls {
+        unavailable = true;
+    }
+    let partial_note = if unavailable { None } else { stopped_early };
 
     // stability: fraction of images whose N parsed outputs are all identical
     let mut stable_images = 0usize;
@@ -802,6 +851,7 @@ fn run_vlm_candidate(
             stability_rate,
             pricing: candidate.pricing_usd_per_m_tokens.clone(),
             unavailable,
+            partial_note,
             selector_results,
         },
         unlabeled_first_run,
@@ -1026,9 +1076,14 @@ fn render_vlm_section(
             r.stats.avg_prompt_tokens() as u64,
             r.stats.avg_completion_tokens() as u64,
         );
+        let id_cell = if r.partial_note.is_some() {
+            format!("{} \u{26a0}\u{fe0f} PARTIAL/rate-limited", r.id)
+        } else {
+            r.id.clone()
+        };
         s.push_str(&format!(
             "| {} | {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.0} | {:.0} | {:.0} | ${:.5} | ${:.4} |\n",
-            r.id,
+            id_cell,
             r.provider,
             r.chosen_max_dim,
             r.stats.field_acc.rate() * 100.0,
@@ -1041,6 +1096,14 @@ fn render_vlm_section(
             cost_per_item,
             cost_per_item * FULL_RUN_IMAGES as f64,
         ));
+    }
+    for r in vlm {
+        if let Some(note) = &r.partial_note {
+            s.push_str(&format!(
+                "\n\u{26a0}\u{fe0f} **`{}` is PARTIAL, not a full N={runs} run** ({note}). All numbers above for this row are real (never discarded), computed only over the calls that actually succeeded before the stop -- treat them as a smaller-N spot check, not a stability claim at the requested N.\n",
+                r.id
+            ));
+        }
     }
     s.push_str(&format!(
         "\n**Note on labeled-image count:** this run scored against {labeled_count} labeled images (the gold subset actually loaded for this run — see the file/commit noted above). An earlier posted table said \"5 labeled\" from a stale binary whose report-header text hadn't picked up extraction's image_10/image_11 addition yet; the underlying field-accuracy numbers in that run were already computed against every image with `expected_figures` present, so only the header text was wrong, not the scoring.\n\n"
@@ -1227,7 +1290,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("parsing {}", args.gold_subset.display()))?;
 
     let image_prompt = load_prompt(
-        &args.prompts_dir.join("image_transcription.v1.md"),
+        &args.prompts_dir.join(&args.image_prompt),
         "User prompt template",
     )?;
     let message_prompt = load_prompt(
@@ -1281,6 +1344,7 @@ fn main() -> Result<()> {
             stability_rate: 0.0,
             pricing: candidate.pricing_usd_per_m_tokens.clone(),
             unavailable: true,
+            partial_note: None,
             selector_results: Vec::new(),
         }
     }

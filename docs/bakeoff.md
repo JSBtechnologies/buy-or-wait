@@ -301,6 +301,93 @@ call), but the same "no fabricated confidence" rule applies: GLM-5.3's
    evidence gathered so far, though LLM backup selection is lower-stakes
    given msg_86 is the only production LLM call.
 
+## Step 3a — v2-prompt re-read (routing v2 finalists, 2026-09-13)
+
+Board `finding.image05_root_cause`: v1's due-date schema had an inverted name/type
+pairing (`amount_due_before_date` numeric, `..._value` the date string;
+`amount_due_after_date` reads as a date name but is numeric). v2
+(`prompts/image_transcription.v2.md`) replaces the trio with an unambiguous
+`due_cutoff_date`/`amount_due_by_cutoff`/`amount_due_after_cutoff` schema. This
+section re-reads the 3 routing-v2 candidates (`Qwen3-VL-235B@1024`,
+`gemma-4-31B-it@768`, `claude-opus-5@1024`) against v2, all 16 images,
+production prompt + production cache path + production selector
+(`buyorwait::extract::images::{select, reconciles}`, extraction head `422a110`).
+
+**Headline result: the v1 image_05 bug is fixed.** Every one of the 3 candidates
+now reads image_05's after-cutoff amount as `822.05` (the correct figure) —
+`gemma-4-31B-it` 5/5 stable and correct (versus 0/5 under v1, where it wrote the
+cutoff date into both date-named fields and had no slot left for the amount).
+`Qwen-235B` and `claude-opus-5` also read image_05 correctly. **0 false accepts
+on image_05 across all 3 candidates.**
+
+| Model | Provider | Res. (px) | N | Field acc. (7 labeled) | Valid-JSON | Stability (16 img) | Selected-figure acc. | Selected-figure stability | Reconciliation | Avg in/out tok | Est. cost/item | Est. cost/16-img run |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen/Qwen3-VL-235B-A22B-Instruct | deepinfra | 1024 | 5 (full) | 63.0% | 100.0% | 12.5% | 83.3% (5/6) | 83.3% (5/6) | 100.0% | 984/184 | $0.00036 | $0.0057 |
+| google/gemma-4-31B-it | deepinfra | 768 | 5 (full) | 71.1% | 100.0% | 87.5% | **100.0% (6/6)** | 100.0% (6/6) | 100.0% | 614/171 | $0.00014 | $0.0023 |
+| claude-opus-5 | anthropic | 1024 | **1 (partial, rate-limited — see below)** | 76.2% | 100.0% | 100.0%* | 100.0% (6/6) | 100.0%* | 100.0% | 1418/423 | $0.01764 | $0.2822 |
+
+\* claude-opus-5's stability/valid-JSON at N=1 is trivially 100% (nothing to
+disagree with itself across) — not a real stability claim, just what one real
+read looked like.
+
+**⚠ claude-opus-5 is PARTIAL, not a full N=5 run.** Mid-run 3/5 (image_14) the
+Anthropic API returned HTTP 400 "You have reached your specified API usage
+limits. You will regain access on 2026-10-01 at 00:00 UTC." — an
+**organization-level spend/usage cap set in the Anthropic Console, not
+session-scoped, only the account owner can raise it** (confirmed by the lead,
+escalated to the user; board `blocker.anthropic_usage_limit`). Runs 1-2 (all 16
+images) completed live before the cap hit; the table above is a
+`--rescore-from-cache` pass (zero new Anthropic calls, per "do not retry
+Anthropic" directive) reading back whichever real v2 response is currently
+cached per image — real data, but N=1, not N=5. `bakeoff.rs` was patched
+(this commit) so a future circuit-break preserves whatever real stats were
+gathered before it trips, instead of discarding the whole candidate as
+`UNAVAILABLE` — a partial candidate now renders its real (smaller-N) numbers
+with an explicit "PARTIAL/rate-limited" marker and a footnote naming exactly
+how far it got, per the lead's "real data must never be discarded" directive.
+
+**Image_02 note:** Qwen-235B's stability dropped to 12.5% under v2 — 1 of 5
+runs returned `null` for `balance_due` on image_02 (the other 4 agreed on
+100000.00, the correct figure); still scored `correct()` since consensus wins
+ties, but a real, newly-observed instability worth flagging, distinct from the
+3 known selector-bug images (⚠ image_07/11/12) called out elsewhere in this doc.
+
+Full per-image detail and the resolution-sweep line for each candidate are in
+the scratch reports this table was compiled from (not committed —
+`--rescore-from-cache`/live runs against `store/bakeoff_cache_v2`,
+reproducible from this commit's `bakeoff.rs` + `config/models.toml` + v2
+prompt).
+
+### Agreement outcome under routing v2 (per-image trace)
+
+Not a live `resolve_blank_amount(vlm_mode=agreement)` call (claude-opus-5 is
+rate-limited, board `blocker.anthropic_usage_limit`) — a manual trace of
+`extract::images::resolve_blank_amount_agreement`'s actual rule (two primary
+readers must agree within `agreement_tolerance()`; on disagreement or a
+missing primary read, the class's distinct `tiebreak` reader must match one
+primary within tolerance) applied to the real per-image reads collected
+above (Qwen-235B's 5th/last cached value where a run disagreed; claude-opus-5's
+single real cached read). Event class per image from `docs/gold_subset.json`'s
+`event_context`, routed per `code/config/models.toml`'s `[vlm_routing]`
+PENDING ACTIVATION block (routing v2).
+
+| Image | Class | Readers (primary pair) | Tiebreak | Outcome | Evidence | Gold | False accept? |
+|---|---|---|---|---|---|---|---|
+| image_01 | income_payslip | Qwen-235B=4365000, gemma=4365000 | claude (not needed) | agree | 4365000.00 | 4365000.00 | no |
+| image_02 | pending_bill_due_date | Qwen-235B=100000, claude=100000 | gemma (not needed) | agree | 100000.00 | 100000.00 | no |
+| image_03 | settled_expense_receipt | Qwen-235B=41272, gemma=41272 | claude (not needed) | agree | 41272.00 | 41272.00 | no |
+| image_05 | pending_bill_due_date | Qwen-235B=822.05, claude=822.05 | gemma (not needed) | agree | 822.05 | 822.05 | no |
+| image_10 | pending_bill_due_date | Qwen-235B=79679.26, claude=79679.26 | gemma (not needed) | agree | 79679.26 | 79679.26 | no |
+| image_11 ⚠ | pending_bill_due_date | Qwen-235B=null (known selector bug), claude=3650 | gemma=3650 -> matches claude | **tiebreak_accept** | 3650.00 | 3650.00 | no |
+
+**0 false accepts across all 6 labeled images under routing v2.** 4 of 6
+resolve on primary-pair agreement alone; image_11 is the one case that needs
+the tiebreak — and it recovers the correct figure precisely because the
+tiebreak reader (`decision.tiebreak_distinct`) is a genuinely different model
+from the failing primary, not Qwen re-asked. Once claude-opus-5's cap lifts,
+re-run this mechanically via `resolve_blank_amount` in agreement mode to
+confirm the trace rather than trust it by hand.
+
 ## Future refinement: fine-tuning / LoRA adapters
 
 Out of scope for this submission, but the natural next step if VLM figure

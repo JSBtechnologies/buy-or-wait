@@ -447,6 +447,7 @@ impl Pricing {
 struct ModelTotals {
     provider: String,
     calls: u64,
+    cache_hits: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
     cost_usd: f64,
@@ -475,6 +476,9 @@ pub fn render_usage_report(
             ..Default::default()
         });
         entry.calls += 1;
+        if r.cache_hit {
+            entry.cache_hits += 1;
+        }
         entry.prompt_tokens += r.prompt_tokens;
         entry.completion_tokens += r.completion_tokens;
         if let Some(p) = pricing.get(&r.model_id) {
@@ -483,6 +487,7 @@ pub fn render_usage_report(
     }
 
     let total_calls: u64 = by_model.values().map(|m| m.calls).sum();
+    let total_cache_hits: u64 = by_model.values().map(|m| m.cache_hits).sum();
     let total_prompt: u64 = by_model.values().map(|m| m.prompt_tokens).sum();
     let total_completion: u64 = by_model.values().map(|m| m.completion_tokens).sum();
     let total_tokens = total_prompt + total_completion;
@@ -506,6 +511,14 @@ pub fn render_usage_report(
     s.push_str(&format!("- Input tokens: {total_prompt}\n"));
     s.push_str(&format!("- Output tokens: {total_completion}\n"));
     s.push_str(&format!("- Total tokens: {total_tokens}\n"));
+    if total_calls > 0 {
+        s.push_str(&format!(
+            "- Cache hit rate: {:.1}% ({total_cache_hits}/{total_calls} calls served from the \u{a7}2.11 disk cache, 0 tokens/cost)\n",
+            100.0 * total_cache_hits as f64 / total_calls as f64
+        ));
+    } else {
+        s.push_str("- Cache hit rate: N/A (0 calls)\n");
+    }
     if total_requests > 0 {
         s.push_str(&format!(
             "- Avg tokens per request: {:.1}\n",
@@ -530,11 +543,11 @@ pub fn render_usage_report(
 
     s.push_str("## Per-model breakdown\n\n");
     s.push_str(
-        "| Model | Provider | Calls | Input tokens | Output tokens | Total tokens | Avg tokens/call | Est. cost |\n",
+        "| Model | Provider | Calls | Cache hits | Input tokens | Output tokens | Total tokens | Avg tokens/call | Est. cost |\n",
     );
-    s.push_str("|---|---|---|---|---|---|---|---|\n");
+    s.push_str("|---|---|---|---|---|---|---|---|---|\n");
     if by_model.is_empty() {
-        s.push_str("| — | — | 0 | 0 | 0 | 0 | 0.0 | $0.000000 |\n");
+        s.push_str("| — | — | 0 | 0 (—) | 0 | 0 | 0 | 0.0 | $0.000000 |\n");
     } else {
         for (model_id, m) in &by_model {
             let total = m.prompt_tokens + m.completion_tokens;
@@ -544,9 +557,10 @@ pub fn render_usage_report(
             } else {
                 "N/A (no pricing on file)".to_string()
             };
+            let hit_rate = if m.calls == 0 { 0.0 } else { 100.0 * m.cache_hits as f64 / m.calls as f64 };
             s.push_str(&format!(
-                "| {model_id} | {} | {} | {} | {} | {} | {avg_per_call:.1} | {cost_cell} |\n",
-                m.provider, m.calls, m.prompt_tokens, m.completion_tokens, total
+                "| {model_id} | {} | {} | {} ({hit_rate:.1}%) | {} | {} | {} | {avg_per_call:.1} | {cost_cell} |\n",
+                m.provider, m.calls, m.cache_hits, m.prompt_tokens, m.completion_tokens, total
             ));
         }
     }
@@ -555,8 +569,9 @@ pub fn render_usage_report(
     } else {
         total_tokens as f64 / total_calls as f64
     };
+    let overall_hit_rate = if total_calls == 0 { 0.0 } else { 100.0 * total_cache_hits as f64 / total_calls as f64 };
     s.push_str(&format!(
-        "| **Overall** | — | {total_calls} | {total_prompt} | {total_completion} | {total_tokens} | {overall_avg:.1} | ${total_cost:.6} |\n",
+        "| **Overall** | — | {total_calls} | {total_cache_hits} ({overall_hit_rate:.1}%) | {total_prompt} | {total_completion} | {total_tokens} | {overall_avg:.1} | ${total_cost:.6} |\n",
     ));
 
     s
