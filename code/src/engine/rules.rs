@@ -353,7 +353,8 @@ impl Default for Rules {
             variable_horizon: None,
             same_day_order: DayOrder::DebitsFirst,
             same_day_placement: SameDayPlacement::default(),
-            salary_day_order: SalaryDayOrder::DebitsFirst,
+            // User decision (lead): S8 A default on after held-out A/B.
+            salary_day_order: SalaryDayOrder::FixedBillsAfterCredit,
             payment_timing: PaymentTiming::AfterDayRows,
             reserve_pending_on_request_date: false,
             ignore_scheduled_before_request_date: true,
@@ -372,7 +373,8 @@ impl Default for Rules {
             stop_income_after_missed_occurrence: true,
             scheduled_replaces_cycle: true,
             scheduled_replacement_window_days: 15,
-            scheduled_replace_scope: ScheduledReplaceScope::CategoryWindow,
+            // User decision (lead): S8 D default on after held-out A/B.
+            scheduled_replace_scope: ScheduledReplaceScope::LifecycleOrAmount,
             scheduled_replace_amount_pct: 10,
             seeded_salary_stream: true,
             final_payroll_stops_income: true,

@@ -72,6 +72,11 @@ fn forecast_for(events: &[Event], rd: &str) -> Forecast {
     forecast_with(events, rd, &Rules::default())
 }
 
+/// RULES S2.3 ordering (every debit before same-day credits), the pre-S8 default.
+fn debits_first() -> Rules {
+    Rules { salary_day_order: super::rules::SalaryDayOrder::DebitsFirst, ..Rules::default() }
+}
+
 fn forecast_with(events: &[Event], rd: &str, rules: &Rules) -> Forecast {
     let rates = Arc::new(RateTable::default());
     let ledger = Ledger::build("INR", events, &[], rates.as_ref(), rules);
@@ -223,19 +228,30 @@ fn request_44_scheduled_utility_projected_once() {
     let events = model::load_financial_events(ds.join("financial_events.csv")).unwrap();
     let rates = Arc::new(RateTable::from_model(&model::load_exchange_rates(ds.join("exchange_rates.csv")).unwrap()));
     let req = model::load_requests(ds.join("requests.csv")).unwrap().into_iter().find(|r| r.request_id == "request_44").unwrap();
-    let session = Session::from_model(&req.user_id, &profiles, &events, rates, Rules::default()).unwrap();
-    let dec = session.decide(&req.request_id, req.request_date, &RequestSpec::from_model(&req), &[]).unwrap();
-    let flows = &dec.baseline.flows;
-    let scheduled: Vec<_> = flows.iter().filter(|f| matches!(f.source, FlowSource::Scheduled { .. })).collect();
-    assert!(scheduled.iter().any(|s| s.category == "utilities" && s.date == d("2025-02-11")));
-    for s in scheduled {
-        let doubles: Vec<_> = flows
+    let run = |rules: Rules| {
+        let session = Session::from_model(&req.user_id, &profiles, &events, rates.clone(), rules).unwrap();
+        let dec = session.decide(&req.request_id, req.request_date, &RequestSpec::from_model(&req), &[]).unwrap();
+        let flows = dec.baseline.flows.clone();
+        let scheduled: Vec<_> = flows.iter().filter(|f| matches!(f.source, FlowSource::Scheduled { .. })).cloned().collect();
+        assert!(scheduled.iter().any(|s| s.category == "utilities" && s.date == d("2025-02-11")));
+        scheduled
             .iter()
-            .filter(|f| matches!(f.source, FlowSource::Stream { .. }) && f.category == s.category && f.amount.0.signum() == s.amount.0.signum())
-            .filter(|f| (f.date - s.date).num_days().abs() <= 15)
-            .collect();
-        assert!(doubles.is_empty(), "{} {:?} doubled by {:?}", s.category, s.date, doubles);
-    }
+            .map(|s| {
+                let near = flows
+                    .iter()
+                    .filter(|f| matches!(f.source, FlowSource::Stream { .. }) && f.category == s.category && f.amount.0.signum() == s.amount.0.signum())
+                    .filter(|f| (f.date - s.date).num_days().abs() <= 15)
+                    .count();
+                (s.category.clone(), near)
+            })
+            .collect::<Vec<_>>()
+    };
+    // S3.4(c) category_window: the scheduled row replaces the cycle, never doubled.
+    let rules = Rules { scheduled_replace_scope: super::rules::ScheduledReplaceScope::CategoryWindow, ..Rules::default() };
+    assert!(run(rules).iter().all(|(_, n)| *n == 0));
+    // S8.3 lifecycle_or_amount (default): the unlinked utility row is 39% off the stream
+    // estimate, so it is additive: exactly one stream occurrence stays next to it.
+    assert!(run(Rules::default()).iter().any(|(c, n)| c == "utilities" && *n == 1));
 }
 
 /// RULES S6.1 (extraction #125): IncomeDateMoved re-anchors ALL later months, not only the
@@ -306,7 +322,7 @@ fn trough_drivers_reconcile_to_the_trough() {
     let mut events = history(EventType::Income, "Payroll credit", "salary", Direction::Credit, 5000.0, 15, 1);
     events.extend(history(EventType::Expense, "Monthly rent", "rent", Direction::Debit, 3000.0, 3, 11));
     events.extend(history(EventType::Expense, "Clinic payment", "healthcare", Direction::Debit, 800.0, 15, 21));
-    let f = forecast_for(&events, "2025-08-01");
+    let f = forecast_with(&events, "2025-08-01", &debits_first());
     let (trough, tdate) = f.trough();
     let drivers = f.trough_drivers();
     let total: Money = drivers.iter().map(|d| d.total).sum();
@@ -329,7 +345,7 @@ fn same_day_placement_per_debit_kind() {
         flow("2025-08-15", -200, "utilities", FlowSource::Stream { stream_id: "rec:debit:utilities:Bill".into() }),
         flow("2025-08-15", 1000, "salary", FlowSource::Stream { stream_id: "rec:credit:salary:Payroll".into() }),
     ];
-    let mut rules = Rules::default();
+    let mut rules = debits_first();
     let build = |rules: &Rules| {
         Forecast::from_flows_placed(start, Money::from_units(600), Money::ZERO, Money::ZERO, flows.clone(), 31, &|f| {
             rules.placement_of(super::forecast::debit_kind(f, &[]))
@@ -350,7 +366,8 @@ fn same_day_placement_per_debit_kind() {
         assert_eq!(fc.opening_balance + sum, trough);
     }
     // JSON patch with the RULES-style name.
-    let patched: Rules = serde_json::from_str(r#"{"SAME_DAY_PLACEMENT":{"scheduled":"after_credits"}}"#).unwrap();
+    let patched: Rules =
+        serde_json::from_str(r#"{"SALARY_DAY_ORDER":"debits_first","SAME_DAY_PLACEMENT":{"scheduled":"after_credits"}}"#).unwrap();
     assert_eq!(patched.placement_of(DebitKind::Scheduled), Placement::AfterCredits);
     assert_eq!(patched.placement_of(DebitKind::VariableSpend), Placement::BeforeCredits);
 }
@@ -374,8 +391,9 @@ fn salary_day_order_fixed_bills_after_credit() {
     let mut flex = history(EventType::Expense, "Cinema and events", "leisure", Direction::Debit, 800.0, 15, 21);
     flex.iter_mut().for_each(|e| e.flexibility = Flexibility::Reducible);
     events.extend(flex);
-    let base = forecast_for(&events, "2025-08-01");
+    let base = forecast_with(&events, "2025-08-01", &debits_first());
     let moved = forecast_with(&events, "2025-08-01", &rules);
+    assert_eq!(Rules::default().salary_day_order, rules.salary_day_order);
     let day = base.day(d("2025-08-15")).unwrap();
     // Default: 100,000 - 3,800 before the salary. Fixed bill after: only the 800 precedes it.
     assert_eq!(base.low[day], Money::from_units(96_200));
@@ -420,7 +438,9 @@ fn scheduled_replace_scope_lifecycle_or_amount() {
         events.push(s);
         forecast_with(&events, "2025-08-01", rules).flows.iter().filter(|f| f.category == "utilities" && f.date <= d("2025-08-31")).count()
     };
-    assert_eq!(run(4830.0, false, &Rules::default()), 1);
+    let window: Rules = serde_json::from_str(r#"{"SCHEDULED_REPLACE_SCOPE":"category_window"}"#).unwrap();
+    assert_eq!(run(4830.0, false, &window), 1);
+    assert_eq!(Rules::default().scheduled_replace_scope, rules.scheduled_replace_scope);
     assert_eq!(run(4830.0, false, &rules), 2);
     assert_eq!(run(7300.0, false, &rules), 1);
     assert_eq!(run(4830.0, true, &rules), 1);
