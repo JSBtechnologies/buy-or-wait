@@ -86,6 +86,20 @@ pub fn parse_amount(raw: &str, currency_hint: Option<&str>, allow_negative: bool
             let value: f64 = format!("{digits}.{frac}").parse().ok()?;
             return Some(if negative { -value } else { value });
         }
+        // fleet/specs/ocr_vllm_pipeline.md A3: a space as the THOUSANDS separator ("4 543" ->
+        // 4543, "4 543 210" -> 4543210) -- a genuine thousands group after the first is always
+        // exactly 3 digits, the same rule `is_valid_grouping` already applies to a comma/dot
+        // separator; a lone 2-digit second group is the Rs/Ps case just above instead, never
+        // this one.
+        let space_groups: Vec<&str> = s.split_whitespace().collect();
+        if space_groups.len() >= 2
+            && space_groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_digit()))
+            && space_groups[0].len() <= 3
+            && space_groups[1..].iter().all(|g| g.len() == 3)
+        {
+            let value: f64 = space_groups.concat().parse().ok()?;
+            return Some(if negative { -value } else { value });
+        }
     }
     if s.contains(char::is_whitespace) {
         return None; // any other embedded whitespace is not a recognized shape
@@ -515,6 +529,15 @@ mod tests {
     fn parses_space_separated_whole_and_fraction() {
         assert_eq!(parse_amount("4543 00", Some("INR"), false), Some(4543.00));
         assert_eq!(parse_amount("1,00,000 50", Some("INR"), false), Some(100_000.50));
+    }
+
+    /// fleet/specs/ocr_vllm_pipeline.md A3: a space as the thousands separator ("4 543" ->
+    /// 4543) -- distinct from the Rs/Ps split-column case above, which requires exactly a
+    /// 2-digit second group; a genuine thousands group after the first is always 3 digits.
+    #[test]
+    fn parses_space_as_thousands_separator() {
+        assert_eq!(parse_amount("4 543", None, false), Some(4543.0));
+        assert_eq!(parse_amount("4 543 210", None, false), Some(4_543_210.0));
     }
 
     /// `allow_negative` gates whether a parenthesized/minus-prefixed amount is honored at

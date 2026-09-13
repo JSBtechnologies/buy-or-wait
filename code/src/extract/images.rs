@@ -2338,4 +2338,63 @@ mod ocr_e2e {
         let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
         assert_eq!(accepted_amount(&resolution), 33.50);
     }
+
+    /// Debug-only report (lead, live vLLM endpoint): reads the lead's real serving-output
+    /// fixtures directly from disk (`scratch/ocr_baidu/vllm/r1/image_*.md`, byte-identical
+    /// across 2 live runs) and prints the gate outcome for all 16 images. Not run by default,
+    /// and never a committed fixture path -- the scratch directory lives outside `code/`.
+    /// `cargo test -- --ignored all_16_images_gate_report_live -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn all_16_images_gate_report_live() {
+        let fixtures_dir = Path::new("E:/projects/hackerrank-orchestrate-september26/scratch/ocr_baidu/vllm/r1");
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, EventType, &str, &str, (i32, u32, u32), (i32, u32, u32), Status); 16] = [
+            ("image_01", EventType::Income, "salary", "IDR", (2019, 8, 31), (2019, 8, 31), Status::Settled),
+            ("image_02", EventType::Expense, "rent", "INR", (2023, 8, 11), (2023, 8, 16), Status::Scheduled),
+            ("image_03", EventType::Expense, "groceries", "INR", (2026, 2, 27), (2026, 2, 27), Status::Settled),
+            ("image_04", EventType::Expense, "groceries", "INR", (2024, 9, 3), (2024, 9, 3), Status::Settled),
+            ("image_05", EventType::Expense, "utilities", "INR", (2026, 2, 6), (2026, 2, 9), Status::Pending),
+            ("image_06", EventType::Expense, "groceries", "INR", (2026, 1, 6), (2026, 1, 6), Status::Settled),
+            ("image_07", EventType::Expense, "dining", "INR", (2025, 10, 29), (2025, 10, 29), Status::Settled),
+            ("image_08", EventType::Expense, "housing", "INR", (2026, 7, 24), (2026, 7, 24), Status::Settled),
+            ("image_09", EventType::Expense, "utilities", "INR", (2026, 6, 7), (2026, 6, 7), Status::Settled),
+            ("image_10", EventType::Expense, "groceries", "INR", (2024, 6, 3), (2024, 6, 10), Status::Pending),
+            ("image_11", EventType::Expense, "healthcare", "INR", (2023, 1, 19), (2023, 1, 23), Status::Scheduled),
+            ("image_12", EventType::Expense, "transport", "USD", (2025, 10, 1), (2025, 10, 1), Status::Settled),
+            ("image_13", EventType::Expense, "shopping", "INR", (2026, 4, 3), (2026, 4, 3), Status::Settled),
+            ("image_14", EventType::Expense, "healthcare", "INR", (2025, 11, 2), (2025, 11, 2), Status::Settled),
+            ("image_15", EventType::Expense, "transport", "INR", (2026, 6, 7), (2026, 6, 7), Status::Settled),
+            ("image_16", EventType::Expense, "transport", "INR", (2026, 9, 3), (2026, 9, 3), Status::Settled),
+        ];
+
+        eprintln!("\n| image | outcome | figure | witness | notes |");
+        eprintln!("|---|---|---|---|---|");
+        for (image_id, event_type, category, currency, event_date, settlement_date, status) in cases {
+            let raw = std::fs::read_to_string(fixtures_dir.join(format!("{image_id}.md")))
+                .unwrap_or_else(|e| panic!("reading {image_id}.md: {e:#}"));
+            let ev = event(
+                image_id,
+                event_type,
+                category,
+                currency,
+                NaiveDate::from_ymd_opt(event_date.0, event_date.1, event_date.2).unwrap(),
+                NaiveDate::from_ymd_opt(settlement_date.0, settlement_date.1, settlement_date.2).unwrap(),
+                status,
+            );
+            let resolution = resolve_blank_amount_ocr(&ocr_result(&raw), image_id, &ev);
+            let figure = resolution.evidence.as_ref().map(|e| match &e.fact {
+                Fact::EventAmount { amount, .. } => amount.to_f64(),
+                _ => f64::NAN,
+            });
+            let read = &resolution.reads[0];
+            eprintln!(
+                "| {image_id} | {} | {} | {} | {} |",
+                resolution.outcome,
+                figure.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
+                read.witness.clone().unwrap_or_else(|| "—".to_string()),
+                read.ocr_notes.join(";"),
+            );
+        }
+    }
 }
