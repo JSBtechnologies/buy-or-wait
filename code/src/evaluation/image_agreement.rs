@@ -29,9 +29,9 @@
 //! ```json
 //! { "image_id": "image_05", "event_id": "event_1786", "class": "pending_bill_with_cutoff",
 //!   "reads": [ { "role": "reader" | "fallback", "model_id": "…", "model_revision": "…", "max_dim_px": 1024,
-//!                "reconciled": true, "selected_amount": 822.05,
-//!                "cutoff": { "due_date": "2026-02-06", "before_amount": 704.05, "after_amount": 822.05 } } ],
-//!   "outcome": "agree" | "fallback_tiebreak" | "missing", "accepted_amount": 822.05 }
+//!                "reconciled": true, "selected_amount": 150.25,
+//!                "cutoff": { "due_date": "2026-02-06", "before_amount": 120.75, "after_amount": 150.25 } } ],
+//!   "outcome": "agree" | "fallback_tiebreak" | "missing", "accepted_amount": 150.25 }
 //! ```
 //! A read counts only if: its model and max_dim_px are the ones routed for its role and class; it
 //! reconciled and selected a figure; for pending/scheduled events the figure is > 0; and when it
@@ -467,49 +467,49 @@ readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, {
     #[test]
     fn default_class_agreement_and_tiebreak() {
         // image_10 (pending grocery invoice, default class): 235B@1024 + gemma@768 agree.
-        let ok = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, true, 79679.26)], "agree", Some(79679.26));
-        assert!(run("a", "image_10", "event_6033", ok, Some(79679.26), ROUTING).is_empty());
+        let ok = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 5000.5), read("reader", G, 768, true, 5000.5)], "agree", Some(5000.5));
+        assert!(run("a", "image_10", "event_6033", ok, Some(5000.5), ROUTING).is_empty());
         // Per-reader px: gemma at 1024 is not routed and does not count.
-        let px = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 1024, true, 79679.26)], "agree", Some(79679.26));
-        let c = run("b", "image_10", "event_6033", px, Some(79679.26), ROUTING);
+        let px = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 5000.5), read("reader", G, 1024, true, 5000.5)], "agree", Some(5000.5));
+        let c = run("b", "image_10", "event_6033", px, Some(5000.5), ROUTING);
         assert!(c.contains(&"IA3_reader_not_routed") && c.contains(&"IA4_no_agreement"), "{c:?}");
         // gemma rejected (reconcile fail), Kimi matches 235B: tiebreak accept.
-        let tie = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, false, 72045.0), read("fallback", K, 1024, true, 79679.26)], "fallback_tiebreak", Some(79679.26));
-        assert!(run("c", "image_10", "event_6033", tie, Some(79679.26), ROUTING).is_empty());
+        let tie = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 5000.5), read("reader", G, 768, false, 4200.0), read("fallback", K, 1024, true, 5000.5)], "fallback_tiebreak", Some(5000.5));
+        assert!(run("c", "image_10", "event_6033", tie, Some(5000.5), ROUTING).is_empty());
         // Kimi matches gemma's figure but gemma did not reconcile: nothing counts -> missing.
-        let bad = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, false, 72045.0), read("fallback", K, 1024, true, 72045.0)], "missing", None);
+        let bad = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 5000.5), read("reader", G, 768, false, 4200.0), read("fallback", K, 1024, true, 4200.0)], "missing", None);
         assert!(run("d", "image_10", "event_6033", bad, None, ROUTING).is_empty());
         // Recorded as a tiebreak and applied anyway: outcome mismatch and no agreement.
-        let lie = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, false, 72045.0), read("fallback", K, 1024, true, 72045.0)], "fallback_tiebreak", Some(72045.0));
-        let c = run("e", "image_10", "event_6033", lie, Some(72045.0), ROUTING);
+        let lie = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 5000.5), read("reader", G, 768, false, 4200.0), read("fallback", K, 1024, true, 4200.0)], "fallback_tiebreak", Some(4200.0));
+        let c = run("e", "image_10", "event_6033", lie, Some(4200.0), ROUTING);
         assert!(c.contains(&"IA6_outcome_mismatch") && c.contains(&"IA4_no_agreement"), "{c:?}");
     }
 
     #[test]
     fn pending_bill_class_routes_235b_and_kimi_with_cutoff() {
-        // image_05: due 06-Feb-2026, event settles 2026-02-09 -> after-cutoff 822.05.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let k = with_cutoff(read("reader", K, 1024, true, 822.05), "06-Feb-2026", 704.05, 822.05);
-        let ok = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k], "agree", Some(822.05));
-        assert!(run("f", "image_05", "event_1786", ok, Some(822.05), ROUTING).is_empty());
+        // image_05: due 06-Feb-2026, event settles 2026-02-09 -> after-cutoff 150.25.
+        let q = with_cutoff(read("reader", Q, 1024, true, 150.25), "2026-02-06", 120.75, 150.25);
+        let k = with_cutoff(read("reader", K, 1024, true, 150.25), "06-Feb-2026", 120.75, 150.25);
+        let ok = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k], "agree", Some(150.25));
+        assert!(run("f", "image_05", "event_1786", ok, Some(150.25), ROUTING).is_empty());
         // gemma routed into this class is not allowed.
-        let g = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", G, 768, true, 822.05), "2026-02-06", 704.05, 822.05)], "agree", Some(822.05));
-        let c = run("g", "image_05", "event_1786", g, Some(822.05), ROUTING);
+        let g = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 150.25), "2026-02-06", 120.75, 150.25), with_cutoff(read("reader", G, 768, true, 150.25), "2026-02-06", 120.75, 150.25)], "agree", Some(150.25));
+        let c = run("g", "image_05", "event_1786", g, Some(150.25), ROUTING);
         assert!(c.contains(&"IA3_reader_not_routed") && c.contains(&"IA4_no_agreement"), "{c:?}");
-        // The image_05 trap: both select 704.05 (before-cutoff) although cash date is after due.
-        let trap = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 704.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05)], "agree", Some(704.05));
-        let c = run("h", "image_05", "event_1786", trap, Some(704.05), ROUTING);
+        // The image_05 trap: both select 120.75 (before-cutoff) although cash date is after due.
+        let trap = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 120.75), "2026-02-06", 120.75, 150.25), with_cutoff(read("reader", K, 1024, true, 120.75), "2026-02-06", 120.75, 150.25)], "agree", Some(120.75));
+        let c = run("h", "image_05", "event_1786", trap, Some(120.75), ROUTING);
         assert!(c.contains(&"IA4_no_agreement"), "{c:?}");
         // Cutoff data missing in a cutoff_rule class: read does not count.
-        let nocut = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![read("reader", Q, 1024, true, 822.05), read("reader", K, 1024, true, 822.05)], "agree", Some(822.05));
-        assert!(run("i", "image_05", "event_1786", nocut, Some(822.05), ROUTING).contains(&"IA4_no_agreement"));
+        let nocut = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![read("reader", Q, 1024, true, 150.25), read("reader", K, 1024, true, 150.25)], "agree", Some(150.25));
+        assert!(run("i", "image_05", "event_1786", nocut, Some(150.25), ROUTING).contains(&"IA4_no_agreement"));
         // 235B reads 0.0 on a pending bill: never counts; applying 0 fails.
         let zero = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 0.0), "2026-02-06", 0.0, 0.0), with_cutoff(read("reader", K, 1024, true, 0.0), "2026-02-06", 0.0, 0.0)], "agree", Some(0.0));
         let c = run("j", "image_05", "event_1786", zero, Some(0.0), ROUTING);
         assert!(c.contains(&"IA4_no_agreement") && c.contains(&"IA6_outcome_mismatch"), "{c:?}");
         // Wrong class recorded.
-        let wrong = prov("image_05", "event_1786", "default", vec![with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", K, 1024, true, 822.05), "2026-02-06", 704.05, 822.05)], "agree", Some(822.05));
-        assert!(run("k", "image_05", "event_1786", wrong, Some(822.05), ROUTING).contains(&"IA10_class_mismatch"));
+        let wrong = prov("image_05", "event_1786", "default", vec![with_cutoff(read("reader", Q, 1024, true, 150.25), "2026-02-06", 120.75, 150.25), with_cutoff(read("reader", K, 1024, true, 150.25), "2026-02-06", 120.75, 150.25)], "agree", Some(150.25));
+        assert!(run("k", "image_05", "event_1786", wrong, Some(150.25), ROUTING).contains(&"IA10_class_mismatch"));
     }
 
     #[test]
@@ -531,22 +531,22 @@ readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, {
         std::fs::remove_dir_all(&root).ok();
 
         // Pending-bill class: 235B and Kimi disagree, gemma tiebreak matches 235B on the after-cutoff figure.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let k = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let g = with_cutoff(read("fallback", G, 768, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let tie = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, g], "fallback_tiebreak", Some(822.05));
-        assert!(run("n", "image_05", "event_1786", tie, Some(822.05), ROUTING).is_empty());
+        let q = with_cutoff(read("reader", Q, 1024, true, 150.25), "2026-02-06", 120.75, 150.25);
+        let k = with_cutoff(read("reader", K, 1024, true, 120.75), "2026-02-06", 120.75, 150.25);
+        let g = with_cutoff(read("fallback", G, 768, true, 150.25), "2026-02-06", 120.75, 150.25);
+        let tie = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, g], "fallback_tiebreak", Some(150.25));
+        assert!(run("n", "image_05", "event_1786", tie, Some(150.25), ROUTING).is_empty());
         // Kimi (a reader of this class) recorded as the tiebreak: IA12 and no acceptance.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let g2 = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let kf = with_cutoff(read("fallback", K, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let dup = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, g2, kf], "fallback_tiebreak", Some(822.05));
-        let c = run("o", "image_05", "event_1786", dup, Some(822.05), ROUTING);
+        let q = with_cutoff(read("reader", Q, 1024, true, 150.25), "2026-02-06", 120.75, 150.25);
+        let g2 = with_cutoff(read("reader", K, 1024, true, 120.75), "2026-02-06", 120.75, 150.25);
+        let kf = with_cutoff(read("fallback", K, 1024, true, 150.25), "2026-02-06", 120.75, 150.25);
+        let dup = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, g2, kf], "fallback_tiebreak", Some(150.25));
+        let c = run("o", "image_05", "event_1786", dup, Some(150.25), ROUTING);
         assert!(c.contains(&"IA12_tiebreak_equals_reader") && c.contains(&"IA4_no_agreement"), "{c:?}");
         // gemma tiebreak picking the before-cutoff figure (cutoff rule applies to the tiebreak): no accept.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let k = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let gb = with_cutoff(read("fallback", G, 768, true, 704.05), "2026-02-06", 704.05, 822.05);
+        let q = with_cutoff(read("reader", Q, 1024, true, 150.25), "2026-02-06", 120.75, 150.25);
+        let k = with_cutoff(read("reader", K, 1024, true, 120.75), "2026-02-06", 120.75, 150.25);
+        let gb = with_cutoff(read("fallback", G, 768, true, 120.75), "2026-02-06", 120.75, 150.25);
         let before = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, gb], "missing", None);
         assert!(run("p", "image_05", "event_1786", before, None, ROUTING).is_empty());
     }
@@ -556,22 +556,22 @@ readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, {
         // Default class, a bill page with a cutoff (image_02 rent, scheduled, settles 2023-08-16):
         // 235B and gemma disagree; Kimi picks the before-cutoff figure matching gemma, but the
         // cash date is after the due date -> neither counts -> missing, applying it fails.
-        let q = with_cutoff(read("reader", Q, 1024, true, 100000.0), "2023-08-11", 90000.0, 100000.0);
-        let g = with_cutoff(read("reader", G, 768, true, 90000.0), "2023-08-11", 90000.0, 100000.0);
-        let k = with_cutoff(read("fallback", K, 1024, true, 90000.0), "2023-08-11", 90000.0, 100000.0);
-        let p = prov("image_02", "event_1442", "default", vec![q, g, k], "fallback_tiebreak", Some(90000.0));
-        let c = run("l", "image_02", "event_1442", p, Some(90000.0), ROUTING);
+        let q = with_cutoff(read("reader", Q, 1024, true, 900.0), "2023-08-11", 800.0, 900.0);
+        let g = with_cutoff(read("reader", G, 768, true, 800.0), "2023-08-11", 800.0, 900.0);
+        let k = with_cutoff(read("fallback", K, 1024, true, 800.0), "2023-08-11", 800.0, 900.0);
+        let p = prov("image_02", "event_1442", "default", vec![q, g, k], "fallback_tiebreak", Some(800.0));
+        let c = run("l", "image_02", "event_1442", p, Some(800.0), ROUTING);
         assert!(c.contains(&"IA4_no_agreement") && c.contains(&"IA6_outcome_mismatch"), "{c:?}");
     }
 
     #[test]
     fn missing_routing_or_provenance_fails() {
-        let ok = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, true, 79679.26)], "agree", Some(79679.26));
-        assert!(run("m", "image_10", "event_6033", ok, Some(79679.26), "[selected]\nvlm_primary = \"x\"\n").contains(&"IA9_no_routing_table"));
+        let ok = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 5000.5), read("reader", G, 768, true, 5000.5)], "agree", Some(5000.5));
+        assert!(run("m", "image_10", "event_6033", ok, Some(5000.5), "[selected]\nvlm_primary = \"x\"\n").contains(&"IA9_no_routing_table"));
         // Image fact without provenance.
         let root = std::env::temp_dir().join(format!("verifier_ia2_noprov_{}", std::process::id()));
         std::fs::create_dir_all(root.join("store/processed/evidence")).unwrap();
-        std::fs::write(root.join("store/processed/evidence/request_73.json"), json!([{"record_id": "image_11", "source": "Image", "observed_at": "2023-01-19T00:00:00", "fact": {"EventAmount": {"event_id": "event_6859", "amount": 36_500_000_i64, "currency": "INR"}}}]).to_string()).unwrap();
+        std::fs::write(root.join("store/processed/evidence/request_73.json"), json!([{"record_id": "image_11", "source": "Image", "observed_at": "2023-01-19T00:00:00", "fact": {"EventAmount": {"event_id": "event_6859", "amount": 25_000_000_i64, "currency": "INR"}}}]).to_string()).unwrap();
         let toml_path = root.join("models.toml");
         std::fs::write(&toml_path, ROUTING).unwrap();
         let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");

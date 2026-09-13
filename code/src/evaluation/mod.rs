@@ -82,12 +82,13 @@ pub fn cli(args: &[String]) -> Result<i32> {
         Some("hardcode") => {
             let code_dir = code_dir.unwrap_or_else(|| PathBuf::from("."));
             let root = code_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".."));
-            let f = hardcode_scan::scan(&code_dir, &dataset, Some(&root.join("docs/gold_subset.json")))?;
+            let f = hardcode_scan::scan(&code_dir, &dataset, Some(&root.join("docs/gold_subset.json")), Some(&root.join("RULES.md")))?;
             for x in &f {
                 println!("{x}");
             }
-            println!("hardcode scan of {}: {} findings -> {}", code_dir.display(), f.len(), if f.is_empty() { "PASS" } else { "FAIL" });
-            Ok(if f.is_empty() { 0 } else { 1 })
+            let errors = f.iter().filter(|x| x.severity == Severity::Error).count();
+            println!("hardcode scan of {}: {errors} errors, {} warnings -> {}", code_dir.display(), f.len() - errors, if errors == 0 { "PASS" } else { "FAIL" });
+            Ok(if errors == 0 { 0 } else { 1 })
         }
         Some("selftest") => {
             let rep = selftest(&dataset)?;

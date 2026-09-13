@@ -177,7 +177,7 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         }
     }
     s.check(
-        "HARD GATE decision.accuracy_first: 0 false accepts (a flagged missing value beats a wrong one)",
+        "HARD GATE decision.accuracy_first: 0 false accepts (development verification; a failure means investigate model vs analyst, never auto-correct)",
         gate_ran && false_accepts.is_empty(),
         if !gate_ran {
             "a contributing check could not run: gate cannot pass".to_string()
@@ -239,11 +239,17 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
     // Hardcoded answers in the prediction path (lead: flag at final sign-off). Paths resolve
     // from the dataset dir's parent (repo root): code/src/{engine,extract}, docs/gold_subset.json.
     let repo = dataset_dir.parent().unwrap_or(Path::new(".."));
-    let hard = super::hardcode_scan::scan(&repo.join("code"), dataset_dir, Some(&repo.join("docs/gold_subset.json")))?;
+    let hard = super::hardcode_scan::scan(&repo.join("code"), dataset_dir, Some(&repo.join("docs/gold_subset.json")), Some(&repo.join("RULES.md")))?;
+    let hard_err: Vec<String> = hard.iter().filter(|f| f.severity == Severity::Error).map(|f| f.to_string()).collect();
+    let hard_warn: Vec<String> = hard.iter().filter(|f| f.severity == Severity::Warn).map(|f| f.to_string()).collect();
     s.check(
-        "no hardcoded ids/label figures in engine+extract",
-        hard.is_empty(),
-        if hard.is_empty() { "none found".to_string() } else { hard.iter().take(12).map(|f| f.to_string()).collect::<Vec<_>>().join(" | ") },
+        "prediction modules (engine, extract, main.rs) use no record ids, label/gold/audit figures or audit files",
+        hard_err.is_empty(),
+        if hard_err.is_empty() {
+            format!("none found; {} audit figures in test code (appearance warnings): {}", hard_warn.len(), hard_warn.iter().take(12).cloned().collect::<Vec<_>>().join(" | "))
+        } else {
+            hard_err.iter().take(12).cloned().collect::<Vec<_>>().join(" | ")
+        },
     );
 
     if let Some(rerun) = rerun {
