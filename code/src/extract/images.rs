@@ -2243,4 +2243,99 @@ mod ocr_e2e {
         let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
         assert_eq!(accepted_amount(&resolution), 822.05);
     }
+
+    /// image_07 (restaurant, settled): the page prints both "Total : 8528.10" and "Grand
+    /// Total (RS) : 8528" -- Grand Total wins (lead ruling, bus #16), witnessed by
+    /// SubTotal + SGST + CGST = 8528.10, which rounds to the accepted 8,528.
+    #[test]
+    fn image_07_grand_total_over_plain_total() {
+        let raw = r#"<|det|>title [379, 66, 751, 135]<|/det|>PAID
+<|det|>text [541, 744, 869, 768]<|/det|>SubTotal : 8122.00
+<|det|>text [474, 770, 869, 794]<|/det|>SGST 2.50 % : 203.05
+<|det|>text [474, 795, 869, 819]<|/det|>CGST 2.50 % : 203.05
+<|det|>text [593, 821, 869, 846]<|/det|>Total : 8528.10
+<|det|>text [112, 874, 705, 898]<|/det|>Grand Total (RS) : 8528"#;
+        let event = event(
+            "event_3231",
+            EventType::Expense,
+            "dining",
+            "INR",
+            NaiveDate::from_ymd_opt(2025, 10, 29).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 10, 29).unwrap(),
+            Status::Settled,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 8528.0);
+    }
+
+    /// image_10 (large grocery invoice, pending): balance due 79,679.26, witnessed by the
+    /// printed amount-in-words line ("Indian Rupee Seventy-Nine Thousand Six Hundred
+    /// Seventy-Nine and Twenty-Six Paise Only") -- the summary row's 6-labels/6-values cell
+    /// is space- (not newline-) separated and isn't zipped by this pass; only the
+    /// amount-in-words and the separate "Balance Due" line resolve the figure.
+    #[test]
+    fn image_10_balance_due_via_amount_in_words() {
+        let raw = r#"<|det|>table [0, 0, 999, 882]<|/det|><table><tr><td colspan="5">Total In Words Indian Rupee Seventy-Nine Thousand Six Hundred Seventy-Nine and Twenty-Six Paise Only</td><td colspan="3">Sub Total CGST2.5 (2.5%) SGST2.5 (2.5%) CGST20 (20%) SGST20 (20%) Total</td><td colspan="2">72,045.00 1,513.13 1,513.13 2,304.00 2,304.00 79,679.26</td></tr><tr><td colspan="5">Notes Thanks for your business.</td><td colspan="3">Balance Due</td><td colspan="2">79,679.26</td></tr></table>"#;
+        let event = event(
+            "event_6033",
+            EventType::Expense,
+            "groceries",
+            "INR",
+            NaiveDate::from_ymd_opt(2024, 6, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 6, 10).unwrap(),
+            Status::Pending,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 79_679.26);
+    }
+
+    /// image_11 (hospital bill, scheduled, amount paid 0): Total Bill Amount = Amount
+    /// Payable = Balance = 3,650 all repeat the same figure; the detailed breakup (not
+    /// modeled here) is cut off and must never block this.
+    #[test]
+    fn image_11_repeated_final_label_balance() {
+        let raw = r#"<|det|>text [747, 411, 953, 426]<|/det|>Total Bill Amount: 3650.00
+<|det|>text [756, 429, 953, 443]<|/det|>Amount Payable: 3650.00
+<|det|>text [811, 446, 953, 460]<|/det|>Amount Paid: 0.00
+<|det|>text [820, 463, 953, 476]<|/det|>Balance: 3650.00
+<|det|>text [738, 480, 953, 494]<|/det|>Paid amount in words : Zero"#;
+        let event = event(
+            "event_6859",
+            EventType::Expense,
+            "healthcare",
+            "INR",
+            NaiveDate::from_ymd_opt(2023, 1, 19).unwrap(),
+            NaiveDate::from_ymd_opt(2023, 1, 23).unwrap(),
+            Status::Scheduled,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 3650.0);
+    }
+
+    /// image_12 (taxi, settled, USD): Subtotal 33.50 + Tax 0.00 witnesses Total 33.50; cash
+    /// tendered ($40.00) and change ($6.50) are ignored, never the fare amount.
+    #[test]
+    fn image_12_usd_total_via_subtotal_plus_tax() {
+        let raw = r#"<|det|>text [78, 636, 233, 656]<|/det|>Subtotal:
+<|det|>text [821, 636, 928, 656]<|/det|>$33.50
+<|det|>text [78, 674, 147, 693]<|/det|>Tax:
+<|det|>text [839, 674, 928, 693]<|/det|>$0.00
+<|det|>text [78, 713, 192, 734]<|/det|>Total:
+<|det|>text [811, 713, 928, 734]<|/det|>$33.50
+<|det|>text [78, 802, 250, 822]<|/det|>Cash Paid:
+<|det|>text [821, 802, 928, 822]<|/det|>$40.00
+<|det|>text [78, 841, 199, 861]<|/det|>Change:
+<|det|>text [839, 841, 928, 861]<|/det|>$6.50"#;
+        let event = event(
+            "event_7307",
+            EventType::Expense,
+            "transport",
+            "USD",
+            NaiveDate::from_ymd_opt(2025, 10, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 10, 1).unwrap(),
+            Status::Settled,
+        );
+        let resolution = resolve_blank_amount_ocr(&ocr_result(raw), "test", &event);
+        assert_eq!(accepted_amount(&resolution), 33.50);
+    }
 }

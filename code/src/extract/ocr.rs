@@ -38,8 +38,14 @@ pub struct OcrConfig {
     pub temperature: f64,
     pub ngram_size: u32,
     pub window_size: u32,
-    /// Per-page upscale factor before OCR (spec: 2x, Lanczos3).
+    /// Per-page upscale factor before OCR (spec: 2x, Lanczos3), applied only when a page
+    /// needs it (see `upscale_min_side_px`).
     pub page_scale: f64,
+    /// Lead finding 2026-09-13 (bus #ocr): a full-resolution page upscaled 2x runs a much
+    /// higher risk of a runaway reply (image_06 at 2x drops its Total in the GSTIN/CIN-footer
+    /// runaway; 1x keeps it). A page whose shorter side is already at or above this many
+    /// pixels is left at its native resolution; only a genuinely small page gets scaled up.
+    pub upscale_min_side_px: u32,
     pub prompt: String,
 }
 
@@ -58,6 +64,7 @@ impl OcrConfig {
             ngram_size: 35,
             window_size: 128,
             page_scale: 2.0,
+            upscale_min_side_px: 600,
             prompt: DEFAULT_PROMPT.to_string(),
         })
     }
@@ -75,6 +82,7 @@ impl OcrConfig {
         hasher.update(self.ngram_size.to_le_bytes());
         hasher.update(self.window_size.to_le_bytes());
         hasher.update(self.page_scale.to_le_bytes());
+        hasher.update(self.upscale_min_side_px.to_le_bytes());
         hasher.update(NEAR_BLACK_LUMA_MAX.to_le_bytes());
         hasher.update(NEAR_BLACK_RUN_MIN_PX.to_le_bytes());
         hasher.update(SLIVER_MAX_PX.to_le_bytes());
@@ -134,6 +142,9 @@ impl OcrClient {
         let http = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(300))
+            // Lead finding 2026-09-13: RunPod's Cloudflare front returns 403 "error code:
+            // 1010" for a request with no User-Agent at all (reqwest sends none by default).
+            .user_agent("buyorwait-ocr/0.1")
             .build()
             .context("failed to build OCR HTTP client")?;
         Ok(Self { config, cache_dir, http })
@@ -170,8 +181,14 @@ impl OcrClient {
         let mut page_metas = Vec::with_capacity(pages.len());
         for (idx, page_img) in pages.iter().enumerate() {
             let page_num = (idx + 1) as u32;
-            let upscaled = upscale(page_img, self.config.page_scale);
-            let b64 = encode_png_base64(&upscaled)?;
+            let (w, h) = page_img.dimensions();
+            let shorter_side = w.min(h);
+            let final_page = if shorter_side < self.config.upscale_min_side_px {
+                upscale(page_img, self.config.page_scale)
+            } else {
+                page_img.clone()
+            };
+            let b64 = encode_png_base64(&final_page)?;
 
             let started = Instant::now();
             let (raw_text, prompt_tokens, completion_tokens, finish_reason) = self.call_once(&b64)?;
@@ -342,6 +359,7 @@ mod tests {
             ngram_size: 35,
             window_size: 128,
             page_scale: 2.0,
+            upscale_min_side_px: 600,
             prompt: DEFAULT_PROMPT.into(),
         };
         let mut scaled = base.clone();
@@ -364,6 +382,7 @@ mod tests {
             ngram_size: 35,
             window_size: 128,
             page_scale: 2.0,
+            upscale_min_side_px: 600,
             prompt: DEFAULT_PROMPT.into(),
         };
         assert_eq!(cfg.config_hash(), cfg.config_hash());

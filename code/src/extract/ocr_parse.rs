@@ -31,23 +31,28 @@ struct DetBlock {
 /// amount grouping (lakh vs. plain thousands) the same way `extract::images` does.
 pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<LabeledValue> {
     let blocks = split_det_blocks(raw);
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut rows: Vec<(bool, Vec<String>)> = Vec::new();
 
+    // `bool` marks a row as TABLE-sourced -- the cross-row "label wrapped to the next line"
+    // continuation below only ever applies within a table (image_05's "Amount due till" is a
+    // table row with nothing else on it); a free-text title/header block with no value of its
+    // own (e.g. a lone "PAID" heading) must never be treated as a wrapped label glued onto
+    // whatever text happens to follow it on the page.
     let mut pending_text_row: Vec<(String, (i64, i64, i64, i64))> = Vec::new();
-    fn flush(pending: &mut Vec<(String, (i64, i64, i64, i64))>, rows: &mut Vec<Vec<String>>) {
+    fn flush(pending: &mut Vec<(String, (i64, i64, i64, i64))>, rows: &mut Vec<(bool, Vec<String>)>) {
         if pending.is_empty() {
             return;
         }
         let mut taken = std::mem::take(pending);
         taken.sort_by_key(|(_, b)| b.0);
-        rows.push(taken.into_iter().map(|(t, _)| t).collect());
+        rows.push((false, taken.into_iter().map(|(t, _)| t).collect()));
     }
 
     for block in &blocks {
         match block.kind.as_str() {
             "table" => {
                 flush(&mut pending_text_row, &mut rows);
-                rows.extend(parse_html_table(&block.content));
+                rows.extend(parse_html_table(&block.content).into_iter().map(|r| (true, r)));
             }
             "image" => {
                 flush(&mut pending_text_row, &mut rows);
@@ -70,10 +75,35 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
 
     let mut out = Vec::new();
     let mut pending_label: Option<String> = None;
-    for row in rows {
-        let cells: Vec<String> = row.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
+    for (is_table, row) in rows {
+        let mut cells: Vec<String> = row.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect();
         if cells.is_empty() {
             continue;
+        }
+
+        // A cell can hold an "in words" label glued directly to its spelled-out value with NO
+        // delimiter at all (image_10: "Total In Words Indian Rupee Seventy-Nine Thousand ...
+        // Paise Only", inside a wider multi-cell row) -- `extract_pairs`'s value-shape
+        // heuristic only recognizes a NUMERIC value start, so a words value can never be
+        // found that way. Pull any such cell out and emit it directly, wherever it sits in
+        // the row, before the rest of this row's normal (label, value) extraction runs.
+        cells.retain(|cell| {
+            if let Some((label, value)) = split_words_marker(cell) {
+                push_row(&mut out, page, &label, &value, currency_hint);
+                false
+            } else {
+                true
+            }
+        });
+        if cells.is_empty() {
+            continue;
+        }
+
+        // A pending label only ever comes from a table row (module doc below); a free-text
+        // row in between means the expected continuation never came, so it's dropped here,
+        // before it can wrongly gate the colon-split/zip checks just below.
+        if !is_table {
+            pending_label = None;
         }
 
         // A single free-text OCR block can hold a whole `"Label : value"` line itself (never
@@ -112,7 +142,7 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
 
         let pairs = extract_pairs(&effective);
         if pairs.is_empty() {
-            if effective.len() == 1 {
+            if is_table && effective.len() == 1 {
                 pending_label = Some(effective[0].clone());
             }
             continue;
@@ -122,6 +152,48 @@ pub fn parse_page(raw: &str, page: u32, currency_hint: Option<&str>) -> Vec<Labe
         }
     }
     out
+}
+
+/// `Some((label, value))` when `cell` contains a case-insensitive whole-word `"words"`
+/// immediately preceded by `"in"` (i.e. an "... In Words" marker -- "Total In Words", "Amount
+/// In Words", "Paid Amount In Words") with non-empty content after it. The marker itself
+/// (through "words") becomes the label; everything after is the spelled-out value.
+fn split_words_marker(cell: &str) -> Option<(String, String)> {
+    let tokens: Vec<(usize, usize)> = token_byte_ranges(cell);
+    for (i, &(start, end)) in tokens.iter().enumerate() {
+        if i == 0 || !cell[start..end].eq_ignore_ascii_case("words") {
+            continue;
+        }
+        let (prev_start, prev_end) = tokens[i - 1];
+        if !cell[prev_start..prev_end].eq_ignore_ascii_case("in") {
+            continue;
+        }
+        let label = cell[..end].trim().to_string();
+        let value = cell[end..].trim().to_string();
+        if !value.is_empty() {
+            return Some((label, value));
+        }
+    }
+    None
+}
+
+/// Byte-range spans of whitespace-separated tokens in `s`.
+fn token_byte_ranges(s: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            if let Some(s0) = start.take() {
+                ranges.push((s0, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s0) = start {
+        ranges.push((s0, s.len()));
+    }
+    ranges
 }
 
 fn push_row(out: &mut Vec<LabeledValue>, page: u32, label: &str, value_raw: &str, currency_hint: Option<&str>) {
@@ -284,7 +356,12 @@ fn looks_like_value_start(fragment: &str) -> bool {
 }
 
 const CURRENCY_WORDS: &[&str] = &["IDR", "INR", "USD", "RS", "RS.", "RP", "EUR", "ZAR"];
+const CURRENCY_SYMBOLS: &[char] = &['$', '₹', '€', '£', '¥'];
 
+/// Strips a leading currency WORD (space-separated, e.g. `"IDR 4,500,000"`) or a bare currency
+/// SYMBOL glued directly to the digits with no space at all (e.g. `"$28.50"`, image_12) --
+/// `normalize::parse_amount` already strips either shape once it owns the full string; this
+/// copy only needs to know a value fragment when it sees one.
 fn strip_leading_currency_word(s: &str) -> &str {
     let trimmed = s.trim();
     for word in CURRENCY_WORDS {
@@ -292,6 +369,11 @@ fn strip_leading_currency_word(s: &str) -> &str {
             if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                 return rest.trim_start();
             }
+        }
+    }
+    if let Some(c) = trimmed.chars().next() {
+        if CURRENCY_SYMBOLS.contains(&c) {
+            return trimmed[c.len_utf8()..].trim_start();
         }
     }
     trimmed

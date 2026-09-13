@@ -61,7 +61,7 @@ pub fn words_to_number(raw: &str) -> Option<f64> {
 
 const STOP_WORDS: &[&str] = &[
     "rupees", "rupee", "dollars", "dollar", "rupiah", "rupiahs", "idr", "inr", "usd", "only",
-    "of", "exactly", "and",
+    "of", "exactly", "and", "indian", "us",
 ];
 
 fn filter_stop_words<'a>(tokens: &[&'a str]) -> Vec<&'a str> {
