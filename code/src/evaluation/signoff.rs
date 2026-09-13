@@ -136,14 +136,14 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
     }
 
     // Board decision.vlm_setup: image amounts only on 2-model agreement (or fallback tiebreak).
-    match super::image_agreement::check(&repo_for_code.join("code"), &dataset_dir.join("images.csv")) {
+    match super::image_agreement::check(&repo_for_code.join("code"), dataset_dir, &repo_for_code.join("code/config/models.toml")) {
         Err(e) => s.check("image amounts: 2-model agreement", false, format!("could not run: {e}")),
         Ok(f) => {
             let image_facts = std::fs::read_dir(repo_for_code.join("code/store/processed/evidence"))
                 .map(|rd| rd.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).map(|t| t.matches("\"EventAmount\"").count()).sum::<usize>())
                 .unwrap_or(0);
             s.check(
-                "image amounts: 2-model agreement (decision.vlm_setup)",
+                "image amounts: routed agreement per [vlm_routing] (decision.vlm_setup)",
                 f.is_empty(),
                 if f.is_empty() { format!("ok; {image_facts} EventAmount facts in persisted evidence") } else { f.iter().take(8).map(|x| x.to_string()).collect::<Vec<_>>().join(" | ") },
             );
