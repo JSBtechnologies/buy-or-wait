@@ -679,3 +679,63 @@ No rule change: a pending/scheduled row with a blank amount reserves its image a
 | `SCHEDULED_REPLACE_SCOPE` | category_window | lifecycle_or_amount | 0 tuning rows change |
 
 Engine implementation 4d52e8f (analyst-reviewed): patches `{"SALARY_DAY_ORDER":"fixed_bills_after_credit"}`, `{"VAR_LONG_PHASE":"from_request"}` (var_long_min_step 21), `{"SCHEDULED_REPLACE_SCOPE":"lifecycle_or_amount"}` (scheduled_replace_amount_pct 10). A bill counts as flexible when its stream's latest row is not `fixed`. Under A, fixed bills, scheduled rows and reserved pending debits go after the credit; variable spend, flexible bills and evidence flows stay before it. A scheduled debit with no amount does not replace the cycle. Engine tuning mean |outflow err| over the 14 amount rows: default 2.62%, A 2.13%, A+E 2.39% (E 16 → 17), A+D 2.13%. These equal this table's Σ/14 (0.366, 0.297, 0.334). Status, method and plan stay at 17 under every config.
+
+### S8.6 Decisions and the narrower E2 (user decision after verifier #302/#303)
+
+**Decisions:** `SALARY_DAY_ORDER=fixed_bills_after_credit` (A) and `SCHEDULED_REPLACE_SCOPE=lifecycle_or_amount` (D) are **ON**. `VAR_LONG_PHASE=from_request` (E) is **not adopted**. The narrower E2 below is the single candidate for one held-out A/B against A+D.
+
+Method: tuning 01–18 plus structural counts across all 275 users (no labels outside 01–18). The replay harness reproduces the S8 table exactly (A+D Σ 0.297, E 16; A+D+E Σ 0.334, E 17).
+
+**Why tuning 02 breaks under E (`from_request`):**
+- user_02 has one 21-day dining stream, last settled 2025-07-30 (rd − 6), so history projects the next occurrence on 2025-08-20 (rd + 15). The salary is on 2025-08-15 (rd + 10), and under A the trough is that salary day, with variable spend before the credit.
+- `from_request` moves the first occurrence to rd + 2 (2025-08-07), before the trough. That adds one dining occurrence (1,083,819 IDR) to the outflow: −0.9% → −8.6%.
+- The label has no dining before the salary. Per S3.7 its implied spend is already 1.6% *below* the estimate without dining.
+- user_03 transport has the **same geometry** (last rd − 6, history next rd + 15, `from_request` rd + 2), and there the label *does* count one occurrence before the trough (+4.6% → +0.6%). No rule that reads only the stream history can separate the two.
+- The quantity that differs is the trough offset: rd + 10 in 02 (salary day) versus rd + 11 in 03 (day before salary, 2019-09-14).
+
+**Excluded shape:** a first occurrence placed earlier than the midpoint of the interval (rd + 2 … rd + 10 for step 21). That is the 02 shape. Every `from_request`-style rule puts it there.
+
+**E2: `VAR_LONG_PHASE = mid_step`** (new value, default stays `last_settled`):
+
+```
+for an Interval (variable-spend) debit stream with step >= 21:
+    first = min(last_settled + step, rd + ceil(step / 2))     # step 21 -> no later than rd + 11
+    then every step; IV_SKIP_DAYS unchanged (rd + 11 > skip)
+streams with step < 21: unchanged
+```
+
+Meaning: never project the next long-cadence occurrence later than half an interval after the request. It is conservative, and it keeps the history phase when that is already earlier. On this dataset `last_settled + step` is always ≥ rd + 11 (see structure), so E2 = "first occurrence at rd + 11".
+
+**Tuning table** (base A+D; D changes 0 tuning rows; outflow err as in S3.6, E = earliest exact):
+
+| config | Σ\|outflow err\| | mean | E exact | 02 | 03 | 07 | 11 | others |
+|---|---|---|---|---|---|---|---|---|
+| A+D | 0.297 | 2.12% | 16 | −0.9% | +4.6% | −1.8% | −0.7% (E ✗) | unchanged |
+| A+D+E `from_request` | 0.334 | 2.39% | 17 | **−8.6%** | +0.6% | −1.8% | −0.7% (E ✓) | unchanged |
+| **A+D+E2 `mid_step`** | **0.257** | **1.84%** | 16 | −0.9% | **+0.6%** | −1.8% | −0.7% (E ✗) | unchanged |
+| lead narrowing 1: `from_request` only if the history next date is after the pre-salary trough and rd + 2 is before it | 0.334 | 2.39% | 17 | −8.6% | +0.6% | −1.8% | −0.7% (E ✓) | = `from_request` (02 and 03 both qualify) |
+| lead narrowing 2: `from_request` only for regular history gaps | 0.334 | 2.39% | 17 | −8.6% | +0.6% | −1.8% | −0.7% (E ✓) | = `from_request` (all 148 long streams are regular) |
+| sensitivity: first occurrence at rd + k, step 21 | k ≤ 10: 0.334 (02 breaks); k = 11, 12: 0.257; k ≥ 13: 0.391 (03 +11.2%, 11 +3.4%) | | | | | | | |
+| E2 applied to steps ≥ 10 / ≥ 14 | 0.257 | | 16 | | | | | identical to ≥ 21 |
+| E2 applied to all steps | 0.267 | | 16 | | | | | 14 −7.5%, 04 −0.7% |
+| `rate` (S8.2) | 0.374 | | 16 | −4.2% | +5.6% | +2.7% | +3.1% | |
+
+Verdict:
+- E2 improves tuning (Σ 0.297 → 0.257, driven by 03) with no row worse and status/method/plan unchanged. It gives up `from_request`'s tuning E gain on 11.
+- The 11 conflict: E on 11 needs two dining occurrences in (06-15, 07-15], i.e. a phase of rd + 1 … rd + 10 mod 21, which is exactly the excluded 02 shape. So no single phase fits 02, 03 and 11's E together. 11's E miss may have another cause (S3.6 lists it ✗ under every estimator).
+- Fragility: only offsets 11 and 12 fit, so `ceil(step/2)` sits at the edge of the band (floor = 10 reproduces the 02 break). The tuning support is one row (03). Hence one held-out A/B, not a default change.
+
+**Structure (275 users, no labels):**
+- All 148 variable streams with step ≥ 21 are regular 21-day cadences, last settled 6–10 days before the request (6: 44, 7: 42, 8: 32, 9: 11, 10: 19), in 86 users.
+- Changed decisions vs A, over the 257 non-tuning requests (replay approximation):
+
+| change vs A | `from_request` | E2 |
+|---|---|---|
+| requests changed | 46 | 16 |
+| of which safe amount changes | 45 | 16 |
+| of which E changes | 11 | 3 |
+
+- Overlap between the two: 15 requests change under both, and 14 of those get the identical result.
+- 31 requests change under `from_request` only. By construction, the result there depends only on occurrences placed at rd + 2…10, which is the excluded 02 shape. If the held-out E gain lives in those 31, E2 will not keep it; the A/B decides.
+
+Hand-off: engine adds `VAR_LONG_PHASE = mid_step` (patch `{"VAR_LONG_PHASE":"mid_step"}`, first = min(last + step, rd + ceil(step/2)) for step ≥ var_long_min_step). The verifier runs ONE held-out A/B of A+D+E2 vs A+D.
