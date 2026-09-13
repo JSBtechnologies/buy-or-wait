@@ -248,8 +248,16 @@ const KNOWN_NON_CUTOFF_FIELDS: [&str; 3] = ["currency", "error", "prompt_version
 /// `witness` (HF-only VLM pairs, image_accuracy_plan.md §2) and `ocr` (one deterministic
 /// Unlimited-OCR reader, fleet/specs/ocr_vllm_pipeline.md A4).
 pub const WITNESS_MODES: [&str; 2] = ["witness", "ocr"];
-/// `extract::witness::WitnessKind::label` values (12488dd). Any other name proves nothing.
-pub const WITNESS_KINDS: [&str; 9] = [
+/// `extract::witness::WitnessKind::label` values (12488dd; 75e4e18 adds the two
+/// ruling.total_or_witnessed_sum kinds: a line-item sum accepted only with an independent words or
+/// printed-label witness; 14eb075 adds `printed_final_label_only`, not an identity but the user's
+/// `ruling.lone_printed_total`: a printed final-labeled total is accepted alone, never a computed
+/// sum or a bare-subtotal duplicate; it never carries `witness_computed`). Any other name proves
+/// nothing.
+pub const WITNESS_KINDS: [&str; 12] = [
+    "printed_final_label_only",
+    "line_item_sum_witnessed_by_words",
+    "line_item_sum_witnessed_by_label",
     "line_item_sum",
     "subtotal_plus_charges",
     "subtotal_plus_tax",
@@ -485,7 +493,8 @@ pub fn decide_witness(p: &Provenance, e: &Event, tol: f64) -> (&'static str, Opt
             .or_else(|| req.filter(|q| !close(a, *q, tol)).map(|q| format!("cutoff requires {q} (cash date {}), read selected {a}", e.cash_date())))
             .or_else(|| r.contradiction.as_ref().map(|c| format!("final label contradicts: {c}")))
             .or_else(|| r.witness.as_ref().filter(|w| !WITNESS_KINDS.contains(&w.as_str())).map(|w| format!("unknown witness kind {w:?}")))
-            .or_else(|| r.witness_computed.filter(|c| r.witness.is_none() || !close(*c, a, tol)).map(|c| format!("witness_computed {c} does not prove {a}")));
+            .or_else(|| r.witness_computed.filter(|c| r.witness.is_none() || !close(*c, a, tol)).map(|c| format!("witness_computed {c} does not prove {a}")))
+            .or_else(|| (r.witness.as_deref() == Some("printed_final_label_only") && r.witness_computed.is_some()).then(|| "printed_final_label_only on a computed figure (ruling.lone_printed_total covers printed totals only)".to_string()));
         match why {
             Some(w) => notes.push(format!("{} {}@{:?}: {w}", r.role, r.model_id, r.max_dim_px)),
             None => counted.push((a, r)),
@@ -1068,6 +1077,13 @@ tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
         let e = ocr("o02b", vec![w(o(200000.0), None, None)], "witness_accept", Some(200000.0));
         assert!(e.contains(&"IA15_accept_without_witness") && e.contains(&"IA4_no_agreement"), "{e:?}");
         assert!(ocr("o02c", vec![w(o(200000.0), None, None)], "fail_closed", None).is_empty());
+        // 75e4e18 kinds (ruling.total_or_witnessed_sum): a sum witnessed by words or a label counts.
+        assert!(ocr("o02d", vec![w(o(100000.0), Some("line_item_sum_witnessed_by_words"), Some(100000.0))], "witness_accept", Some(100000.0)).is_empty());
+        assert!(ocr("o02e", vec![w(o(100000.0), Some("line_item_sum_witnessed_by_label"), None)], "witness_accept", Some(100000.0)).is_empty());
+        // 14eb075 ruling.lone_printed_total: a printed total alone is accepted; never with a computed result.
+        assert!(ocr("o02f", vec![w(o(100000.0), Some("printed_final_label_only"), None)], "witness_accept", Some(100000.0)).is_empty());
+        let e = ocr("o02g", vec![w(o(100000.0), Some("printed_final_label_only"), Some(100000.0))], "witness_accept", Some(100000.0));
+        assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA6_outcome_mismatch"), "{e:?}");
 
         // The shape main.rs persists (26fe32f): nested `cutoff`, top-level accepted_amount/event_id,
         // no evidence record. image_05 at 704.05 after the cutoff is still caught; 822.05 passes.
