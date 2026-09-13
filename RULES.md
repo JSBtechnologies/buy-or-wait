@@ -288,7 +288,23 @@ Images (blank-amount events). Selector by linked event:
 
 Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
 
-**All 16 images: expected EventAmount (analyst read of every page; audit reference for the VLM path).** Selector per `extract/images.rs::select` (income → net pay; settled → amount paid / total; pending/scheduled → amount due for the cash date, else balance due).
+**All 16 images: expected EventAmount (analyst read of every page; audit reference for the VLM path).** Selector per `extract/images.rs::select` (income → net pay; settled → total, else amount paid; pending/scheduled → the due-date rule below, else balance due / amount due, never ≤ 0).
+
+**Due-date fields, prompt v2** (board `finding.image05_root_cause`: v1 `amount_due_before_date` / `amount_due_before_date_value` / `amount_due_after_date` had name and type inverted):
+```
+due_cutoff_date          string YYYY-MM-DD   the printed "due till / due by" date
+amount_due_by_cutoff     number              amount payable on or before that date
+amount_due_after_cutoff  number              amount payable after that date
+select (pending/scheduled):
+    if due_cutoff_date parses:
+        cash_date > cutoff  -> amount_due_after_cutoff   (None if absent: never fall back to the by-cutoff amount)
+        cash_date <= cutoff -> amount_due_by_cutoff
+    elif both amounts present -> max(by, after)            # conservative, conflict rule 4
+    else -> balance_due, else amount_due (ignore values <= 0)
+```
+image_05 v2 expected read: `{due_cutoff_date: "2026-02-06", amount_due_by_cutoff: 704.05, amount_due_after_cutoff: 822.05}`; event_1786 cash date 2026-02-09 > cutoff → **822.05**.
+
+Routing for the audit (board `decision.vlm_routing_v2`, `decision.tiebreak_distinct`): pending/scheduled rows (02, 05, 10, 11) read by Qwen3-VL-235B@1024 + claude-opus-5, tiebreak gemma-4-31B@768 counting only if it satisfies the cutoff rule; every other row read by 235B + gemma, tiebreak claude-opus-5.
 
 | image | event (status, cur) | expected | wrong-but-plausible figures on the page | risk |
 |---|---|---|---|---|
@@ -296,7 +312,7 @@ Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
 | 02 | event_1442 rent, **scheduled**, INR | **100,000** balance due | total 2,00,000; amount received 1,00,000 | cash-moving (−100,000 on 2023-08-16) |
 | 03 | event_1545 groceries, settled, INR | **41,272** cash paid | — | history; excluded from estimator (S5) |
 | 04 | event_1700 groceries, settled, INR | item bill **2,854** (line sum 2,854). The page is cropped below "Delivery…", so no final total is visible | a delivery fee line is cut off | selector returns None (no total/paid) → acceptable: history-only row, excluded from estimator; never 0 |
-| 05 | event_1786 utilities, **pending**, INR, settles 2026-02-09 | **822.05** amount due after 06-Feb-2026 (cash date is after the due date) | 704.05 due by 06-Feb; previous balance 3,543.54 | cash-moving |
+| 05 | event_1786 utilities, **pending**, INR, settles 2026-02-09 | **822.05** = `amount_due_after_cutoff` (v2); `due_cutoff_date` 2026-02-06, `amount_due_by_cutoff` 704.05 | 704.05 by-cutoff amount (the v1 trap); previous balance 3,543.54 | cash-moving; a 704.05 accept is a false accept |
 | 06 | event_3051 groceries, settled, INR | **1,995.00** invoice total | per-line totals 565/552/289; CGST/SGST 47.49 | history |
 | 07 | event_3231 dining, settled, INR | **8,528** grand total paid (alt 8,528.10 "Total") | subtotal 8,122; SGST/CGST 203.05 | reconciliation: subtotal 8,122 + tax 406.10 = 8,528.10, so a VLM `total` of 8,528 fails the exact check → rejected; allow ≥1 unit rounding tolerance or read `total`=8,528.10 |
 | 08 | event_4535 housing, settled, INR | **15,339** total amount received | line items 13,880 / 1,050 / 409 | history (message_35 confirms date only) |
