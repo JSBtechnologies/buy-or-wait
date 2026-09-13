@@ -89,6 +89,36 @@ bash final_run.sh                                          # cold + warm determi
    - byte-identical cold/warm runs.
 
    Sample requests 01–18 were used for tuning, and 19–25 were held out, reported as pass counts only.
+6. **Built with [atrium](https://github.com/nativelite/atrium), my own agentic harness.** atrium is "tmux for coding agents": a multi-agent terminal that hosts real CLI agents (here, Claude Code) in switchable, splittable panes. The whole solution was developed by an atrium **fleet** (`atrium.fleet.json`, kickoffs and rules in [`fleet/`](https://github.com/JSBtechnologies/buy-or-wait/tree/main/fleet)), with me supervising and making every product ruling.
+
+   ```mermaid
+   flowchart LR
+     H((Me<br/>rulings)) --> L[lead<br/>coordinates, no code]
+     L <-->|board + bus| AN[analyst<br/>RULES.md]
+     L <--> EN[engine<br/>ledger/forecast/plans]
+     L <--> EX[extraction<br/>messages/evidence]
+     L <--> ML[ml-engineer<br/>OCR + labels + gate]
+     L <--> VE[verifier<br/>tests + sign-off]
+     L <--> IN[integrator<br/>merges, runs, zip]
+     EN & EX & ML & VE -->|branches| IN --> M[(main)]
+   ```
+
+   **Why I used it:**
+   - **Parallel specialists.** A 24-hour solo challenge needs parallel specialists without losing control. Each agent owns specific files, works in its own git worktree, commits on its own branch, and only the integrator merges.
+   - **Visible work.** Every agent is a pane I can watch, steer or take over, unlike invisible background sub-agents. The status chrome shows who is working, who is waiting on me and who is idle.
+   - **Audit trail.** Decisions and evidence travel on a structured control plane instead of chat scroll-back, so the whole process leaves a trail. That includes the per-turn `log.txt`, board entries such as `ruling.*` and `decision.*`, and the bus history.
+
+   **What's cool about it:**
+   - **Control plane (`atrium ctl`):** a shared **board** with claims and leases (`board claim`, `state.<agent>` handoffs) and a pub/sub **bus** with topics. Questions can be routed to a specific role (`--decision --to lead`), so design questions reach the coordinator before the human.
+   - **Trust policy with ceilings** (`plan < accept < automode < skip`). Planners ran read-only in plan mode while the OCR work executed, and a worker can never raise its own permissions.
+   - **Fleet files.** A whole team relaunches from `atrium.fleet.json`, and each role resumes from its board state after context compaction instead of starting over.
+   - **Agent-aware panes:** borders and the status bar reflect each agent's real session state.
+   - **Zero third-party dependencies,** built on the nativelite stack (pty, rawterm, ansi, vterm, agsess), with Windows ConPTY as the reference platform.
+
+   **In practice on this project:**
+   - The fleet reverse-engineered the decision rules and built and tuned the engine.
+   - It ran the OCR experiments, and caught and fixed real bugs: contaminated shared build caches, a rent-change rule scaling a one-off balance, and invented cutoffs.
+   - It shipped behind a verifier sign-off, with byte-identical cold runs.
 
 ## 1. Goals
 

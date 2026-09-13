@@ -75,7 +75,7 @@ path and the Anthropic client were removed entirely (board:cleanup.remove_vlm_an
 Serving is a vLLM OpenAI-compatible endpoint — the POC runs on a RunPod H100:
 
 ```bash
-docker run --rm --gpus all --network host --ipc host vllm/vllm-openai:unlimited-ocr baidu/Unlimited-OCR \
+docker run --rm --gpus all --network host --ipc host vllm/vllm-openai:unlimited-ocr-cu129 baidu/Unlimited-OCR \
   --trust-remote-code \
   --logits_processors vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor \
   --no-enable-prefix-caching --mm-processor-cache-gb 0
@@ -107,15 +107,6 @@ the repository `RULES.md` (not shipped in `code.zip`); a mismatch means model an
 disagree and is investigated, never auto-corrected. The batch run never reads the audit
 table.
 
-## Model bake-off
-
-```bash
-CARGO_TARGET_DIR=target cargo run --release --bin bakeoff
-```
-
-Candidate models, providers, and decoding parameters live in `config/models.toml`;
-results are written to `../docs/bakeoff.md`.
-
 ## Layout
 
 ```text
@@ -124,14 +115,15 @@ code/
   src/
     main.rs         CLI entry point (batch pipeline + verify subcommand)
     model.rs         dataset CSV row structs and loaders
-    hf.rs             Hugging Face Inference Providers client
-    bin/bakeoff.rs   model bake-off harness
+    hf.rs             OpenAI-compatible HTTP client + usage/pricing types
+    bin/              coverage, gen_evidence, llm_generalization dev tools
     extract/          retrieval, image/message extraction, request intake, grounding
     engine/           ledger, recurrence, forecast, plan search/ranking, explanations
     evaluation/       invariants, output-contract validator, sample scorer, replay
     store/            processed-data store: model-call cache + persisted preprocessing
-  prompts/            versioned prompt files
-  config/models.toml  bake-off candidates and decoding/caching config (no secrets)
+  prompts/            versioned prompt files (message extraction, request intake)
+  config/models.toml  decoding/caching/OCR config (no secrets)
+  docs/               ARCHITECTURE.md (setup, approach, architecture, atrium) + PDF
   evaluation/usage_report.md   token/cost report for the final full-dataset run
   store/              (generated, gitignored) on-disk cache and processed data
 ```
