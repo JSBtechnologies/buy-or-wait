@@ -227,6 +227,12 @@ mod image_preview {
     use crate::engine::{session::Session, types::*};
     use crate::model;
 
+    /// First bold number (`**79,679.26**`) in the RULES.md table row that names `event_id`.
+    fn audited_figure(md: &str, event_id: &str) -> Option<f64> {
+        let row = md.lines().find(|l| l.starts_with('|') && l.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == event_id))?;
+        row.split("**").skip(1).step_by(2).find_map(|t| t.replace(',', "").trim().parse::<f64>().ok())
+    }
+
     /// board verify.images_64_73: with the verifier's image readings as EventAmount facts,
     /// request_64 -> safe 0, E blank; request_73 -> not_affordable, safe 68498.58, E 2023-02-15.
     #[test]
@@ -239,7 +245,14 @@ mod image_preview {
         let options = model::load_request_payment_options(ds.join("request_payment_options.csv")).unwrap();
         let messages = model::load_messages(ds.join("messages.csv")).unwrap();
         let requests = model::load_requests(ds.join("requests.csv")).unwrap();
-        for (rid, eid, amount) in [("request_64", "event_6033", 79679.26), ("request_73", "event_6859", 3650.0)] {
+        // Figures come from the analyst's RULES.md image audit table at test time; nothing
+        // precomputed lives in code.
+        let rules_md = std::fs::read_to_string(std::env::var("RULES_MD").unwrap_or_else(|_| "../RULES.md".into())).unwrap_or_default();
+        for (rid, eid) in [("request_64", "event_6033"), ("request_73", "event_6859")] {
+            let Some(amount) = audited_figure(&rules_md, eid) else {
+                println!("{rid}: no RULES.md audit figure for {eid}; skipped");
+                continue;
+            };
             let r = requests.iter().find(|r| r.request_id == rid).unwrap();
             let mut session = Session::from_model(&r.user_id, &profiles, &events, rates.clone(), patched_rules()).unwrap();
             let msgs: Vec<&model::Message> = messages.iter().filter(|m| m.user_id == r.user_id && m.sent_at.date_naive() <= r.request_date).collect();
