@@ -157,11 +157,20 @@ impl Forecast {
                 // its phase at rd + IV_SKIP_DAYS instead of continuing from the last row.
                 Cadence::EveryDays { days }
                     if stream.kind == StreamKind::VariableSpend
-                        && rules.var_long_phase == VarLongPhase::FromRequest
+                        && rules.var_long_phase != VarLongPhase::LastSettled
                         && days >= rules.var_long_min_step =>
                 {
-                    let first = start + Duration::days(rules.variable_skip_days);
-                    (0..).map(|k| first + Duration::days(k * days)).take_while(|d| *d <= stream_end).collect()
+                    let first = match rules.var_long_phase {
+                        VarLongPhase::MidStep => {
+                            (stream.last_date() + Duration::days(days)).min(start + Duration::days((days + 1) / 2))
+                        }
+                        _ => start + Duration::days(rules.variable_skip_days),
+                    };
+                    (0..)
+                        .map(|k| first + Duration::days(k * days))
+                        .take_while(|d| *d <= stream_end)
+                        .filter(|d| *d >= start)
+                        .collect()
                 }
                 _ => stream.dates_between(start, stream_end),
             };
