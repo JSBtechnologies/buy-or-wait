@@ -241,39 +241,37 @@ fn decide_one(
     let home_currency = session.profile().home_currency.clone();
     let mut facts = deterministic_evidence(&evidence.messages, &home_currency);
 
-    if let (Some(client), Some(prompt), Some(vlm_primary)) =
-        (model_ctx.client, model_ctx.image_prompt, model_ctx.config.vlm_primary())
-    {
-        let vlm_escalation = model_ctx.config.vlm_escalation();
-        let image_max_dim_px = model_ctx.config.image_max_dim_px();
-        for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
-            let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
-                continue;
-            };
-            let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
-            let typed_event = match Event::from_model(event) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("vlm: skipping {}: {e:#}", event.event_id);
+    if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
+        if model_ctx.config.vlm_primary().is_some() {
+            let image_max_dim_px = model_ctx.config.image_max_dim_px();
+            for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
+                let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
                     continue;
+                };
+                let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+                let typed_event = match Event::from_model(event) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("vlm: skipping {}: {e:#}", event.event_id);
+                        continue;
+                    }
+                };
+                // resolve_blank_amount dispatches on config.vlm_mode() (escalate vs.
+                // two-model agreement) internally now, per extraction's decision.vlm_setup.
+                match images::resolve_blank_amount(
+                    client,
+                    model_ctx.cold,
+                    prompt,
+                    image_max_dim_px,
+                    &image_path,
+                    &image.image_id,
+                    model_ctx.config,
+                    &typed_event,
+                ) {
+                    Ok(Some(record)) => facts.push(record),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
                 }
-            };
-            match images::resolve_blank_amount(
-                client,
-                model_ctx.cold,
-                prompt,
-                &model_ctx.config.decoding,
-                image_max_dim_px,
-                &image_path,
-                &image.image_id,
-                vlm_primary,
-                vlm_escalation,
-                model_ctx.config.vlm_fallback(),
-                &typed_event,
-            ) {
-                Ok(Some(record)) => facts.push(record),
-                Ok(None) => {}
-                Err(e) => eprintln!("vlm: {} failed: {e:#}", image.image_id),
             }
         }
     }
