@@ -675,7 +675,16 @@ pub fn extract_batch(
         temperature: decoding.temperature,
         seed: decoding.seed,
         max_tokens: decoding.max_tokens_llm,
-        json_response: candidate.supports_structured_output,
+        // ml-engineer's step-5 harness (blocker.msg86_json_array_mismatch): this call's
+        // contract is a top-level JSON *array* (one entry per batched message), but
+        // `response_format: json_object` requires a top-level *object* on every provider
+        // that implements it -- SEA-LION and its DeepSeek fallback both collapsed a batch
+        // to one bare `{message_id, records}` object instead of the array this parses
+        // below. That breaks any batch, including production's single-message batch=1 call
+        // for msg_86. Never force structured-output mode for this array-shaped contract;
+        // the prompt's own "strict JSON only" instruction is what every other array-shaped
+        // path here already relies on.
+        json_response: false,
         json_schema: None,
     };
     let response =
