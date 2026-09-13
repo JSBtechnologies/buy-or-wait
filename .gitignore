@@ -7,3 +7,5 @@ code/store/
 code/target/
 scratch/
 dist/
+bash.exe.stackdump
+*.stackdump

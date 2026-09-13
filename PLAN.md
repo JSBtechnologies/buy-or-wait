@@ -308,3 +308,19 @@ Required field values:
 - Add a line `agent=<your agent name>` directly under `tool=` so entries from different panes can be told apart
 
 Never log secrets: the HF token, API keys, cookies. Write `[REDACTED]`.
+
+## 8. Context discipline: context-mode and strategic compaction (mandatory, all agents)
+
+**context-mode is required.** Tool output enters your context and costs reasoning capacity for the rest of the session.
+- Use `ctx_batch_execute` (commands plus queries in one call) for research, and `ctx_execute` / `ctx_execute_file` to filter, count, parse, or diff large output: cargo build/test, `sample_report`, `dump_diagnostics`, dataset/CSV analysis, `log.txt` greps, long git logs/diffs. Print only the derived answer.
+- Use `ctx_search` for follow-ups on indexed output, and on resume to recover prior decisions (`sort: "timeline"`).
+- Plain Bash is only for short observed output and mutations: git commit/merge, `atrium ctl`, and the `log.txt` append.
+- context-mode does not persist files. Write files with Write/Edit (`log.txt` stays Bash-append only). `ctx_execute_file` is confined to your own project root.
+
+**Strategic compaction.** Compact only at a logical boundary: work committed, bus/board updated, nothing in flight.
+1. Before compacting, write a handoff to `atrium ctl board set state.<name>`: head sha, done, in_progress, next, blockers, decisions.
+2. Compact on a `[StrategicCompact]` warning, or before a new large task while context is heavy. If you can't trigger it yourself, post "ready to compact at <sha>" and the lead or user runs it.
+3. After compaction or restart: re-read PLAN.md, `atrium ctl board get state.<name>`, `atrium ctl bus feed`, `ctx_search` your prior decisions, then continue.
+- The lead never compacts the integrator mid-merge or the verifier mid-scoring run.
+
+**Resume guard.** In the endgame, a restarted agent must not redo its kickoff (no re-scaffold, no re-run bake-off). Continue from board state. Commit or hand off uncommitted edits first, and never leave edits in files you don't own.
