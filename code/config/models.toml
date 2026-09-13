@@ -302,7 +302,7 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 #   [selected]
 #   vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
 #   vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px
-#   vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (fails the backup gate), claude-opus-5 IN -- gate test still in progress, see docs/bakeoff.md
+#   vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (failed the backup gate), claude-opus-5 IN -- USER ACCEPTED (board decision.backup_gate, criterion 5 [>=2 providers] waived for a direct-API model): 90.6% field accuracy (best of any VLM tested), 100% valid-JSON, 83.3% selected-figure accuracy, 83.3% reconciliation, 0 false-accepts (docs/bakeoff.md)
 #   vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
 #   image_max_dim_px = 1024
 #   llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai
