@@ -47,7 +47,7 @@
 
 \title{\textbf{Buy or Wait?}\\[2pt]\large Architecture and Design of a Verified-or-Fail-Closed Financial Decision Agent}
 \author{HackerRank Orchestrate --- September 2026}
-\date{Revision: main \texttt{fbe1c4a} (verifier sign-off on \texttt{3c77c81})}
+\date{Revision: main \texttt{1f381fe} (verifier sign-off on \texttt{7b68395})}
 
 \begin{document}
 \maketitle
@@ -130,8 +130,8 @@ The submission runs both phases in batch over the dataset.
   \node[box, below right=10mm and 22mm of main] (eval) {\texttt{evaluation}\\\footnotesize verification};
   \node[box, above left=4mm and 20mm of main] (model) {\texttt{model}\\\footnotesize typed CSV loaders};
   \node[box, above right=4mm and 20mm of main] (store) {\texttt{store}\\\footnotesize cache + processed};
-  \node[box, below=10mm of extract] (hf) {\texttt{hf} / \texttt{anthropic}\\\footnotesize HTTP clients (legacy, off)};
-  \node[box, below=10mm of eval] (bins) {\texttt{bin/}\\\footnotesize bakeoff, coverage,\\\footnotesize gen\_evidence, llm\_generalization};
+  \node[box, below=10mm of extract] (hf) {\texttt{hf}\\\footnotesize HTTP client + usage types};
+  \node[box, below=10mm of eval] (bins) {\texttt{bin/}\\\footnotesize coverage, gen\_evidence,\\\footnotesize llm\_generalization};
   \draw[flow] (main) -- (extract); \draw[flow] (main) -- (engine); \draw[flow] (main) -- (eval);
   \draw[flow] (main) -- (model);   \draw[flow] (main) -- (store);
   \draw[flow] (extract) -- node[lbl,below=1mm,font=\scriptsize]{\texttt{Fact}, \texttt{EvidenceRecord}} (engine);
@@ -211,7 +211,7 @@ Sixteen financial events have blank amounts whose values are printed on images (
 handwritten pharmacy bill). Four of them are pending or scheduled and therefore change a forecast.
 
 \subsection{Why OCR plus deterministic mapping}
-An audit of earlier vision-language-model reads (Qwen3-VL-235B, gemma-4-31B) found that the models transcribed every
+An audit of earlier vision-language-model reads (Qwen3-VL-235B, gemma-4-31B; that path has since been removed from the codebase) found that the models transcribed every
 printed final amount correctly. Every failure came from asking the model to \emph{interpret} the page into fixed JSON keys:
 it invented totals, subtotals, balances and due-date cutoffs the page did not print. The redesign lets the model only
 transcribe what is printed; Rust assigns meaning from the printed label text.
@@ -493,7 +493,6 @@ missing pages call the endpoint. \texttt{-{}-cold} wipes the processed store so 
   \item \textbf{Handwriting.} Line items on image 14 are misread; only its printed total is used.
   \item \textbf{Unauthenticated POC endpoint.} Production needs an API key (\texttt{OCR\_API\_KEY}) and private networking.
   \item \textbf{Small labelled sample.} 25 sample requests (7 held out) limit how precisely rule toggles can be validated.
-  \item \textbf{Legacy readers.} The Hugging Face VLM and Anthropic paths remain compiled but switched off; they could be removed to shrink the attack and maintenance surface.
 \end{itemize}
 
 \end{document}

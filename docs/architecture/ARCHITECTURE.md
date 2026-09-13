@@ -2,7 +2,7 @@
 
 > The full design document with LaTeX/TikZ diagrams is [`architecture.tex`](architecture.tex). Build it with `latexmk -pdf architecture.tex` or `tectonic architecture.tex`. This page is the GitHub-rendered summary, with Mermaid diagrams.
 
-**Revision:** `main@fbe1c4a`. Verifier sign-off is on `3c77c81`.
+**Revision:** `main@1f381fe`. Verifier sign-off is on `7b68395`.
 
 **Final run:**
 - 250 decisions, 0 contract violations, 0 invariant violations.
@@ -47,7 +47,7 @@ flowchart TB
   main --> evaluation[evaluation<br/>verification]
   extract -->|Fact, EvidenceRecord| engine
   evaluation --> engine
-  extract -.-> hf[hf / anthropic<br/>legacy HTTP clients, off]
+  extract -.-> hf[hf<br/>HTTP client + usage types]
 ```
 
 | Module | Responsibility |
@@ -89,7 +89,7 @@ flowchart TB
 
 ## 5. Image evidence pipeline
 
-**Why this design:** an audit found the earlier VLM reads (Qwen3-VL-235B, gemma-4-31B) transcribed every printed final amount correctly. All failures came from asking the model to fill fixed JSON keys. It invented totals, subtotals, balances and cutoffs. Now the model only transcribes, and Rust maps printed labels to meaning.
+**Why this design:** an audit found the earlier VLM reads (Qwen3-VL-235B, gemma-4-31B; that path has since been removed) transcribed every printed final amount correctly. All failures came from asking the model to fill fixed JSON keys. It invented totals, subtotals, balances and cutoffs. Now the model only transcribes, and Rust maps printed labels to meaning.
 
 ```mermaid
 flowchart LR
@@ -227,4 +227,3 @@ CARGO_TARGET_DIR=target cargo test
 - **Handwritten line items** (14) are misread. Only the printed total is used.
 - **The POC endpoint** is unauthenticated. Production needs `OCR_API_KEY` and private networking.
 - **The labelled sample is small**: 25 requests, 7 held out.
-- **Legacy HF VLM and Anthropic paths** are compiled but off. They are candidates for removal.
