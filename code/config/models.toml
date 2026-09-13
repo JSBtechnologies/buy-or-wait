@@ -350,12 +350,14 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 
 [vlm_routing]
 default_class = "settled_expense_receipt"
-# Verifier #250: top-level reconciliation tolerance, must be <= 1.0 (mirrors
-# extract/images.rs's `const TOL: f64 = 0.01` for subtotal+tax=total etc.).
-# Value/key name not yet confirmed with extraction -- flagged on bus topic
-# extract for their read-side to pick this up (or say it's already an
-# internal constant and this key is unused).
-reconciliation_tolerance = 0.01
+# Verifier gate #250: cross-model agreement/tiebreak matching tolerance
+# (currency units), NOT the reconciliation TOL constant (that stays a
+# fixed 0.01 in extract/images.rs). Confirmed key name and semantics from
+# extraction's 0248730 (extract/model_config.rs): must be in [0.0, 1.0],
+# hard error above that -- board decision.accuracy_first requires 0 false
+# accepts, and a looser tolerance would accept more disagreeing reads as
+# "agreeing".
+tolerance = 0.01
 
 [[vlm_routing.classes]]
 name = "income_payslip"
