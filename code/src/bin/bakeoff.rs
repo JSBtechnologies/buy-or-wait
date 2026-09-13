@@ -553,12 +553,14 @@ fn downscale_and_encode(path: &Path, max_dim: u32) -> Result<String> {
 
 fn image_call(
     client: &HfClient,
+    anthropic_client: Option<&buyorwait::anthropic::AnthropicClient>,
     candidate: &CandidateConfig,
     cfg: &DecodingConfig,
     prompt: &PromptSet,
     image_b64: &str,
     rescore_from_cache: bool,
 ) -> Result<(Option<Value>, Usage)> {
+    let is_anthropic = candidate.provider == "anthropic";
     let call = ModelCall {
         model_id: candidate.id.clone(),
         provider: candidate.provider.clone(),
@@ -576,12 +578,23 @@ fn image_call(
         seed: cfg.seed,
         max_tokens: cfg.max_tokens_vlm,
         json_response: candidate.supports_structured_output,
-        json_schema: None,
+        json_schema: if is_anthropic && candidate.supports_structured_output {
+            Some(buyorwait::anthropic::image_figures_json_schema())
+        } else {
+            None
+        },
     };
     // Rescore mode (--rescore-from-cache): read the existing cache, never
-    // call the router. Used to re-run select()/reconciles() against
+    // call the router/API. Used to re-run select()/reconciles() against
     // already-obtained model outputs after a selector fix, at zero cost.
-    let resp = if rescore_from_cache {
+    let resp = if is_anthropic {
+        let ac = anthropic_client.context("anthropic candidate but no AnthropicClient configured")?;
+        if rescore_from_cache {
+            ac.chat_completion(&call)?
+        } else {
+            ac.chat_completion_cold(&call)?
+        }
+    } else if rescore_from_cache {
         client.chat_completion(&call)?
     } else {
         client.chat_completion_cold(&call)?
@@ -604,6 +617,7 @@ const KNOWN_SELECTOR_BUG_IMAGES: &[&str] = &["image_07", "image_11", "image_12"]
 
 fn run_vlm_candidate(
     client: &HfClient,
+    anthropic_client: Option<&buyorwait::anthropic::AnthropicClient>,
     candidate: &CandidateConfig,
     models_cfg: &ModelsConfig,
     gold: &GoldSubset,
@@ -633,7 +647,7 @@ fn run_vlm_candidate(
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, max_dim)?;
-            let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
+            let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
             let parsed = match outcome {
                 Ok((parsed, _usage)) => {
                     consecutive_failures = 0;
@@ -685,7 +699,7 @@ fn run_vlm_candidate(
                 eprintln!("  [{}] run {}/{runs}: calling {} ...", candidate.id, run_idx + 1, img.image_id);
                 let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
                 let b64 = downscale_and_encode(&path, chosen_max_dim)?;
-                let outcome = image_call(client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
+                let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
                 let parsed = match outcome {
                     Ok((parsed, usage)) => {
                         consecutive_failures = 0;
@@ -1231,6 +1245,21 @@ fn main() -> Result<()> {
     let client = HfClient::with_cache_dir(&args.cache_dir)?
         .with_request_timeout(60)?
         .with_retry_policy(2, 1000, 2.0, 4000);
+    // Only needed when a candidate's provider == "anthropic" (board
+    // decision.claude_backup); optional so an HF-only config still runs
+    // without ANTHROPIC_API_KEY set.
+    let anthropic_client: Option<buyorwait::anthropic::AnthropicClient> = {
+        let wants_anthropic = cfg.candidates.vlm.iter().chain(&cfg.candidates.llm).any(|c| c.provider == "anthropic");
+        if wants_anthropic {
+            Some(
+                buyorwait::anthropic::AnthropicClient::with_cache_dir(&args.cache_dir)?
+                    .with_request_timeout(90)?
+                    .with_retry_policy(2, 1000, 2.0, 4000),
+            )
+        } else {
+            None
+        }
+    };
 
     eprintln!(
         "bake-off: {} VLM candidate(s), {} LLM candidate(s), {} runs each, {} labeled + {} unlabeled images, {} messages (parallel per modality, 60s/req timeout, circuit breaker at {CIRCUIT_BREAKER_THRESHOLD} consecutive failures)",
@@ -1269,6 +1298,7 @@ fn main() -> Result<()> {
                         eprintln!("=== VLM candidate: {} ({}) ===", candidate.id, candidate.provider);
                         run_vlm_candidate(
                             &client,
+                            anthropic_client.as_ref(),
                             candidate,
                             &cfg,
                             &gold,
