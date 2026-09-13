@@ -17,7 +17,7 @@ Every tunable rule has a name. Engine should expose each as a config value. The 
 | `SAME_DAY_ORDER` | `debits_first` | `credits_first` | request_18 safe 462 → 546 (+18%) | S2.3 |
 | `PAYMENT_TIMING` | `after_day_rows` | `before_credits` | rejects all 5 salary-day wait plans (03, 04, 08, 13, 18) | S3.5 |
 | `IV_SKIP_DAYS` | `2` (Interval occurrences on rd, rd+1 skipped) | `0` | 15 outflow −2.9% → −17.1%; 06 −7.6% → −21.1% and E wrong; 10 +5.5% → +4.4% | S3.2 |
-| `BILL_ESTIMATOR` | `mean_last3` | `max_last3`, `mid_all` ((min+max)/2), `mean_all` | `mid_all` marginally better sum of abs outflow err (0.338 vs 0.352), same E; `max_last3` worse (08 −52%, 13 −99% when combined with max var) | S3.3 |
+| `BILL_ESTIMATOR` | `mean_last3` | `max_last3`, `mid_all` ((min+max)/2), `mean_all` | `mid_all` marginally better sum of abs outflow err (0.338 vs 0.352), same E; engine f776790 (with evidence): safe within 1% 4→6 but one status wrong, so keep `mean_last3`; daily-rate accrual worsens outflow err 2.6%→5.2% (engine #160, agrees with §S3.7); `max_last3` worse (08 −52%, 13 −99% when combined with max var) | S3.3 |
 | `VAR_ESTIMATOR` | `mean_all` | `median_all`, `max_last4` | `max_last4` closes 05 (−0.3%) and 10 (−0.4%) but breaks 06 −21%, 08 −29%, 13 −20% | S3.3 |
 | `VAR_HORIZON` | `same_as_horizon` | `rd_plus_90` (Interval streams only). Exact semantics (verifier #104): when on, the **day series runs rd ..= rd+90**; Interval-stream occurrences in (horizon_end, rd+90] count **on their own dates** (no clamping); Monthly streams, salary, pending and scheduled rows stay limited to horizon_end; `safe` and E take their minima over the full rd..rd+90 series (E candidates also run to rd+90). With nothing else after horizon_end, balances there only fall, so the low point moves to the last extra occurrence | 05 +1.0% → −2.3%, 10 +5.5% → +3.4%; others unchanged | S3.3 |
 | `SCHEDULED_REPLACES_CYCLE` | `on` (±15 days, salary re-anchors day) | `off` | no tuning row exercises it (request_86, 44/104/164/224 in eval) | S3.4c |
@@ -221,6 +221,36 @@ Includes the §S3.2 rd/rd+1 variable-occurrence skip. "outflow err" = (safe − 
 | 17 | 243,001.82 | 243,849.58 | −0.3% | −0.6% | 2026-04-15 | 2026-03-15 | ✗ |
 | 18 | 454.67 | 462 | −1.6% | −1.2% | 2026-09-15 | 2026-09-15 | ✓ |
 
+### S3.7 Label arithmetic audit of the safe-amount residuals (lead: 1% rows 02/07/08/11/17)
+
+Method: at each row's trough day, take the label's implied spending `need = B0 + (fixed items and pending/scheduled up to the trough) − M − label_safe`. That leaves only the variable-estimate occurrences (Monthly variable bills + Interval streams), with occurrence counts from S3.2.
+
+| req | cur | variable occurrences before trough | label need | S3.3 estimate | diff | diff % |
+|---|---|---|---|---|---|---|
+| 02 | IDR | util, groc, health, trans, ent ×1 | 7,803,300 | 7,927,591.17 | −124,291.17 | −1.6% |
+| 03 | IDR | util, groc, shop, dining ×1 | 894,900 | 790,959.44 | +103,940.56 | +13.1% |
+| 04 | IDR | util, groc×2, trans, dining, ent | 9,676,700 | 8,941,626.53 | +735,073.47 | +8.2% |
+| 05 | ZAR | util×3, health×3, groc×12, trans×6, shop×3 | 16,929 | 16,598.95 | +330.05 | +2.0% |
+| 06 | EUR | util, groc, trans×2, dining, shop, ent | 235 | 275.82 | −40.82 | −14.8% |
+| 07 | INR | util, groc, dining, trans ×1 | 22,120 | 22,823.32 | −703.32 | −3.1% |
+| 08 | EUR | groc, trans, dining ×1 | 148 | 147.37 | +0.63 | +0.4% |
+| 10 | INR | util×3, groc×12, trans×12, dining×6, ent×3 | 345,190 | 316,840.72 | +28,349.28 | +8.9% |
+| 11 | IDR | util, groc, trans, health, dining ×1 | 9,332,800 | 9,445,945.33 | −113,145.33 | −1.2% |
+| 13 | EUR | groc×10, trans×10, dining×5, ent×3, util×2 | 2,165 | 2,139.30 | +25.70 | +1.2% |
+| 14 | EUR | util, groc, health, trans, shop ×1 | 544 | 524.40 | +19.60 | +3.7% |
+| 15 | EUR | util, dining, groc, trans ×1 | 206 | 220.01 | −14.01 | −6.4% |
+| 17 | INR | util, groc×2, trans×2, dining | 43,240 | 44,087.76 | −847.76 | −1.9% |
+| 18 | EUR | util, health, groc, trans, dining ×1 | 488 | 495.33 | −7.33 | −1.5% |
+
+**Systematic finding (exact, 14/14 uncapped rows):** the label's variable spending is always a whole multiple of a per-currency unit: **IDR 100, INR 10, EUR/ZAR 1**. None of the 14 has cents, although every history amount does. By chance alone that would be about 1/100 per EUR row. So the generator projects each variable occurrence as a **whole-unit base amount**, not a statistic of the noisy history.
+
+**No recoverable offset:**
+- Every uniform (Interval estimator × Monthly estimator × {round, ceil, floor, none} to the unit) over {mean, median, midrange, last, max, min, mean/max/median of last 3–13} was tried. The best reproduces 2/14 rows exactly (13, 14, with no pattern); nothing else gets above 1/14.
+- Diff signs are balanced: 7 negative (02, 06, 07, 11, 15, 17, 18), 7 positive. So there is no bias to correct by a multiplier.
+- For the 5 rows asked about, the gaps are 0.4–3.1% of variable spend. That is the size of mean-of-history noise (±2–3%, §S0). Rounding our estimates to the unit moves each row by at most unit × count (≤ IDR 500, INR 60, EUR 12), which does not close any gap.
+
+**Rule change: none to the numbers.** Optional, harmless toggle `EST_ROUND_UNIT` (default off): round each variable occurrence estimate half-up to IDR 100 / INR 10 / EUR, ZAR, USD 1. It makes engine outflows integer in the same units as the labels, but exact matches stay at 0 extra on 01–18. The 4 exact `amount_safe_to_pay` rows (01, 09, 12, 16) are all caps; exact uncapped safe amounts are not achievable from the data.
+
 E exact 16/18; every outflow within ±8%, 12/14 uncapped within ±5%. Status of the lead's open list: **05** closed (structure right: final payroll + horizon; 1% estimator residual), **10** closed structurally (no gig income: message_07 payout pending; counting any payout moves it further from the label; 5.5% estimator residual), **15** closed (rd/rd+1 skip: −17% → −2.9% outflow), **06** mostly (−21% → −7.6% outflow; E now ✓). Remaining misses (03, 04 ~+5%, 11/17 E) are estimator noise against hidden base amounts.
 
 ---
@@ -257,6 +287,31 @@ Images (blank-amount events). Selector by linked event:
 | image_03 | user_17 event_1545 "Bulk groceries and pantry purchase" (settled, history) | Cash Paid 41,272 | history only; **exclude this one-off bulk row from the groceries estimator** (including it moves request_17 safe from −0.3% to −1.3%) |
 
 Indian digit grouping (`2,00,000.00` = 200,000) must be parsed correctly.
+
+**All 16 images: expected EventAmount (analyst read of every page; audit reference for the VLM path).** Selector per `extract/images.rs::select` (income → net pay; settled → amount paid / total; pending/scheduled → amount due for the cash date, else balance due).
+
+| image | event (status, cur) | expected | wrong-but-plausible figures on the page | risk |
+|---|---|---|---|---|
+| 01 | event_253 salary, settled, IDR | **4,365,000** net pay | total earnings 4,780,800; subtotal deductions 415,800. Arrears 1,964,250 is NOT on the payslip (separate settled event_211); never add it | history only |
+| 02 | event_1442 rent, **scheduled**, INR | **100,000** balance due | total 2,00,000; amount received 1,00,000 | cash-moving (−100,000 on 2023-08-16) |
+| 03 | event_1545 groceries, settled, INR | **41,272** cash paid | — | history; excluded from estimator (S5) |
+| 04 | event_1700 groceries, settled, INR | item bill **2,854** (line sum 2,854). The page is cropped below "Delivery…", so no final total is visible | a delivery fee line is cut off | selector returns None (no total/paid) → acceptable: history-only row, excluded from estimator; never 0 |
+| 05 | event_1786 utilities, **pending**, INR, settles 2026-02-09 | **822.05** amount due after 06-Feb-2026 (cash date is after the due date) | 704.05 due by 06-Feb; previous balance 3,543.54 | cash-moving |
+| 06 | event_3051 groceries, settled, INR | **1,995.00** invoice total | per-line totals 565/552/289; CGST/SGST 47.49 | history |
+| 07 | event_3231 dining, settled, INR | **8,528** grand total paid (alt 8,528.10 "Total") | subtotal 8,122; SGST/CGST 203.05 | reconciliation: subtotal 8,122 + tax 406.10 = 8,528.10, so a VLM `total` of 8,528 fails the exact check → rejected; allow ≥1 unit rounding tolerance or read `total`=8,528.10 |
+| 08 | event_4535 housing, settled, INR | **15,339** total amount received | line items 13,880 / 1,050 / 409 | history (message_35 confirms date only) |
+| 09 | event_5170 utilities, settled, INR | **723** total amount received | — | history |
+| 10 | event_6033 groceries, **pending**, INR | **79,679.26** balance due | subtotal 72,045; any single tax line 1,513.13 / 2,304 | cash-moving |
+| 11 | event_6859 healthcare, **scheduled**, INR | **3,650** amount payable / balance | detailed-breakup subtotals sum to **3,150** (250+1,400+1,000+500), inconsistent with the 3,650 summary; amount paid 0 | cash-moving; if the VLM fills `line_items_sum_check` from the breakup, the sum check (3,150 ≠ 3,650) rejects the image → leave that check off for this layout or take it from the top table (1,650+1,000+1,000) |
+| 12 | event_7307 transport, settled, **USD** | **33.50 USD** total (→ INR at the 2025-10-01 USD→INR row) | **cash paid 40.00**, change 6.50 | `select` prefers `amount_paid` → 40.00 would be wrong; amount paid must be net of change (= total) |
+| 13 | event_7941 shopping, settled, INR | **2,298** total paid | item prices 699 / 1,599 | history |
+| 14 | event_9421 healthcare, settled, INR (handwritten) | **4,543** total (lines 1,500+724+796+550+303+670) | struck-through line reads as 670 | history; handwriting read risk |
+| 15 | event_9806 transport, settled, INR | **9,968.00** grand total | 9,580 (air travel line incl. taxes), 9,512 (total excl. tax), 9,124 taxable | history |
+| 16 | event_10521 transport, settled, INR | **393.22** total | 333.24 energy amount; 29.99 each GST | history (message_86 confirms date only) |
+
+**Sign-off gate (user decision `decision.accuracy_first`):** for every model-derived fact, a flagged missing value always beats a wrong one. The image/message audit signs off only when **false accepts = 0** (a wrong amount accepted counts even once, on any read combination). "Unverifiable" (no reads for a routed model) is **not** a pass, and "missing/escalated" is acceptable. Validation has no time cutoff: audits wait for the data instead of reporting partial results as final.
+
+Cash-moving images (change a request's forecast): **02, 05, 10, 11**. The other 12 only feed stream estimators, and a missing figure there is safe (row excluded) as long as it is never read as 0.
 
 ---
 
