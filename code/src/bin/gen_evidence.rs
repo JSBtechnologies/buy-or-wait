@@ -1,7 +1,8 @@
 //! One-off tool (owner: extraction): generate per-user `EvidenceRecord`s via the
 //! deterministic, zero-token skeleton parser and write them to
 //! `code/store/evidence/<user_id>.json` so engine can read them directly while the model
-//! path (bake-off/hf.rs) is still pending — board decision `evidence_handoff`.
+//! path (bake-off/hf.rs) is still pending — board decision `evidence_handoff`. Covers all
+//! 275 users (started at 01-25, extended per lead instruction).
 //!
 //! Not part of the main pipeline: the integrator wires
 //! `extract::messages::deterministic_evidence` into `main.rs`'s own run separately, per
@@ -35,17 +36,12 @@ fn main() -> anyhow::Result<()> {
         as_of_by_user.entry(r.user_id.clone()).or_insert(r.request_date);
     }
 
-    // Board decision.evidence_handoff: users 01-25 first.
-    let mut user_ids: Vec<&String> = as_of_by_user
-        .keys()
-        .filter(|u| {
-            u.strip_prefix("user_")
-                .and_then(|n| n.parse::<u32>().ok())
-                .map(|n| n <= 25)
-                .unwrap_or(false)
-        })
-        .collect();
-    user_ids.sort();
+    // Board decision.evidence_handoff: users 01-25 first, now extended to all 275 users
+    // (lead: "Regenerate store/evidence for ALL 275 users").
+    let mut user_ids: Vec<&String> = as_of_by_user.keys().collect();
+    user_ids.sort_by_key(|u| {
+        u.strip_prefix("user_").and_then(|n| n.parse::<u32>().ok()).unwrap_or(u32::MAX)
+    });
 
     let out_dir = Path::new("store/evidence");
     fs::create_dir_all(out_dir)?;

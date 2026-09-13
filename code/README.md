@@ -64,9 +64,12 @@ same binary:
 CARGO_TARGET_DIR=target cargo run --release -- verify validate --output ../output.csv
 CARGO_TARGET_DIR=target cargo run --release -- verify score --output ../output.csv
 CARGO_TARGET_DIR=target cargo run --release -- verify selftest
+CARGO_TARGET_DIR=target cargo run --release -- verify signoff --output ../output.csv --usage evaluation/usage_report.md
 ```
 
-Exit code is `0` on pass, `1` on a failing check, `2` on a usage error.
+Exit code is `0` on pass, `1` on a failing check, `2` on a usage error. `signoff` is the
+ship gate: contract, status distribution, injected-text/hardcoded-id scans, secrets, and
+the usage report's presence/sections/secrets, all in one pass/fail report.
 
 ## Model bake-off
 
@@ -97,18 +100,76 @@ code/
   store/              (generated, gitignored) on-disk cache and processed data
 ```
 
-## Packaging `code.zip`
+## Final submission run
 
-The submission `code.zip` is this `code/` directory, excluding anything generated or
-local-only:
+One command runs the whole ship sequence (PLAN.md §5 Phase 3): a cold run producing the
+submitted `output.csv` and `evaluation/usage_report.md`, a warm rerun that must reproduce
+them byte-for-byte (determinism check) and reports the cache hit rate, `verify signoff`
+against the cold run's files, and rebuilding `code.zip` from the exact commit that
+produced them:
 
 ```bash
 cd code
-zip -r ../code.zip . -x 'target/*' -x 'store/*' -x 'scratch/*' -x '.env'
+bash final_run.sh
 ```
 
-(PowerShell equivalent: copy `code/` to a temp folder, delete `target/`, `store/`,
-`scratch/`, and `.env` from the copy, then `Compress-Archive` that folder to
-`code.zip`.) `evaluation/usage_report.md`, `prompts/`, and `config/models.toml` are
-included as required by the submission; no HF token or other secret is ever written
-to a tracked or packaged file.
+It exits non-zero (before touching signoff or the zip) if the warm rerun doesn't
+byte-match the cold run's `output.csv`. `dist/` (gitignored, outside git) is where the
+zip lands.
+
+### The same steps without bash (PowerShell / cmd)
+
+`final_run.sh` is a bash script (AGENTS.md: don't assume bash is available). The same
+sequence run directly:
+
+PowerShell:
+
+```powershell
+cd code
+$env:CARGO_TARGET_DIR = "target"
+cargo run --release -- --cold
+Copy-Item ..\output.csv ..\output.cold.csv
+Copy-Item evaluation\usage_report.md evaluation\usage_report.cold.md
+cargo run --release
+if ((Get-FileHash ..\output.cold.csv).Hash -eq (Get-FileHash ..\output.csv).Hash) {
+    "byte-identical: PASS"
+} else {
+    Write-Error "byte-identical: FAIL (cold and warm runs produced different output.csv)"
+}
+Move-Item ..\output.cold.csv ..\output.csv -Force
+Move-Item evaluation\usage_report.cold.md evaluation\usage_report.md -Force
+cargo run --release -- verify signoff --output ..\output.csv --usage evaluation\usage_report.md
+New-Item -ItemType Directory -Force ..\dist | Out-Null
+git -C .. archive --format=zip -o dist/code.zip HEAD -- code
+```
+
+cmd.exe:
+
+```bat
+cd code
+set CARGO_TARGET_DIR=target
+cargo run --release -- --cold
+copy /Y ..\output.csv ..\output.cold.csv
+copy /Y evaluation\usage_report.md evaluation\usage_report.cold.md
+cargo run --release
+fc /B ..\output.cold.csv ..\output.csv >nul && echo byte-identical: PASS || echo byte-identical: FAIL
+move /Y ..\output.cold.csv ..\output.csv
+move /Y evaluation\usage_report.cold.md evaluation\usage_report.md
+cargo run --release -- verify signoff --output ..\output.csv --usage evaluation\usage_report.md
+mkdir ..\dist 2>nul
+git -C .. archive --format=zip -o dist/code.zip HEAD -- code
+```
+
+## Packaging `code.zip` manually
+
+`final_run.sh`'s last step is just `git archive`, packaging the exact committed `code/`
+tree — no manual include/exclude list needed, since anything generated or local-only
+(`target/`, `store/`, `scratch/`, `.env`) was never tracked in the first place:
+
+```bash
+git archive --format=zip -o dist/code.zip HEAD -- code
+```
+
+`evaluation/usage_report.md`, `prompts/`, and `config/models.toml` are included as
+required by the submission; no HF token or other secret is ever written to a tracked or
+packaged file.

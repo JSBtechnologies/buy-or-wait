@@ -1,0 +1,3 @@
+output.csv -text
+*.csv -text
+*.sh text eol=lf

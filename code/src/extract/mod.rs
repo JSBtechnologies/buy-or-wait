@@ -11,30 +11,11 @@ pub mod grounding;
 pub mod images;
 pub mod intake;
 pub mod messages;
+pub mod model_config;
+pub mod prompts;
 pub mod retrieval;
 
 use anyhow::Result;
-
-/// One model call's raw result. `text` is expected to be strict JSON (see `code/prompts/`);
-/// token counts feed the usage report (ml-engineer, PLAN.md §2.5/§6.5).
-pub struct ModelResponse {
-    pub text: String,
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-}
-
-/// The model call boundary. ml-engineer's `crate::hf` provides the concrete client; this
-/// trait keeps `extract/` compilable and testable independent of which model the bake-off
-/// (PLAN.md Phase 2d) picks.
-pub trait ModelClient {
-    /// `images` are raw PNG bytes to attach (VLM calls only; empty for text-only calls).
-    fn complete(
-        &self,
-        system_prompt: &str,
-        user_prompt: &str,
-        images: &[Vec<u8>],
-    ) -> Result<ModelResponse>;
-}
 
 /// Parse a model's raw text reply as strict JSON, tolerating an accidental ```json fence
 /// despite the prompt instructing against one.
@@ -47,6 +28,72 @@ pub fn parse_json_reply(text: &str) -> Result<serde_json::Value> {
         .and_then(|s| s.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed);
-    serde_json::from_str(unfenced)
-        .map_err(|e| anyhow::anyhow!("model reply is not valid JSON: {e}\nraw: {trimmed}"))
+    if let Ok(v) = serde_json::from_str(unfenced) {
+        return Ok(v);
+    }
+    // A thinking model (e.g. Kimi-K3, ml-engineer #204) can still prefix its reply with
+    // reasoning text even outside a ```-fence; locate the outermost {...} or [...] and
+    // parse just that, rather than requiring the whole reply to be JSON.
+    if let Some(json_slice) = extract_json_span(unfenced) {
+        if let Ok(v) = serde_json::from_str(json_slice) {
+            return Ok(v);
+        }
+    }
+    Err(anyhow::anyhow!("model reply is not valid JSON\nraw: {trimmed}"))
+}
+
+/// The substring from the first `{`/`[` to the matching last `}`/`]`, tracking string
+/// literals so a brace inside quoted text doesn't end the span early. `None` if no opening
+/// bracket is found.
+fn extract_json_span(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
+    let opening = bytes[start];
+    let closing = if opening == b'{' { b'}' } else { b']' };
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b if b == opening => depth += 1,
+            b if b == closing => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_json_with_reasoning_preamble() {
+        let reply = "Let me think about this step by step. The subtotal is 100 and tax is 5.\n\n{\"subtotal\": 100.0, \"tax\": 5.0}";
+        let v = parse_json_reply(reply).expect("should extract the JSON span");
+        assert_eq!(v["subtotal"], 100.0);
+    }
+
+    #[test]
+    fn extract_json_span_ignores_braces_inside_strings() {
+        let text = r#"noise {"a": "text with } inside", "b": 2} trailing"#;
+        let span = extract_json_span(text).unwrap();
+        assert_eq!(span, r#"{"a": "text with } inside", "b": 2}"#);
+    }
 }

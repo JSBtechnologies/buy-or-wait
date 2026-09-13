@@ -1,0 +1,563 @@
+//! `code/config/models.toml` loader (file owner: ml-engineer; this loader lives in
+//! extract/ because resolving which model handles which call is extraction's own
+//! orchestration concern). Mirrors ml-engineer's `bakeoff.rs` deserialization shape so the
+//! two never drift on the config schema.
+//!
+//! The `[selected]` table is additive and does not exist in the file yet — ml-engineer/the
+//! user fill it in once the bake-off concludes and the user picks (PLAN.md Phase 2d).
+//! `#[serde(default)]` means its absence today is not an error: every `resolve_*` call
+//! just returns `None` and the model path stays inactive until `[selected]` is added.
+//! "The user's choice is only a config change" — no extraction code changes when it lands.
+
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+use crate::engine::types::Event;
+
+#[derive(Debug, Deserialize)]
+pub struct ModelsConfig {
+    pub decoding: DecodingConfig,
+    pub image_preprocessing: ImagePreprocessingConfig,
+    pub candidates: CandidatesConfig,
+    #[serde(default)]
+    pub selected: Selected,
+    #[serde(default)]
+    pub fallback: FallbackConfig,
+    /// User decision `decision.vlm_setup`: which linked-event class routes to which pair
+    /// of VLM readers, for `agreement` mode. Additive `[vlm_routing]` table — absent from
+    /// the file today, so `VlmRoutingConfig::default()` (3 built-in classes) applies until
+    /// it's added, same pattern as `[selected]`/`[fallback]`.
+    #[serde(default)]
+    pub vlm_routing: VlmRoutingConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecodingConfig {
+    pub temperature: f64,
+    pub seed: i64,
+    pub max_tokens_vlm: u32,
+    pub max_tokens_llm: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImagePreprocessingConfig {
+    #[allow(dead_code)] // kept for schema completeness; production reads `selected.image_max_dim_px` instead
+    pub candidate_max_dimensions_px: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CandidatesConfig {
+    pub vlm: Vec<CandidateConfig>,
+    pub llm: Vec<CandidateConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CandidateConfig {
+    pub id: String,
+    pub provider: String,
+    pub model_revision: String,
+    #[serde(default)]
+    pub supports_structured_output: bool,
+    /// Only set on `[[fallback.candidates]]` entries (ml-engineer 2f0746b): "llm", "vlm",
+    /// or "llm_and_vlm" for a multimodal backup that covers both roles with one model.
+    /// `None` for the primary `[[candidates.vlm]]`/`[[candidates.llm]]` entries, which
+    /// already know their role from which array they're in.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Backup/fallback model catalog (ml-engineer 2f0746b, user request): frontier-class,
+/// more-expensive models tried only when a primary candidate's output fails validation/
+/// reconciliation or the primary is unavailable — never a routine first choice. Separate
+/// from `candidates` so it can never accidentally become a primary pick.
+#[derive(Debug, Default, Deserialize)]
+pub struct FallbackConfig {
+    #[serde(default)]
+    pub candidates: Vec<CandidateConfig>,
+}
+
+/// Filled in once the bake-off concludes and the user picks (PLAN.md Phase 2d). Absent
+/// entirely from the file today — every field then defaults to `None`, keeping the model
+/// path inactive rather than erroring.
+#[derive(Debug, Default, Deserialize)]
+pub struct Selected {
+    /// Candidate id from `[[candidates.vlm]]` for the first image read.
+    pub vlm_primary: Option<String>,
+    /// Candidate id from `[[candidates.vlm]]` for the second read on a reconciliation
+    /// failure. May equal `vlm_primary` (same model, second attempt) or name a different
+    /// candidate.
+    pub vlm_escalation: Option<String>,
+    /// Candidate id from `[[candidates.vlm]]` for a backup frontier model, tried after
+    /// `vlm_escalation` also fails to reconcile (or when `vlm_primary`/`vlm_escalation`
+    /// themselves are unavailable — a network/provider error, not just a bad reconcile).
+    /// User-requested resilience layer beyond the primary bake-off pick.
+    pub vlm_fallback: Option<String>,
+    /// Candidate id from `[[candidates.llm]]` for messages the deterministic skeleton
+    /// parser does not recognize.
+    pub llm_primary: Option<String>,
+    /// Candidate id from `[[candidates.llm]]` for a backup frontier model, tried when
+    /// `llm_primary`'s call fails or its reply doesn't parse into valid records.
+    pub llm_fallback: Option<String>,
+    /// Image max dimension in px to actually ship with (one of
+    /// `image_preprocessing.candidate_max_dimensions_px`, PLAN.md §3 token-efficiency
+    /// lever). Defaults to 1024 if unset — the bake-off's resolution sweep should
+    /// confirm or override this once results land.
+    pub image_max_dim_px: Option<u32>,
+    /// User decision `decision.vlm_setup`: `"agreement"` (two independent reads of the
+    /// image must select the same amount before it's trusted, tiebroken by `vlm_fallback`
+    /// on disagreement) or `"escalate"` (the original primary -> escalation -> fallback
+    /// chain, PLAN.md §2.3, accepting the first reconciling read). Unset defaults to
+    /// `"escalate"` — the already-tested, backward-compatible path — so `vlm_mode` must be
+    /// set explicitly to opt into agreement mode.
+    pub vlm_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VlmMode {
+    Agreement,
+    Escalate,
+}
+
+/// Which pair of VLM readers handles a class of linked event (user decision
+/// `decision.vlm_setup`, board:verify.image_agree_preaudit). `readers` names two role
+/// keys ("vlm_primary" | "vlm_escalation" | "vlm_fallback"), resolved against `[selected]`
+/// via `ModelsConfig::resolve_role`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VlmRouteClass {
+    pub name: String,
+    /// `EventType::as_str()` values ("income", "expense", ...). Empty = matches any.
+    #[serde(default)]
+    pub event_types: Vec<String>,
+    /// `Status::as_str()` values ("settled", "pending", "scheduled", ...). Empty = any.
+    #[serde(default)]
+    pub statuses: Vec<String>,
+    /// Event categories ("salary", "rent", ...). Empty = any.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    pub readers: Vec<ReaderSpec>,
+}
+
+/// One reader slot in a route class: a role key plus its OWN resolution/token budget
+/// (ml-engineer #204/lead: the bake-off screened different candidates at different
+/// resolutions -- 235B@1024, gemma@768 -- and a thinking model like Kimi-K3 needs a much
+/// larger `max_tokens` or it returns nothing (reasoning tokens consume the default
+/// budget). Using the wrong px for a candidate also changes the §2.11 cache key, silently
+/// triggering a brand-new paid call instead of a cache hit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReaderSpec {
+    /// "vlm_primary" | "vlm_escalation" | "vlm_fallback", resolved via `resolve_role`.
+    pub role: String,
+    /// Falls back to `[selected].image_max_dim_px` (global default) when unset.
+    #[serde(default)]
+    pub max_dim_px: Option<u32>,
+    /// Falls back to `[decoding].max_tokens_vlm` when unset.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+impl ReaderSpec {
+    /// A reader that wants the global `[selected].image_max_dim_px` / `[decoding].max_tokens_vlm`
+    /// defaults rather than an override -- available for a hand-written `[vlm_routing]` entry.
+    #[allow(dead_code)]
+    fn new(role: &str) -> ReaderSpec {
+        ReaderSpec { role: role.to_string(), max_dim_px: None, max_tokens: None }
+    }
+
+    fn with(role: &str, max_dim_px: u32, max_tokens: u32) -> ReaderSpec {
+        ReaderSpec {
+            role: role.to_string(),
+            max_dim_px: Some(max_dim_px),
+            max_tokens: Some(max_tokens),
+        }
+    }
+}
+
+/// One resolved reader: role, candidate, and the exact per-call `max_dim_px`/`max_tokens`
+/// to use for it (either the reader's own override or the global default).
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderPick<'a> {
+    pub role: &'a str,
+    pub candidate: &'a CandidateConfig,
+    pub max_dim_px: u32,
+    pub max_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VlmRoutingConfig {
+    #[serde(default)]
+    pub default_class: Option<String>,
+    #[serde(default)]
+    pub classes: Vec<VlmRouteClass>,
+}
+
+/// Built-in routing (user decision `decision.vlm_setup`): a linked event classifies as
+/// deterministic income/payslip, pending-or-scheduled bill, or settled expense/receipt —
+/// derived from `event_type`/`status`/`category` only, never the model's own `doc_type`
+/// (analyst audit #184/#194: doc_type is free text and unreliable; the event row is not).
+/// Default reader pair for every class is `vlm_primary` + `vlm_escalation` (235B + gemma),
+/// EXCEPT pending/scheduled bills: pre-audit board:verify.image_agree_preaudit found gemma
+/// consistently drops the due-date fields on that document shape (falls back to the
+/// pre-cutoff amount even when the later, larger, correct figure is the one that applies —
+/// image_05), so that class routes to `vlm_primary` + `vlm_fallback` (235B + Kimi) instead,
+/// per the lead's own example of what the routing table exists to express.
+impl Default for VlmRoutingConfig {
+    fn default() -> Self {
+        // Per-reader px matches what ml-engineer's bake-off actually screened each
+        // candidate at (235B@1024, gemma@768) -- using a different px changes the §2.11
+        // cache key and silently triggers a new paid call instead of a cache hit. Kimi-K3's
+        // max_tokens=1500 (vs the decoding-default ~400) is ml-engineer's finding: as a
+        // thinking model it returns 0% output at the default budget (reasoning tokens
+        // consume it) -- the final answer still needs extracting from any reasoning
+        // preamble, handled by `crate::extract::parse_json_reply`.
+        VlmRoutingConfig {
+            default_class: Some("settled_expense_receipt".to_string()),
+            classes: vec![
+                VlmRouteClass {
+                    name: "income_payslip".to_string(),
+                    event_types: vec!["income".to_string()],
+                    statuses: vec![],
+                    categories: vec![],
+                    readers: vec![
+                        ReaderSpec::with("vlm_primary", 1024, 400),
+                        ReaderSpec::with("vlm_escalation", 768, 400),
+                    ],
+                },
+                VlmRouteClass {
+                    name: "pending_bill_due_date".to_string(),
+                    event_types: vec![],
+                    statuses: vec!["pending".to_string(), "scheduled".to_string()],
+                    categories: vec![],
+                    // gemma excluded (analyst pre-audit board:verify.image_agree_preaudit:
+                    // drops due-date fields on this shape 4/4, falls back to the pre-cutoff
+                    // amount even when the settlement date is past it).
+                    readers: vec![
+                        ReaderSpec::with("vlm_primary", 1024, 400),
+                        ReaderSpec::with("vlm_fallback", 1024, 1500),
+                    ],
+                },
+                VlmRouteClass {
+                    name: "settled_expense_receipt".to_string(),
+                    event_types: vec![],
+                    statuses: vec!["settled".to_string()],
+                    categories: vec![],
+                    readers: vec![
+                        ReaderSpec::with("vlm_primary", 1024, 400),
+                        ReaderSpec::with("vlm_escalation", 768, 400),
+                    ],
+                },
+            ],
+        }
+    }
+}
+
+
+impl ModelsConfig {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    pub fn vlm_primary(&self) -> Option<&CandidateConfig> {
+        self.selected.vlm_primary.as_deref().and_then(|id| self.find_vlm(id))
+    }
+
+    pub fn vlm_escalation(&self) -> Option<&CandidateConfig> {
+        self.selected.vlm_escalation.as_deref().and_then(|id| self.find_vlm(id))
+    }
+
+    /// Resolves `[selected].vlm_fallback` against `[[candidates.vlm]]` first, then the
+    /// `[[fallback.candidates]]` catalog (ml-engineer 2f0746b) filtered to a "vlm" or
+    /// "llm_and_vlm" role.
+    pub fn vlm_fallback(&self) -> Option<&CandidateConfig> {
+        let id = self.selected.vlm_fallback.as_deref()?;
+        self.find_vlm(id).or_else(|| self.find_fallback(id, "vlm"))
+    }
+
+    pub fn llm_primary(&self) -> Option<&CandidateConfig> {
+        self.selected.llm_primary.as_deref().and_then(|id| self.find_llm(id))
+    }
+
+    /// Resolves `[selected].llm_fallback` against `[[candidates.llm]]` first, then the
+    /// `[[fallback.candidates]]` catalog filtered to a "llm" or "llm_and_vlm" role.
+    pub fn llm_fallback(&self) -> Option<&CandidateConfig> {
+        let id = self.selected.llm_fallback.as_deref()?;
+        self.find_llm(id).or_else(|| self.find_fallback(id, "llm"))
+    }
+
+    pub fn image_max_dim_px(&self) -> u32 {
+        self.selected.image_max_dim_px.unwrap_or(1024)
+    }
+
+    pub fn vlm_mode(&self) -> VlmMode {
+        match self.selected.vlm_mode.as_deref() {
+            Some("agreement") => VlmMode::Agreement,
+            _ => VlmMode::Escalate,
+        }
+    }
+
+    /// Resolves a routing role key against `[selected]`. Unknown role names resolve to
+    /// `None` (never a guessed candidate).
+    pub fn resolve_role(&self, role: &str) -> Option<&CandidateConfig> {
+        match role {
+            "vlm_primary" => self.vlm_primary(),
+            "vlm_escalation" => self.vlm_escalation(),
+            "vlm_fallback" => self.vlm_fallback(),
+            _ => None,
+        }
+    }
+
+    /// Deterministic route-class name for a linked event, derived only from
+    /// `event_type`/`status`/`category` — never the model's own `doc_type` (analyst audit
+    /// #184/#194). The first class whose (empty = wildcard) filters all match wins; falls
+    /// back to `vlm_routing.default_class`, or "settled_expense_receipt" if that too is
+    /// unset.
+    pub fn classify_event(&self, event: &Event) -> &str {
+        for class in &self.vlm_routing.classes {
+            let type_ok = class.event_types.is_empty()
+                || class.event_types.iter().any(|t| t == event.event_type.as_str());
+            let status_ok =
+                class.statuses.is_empty() || class.statuses.iter().any(|s| s == event.status.as_str());
+            let category_ok =
+                class.categories.is_empty() || class.categories.iter().any(|c| c == &event.category);
+            if type_ok && status_ok && category_ok {
+                return &class.name;
+            }
+        }
+        self.vlm_routing.default_class.as_deref().unwrap_or("settled_expense_receipt")
+    }
+
+    /// The two-reader pair for `vlm_mode() == Agreement`, for this event's route class:
+    /// `(role_a, candidate_a, role_b, candidate_b)`. `None` when the class's reader list has
+    /// fewer than two entries, or either role doesn't resolve to a configured candidate
+    /// (never guesses a reader pair).
+    pub fn readers_for(&self, event: &Event) -> Option<(ReaderPick<'_>, ReaderPick<'_>)> {
+        let class_name = self.classify_event(event);
+        let class = self.vlm_routing.classes.iter().find(|c| c.name == class_name)?;
+        let a = class.readers.first()?;
+        let b = class.readers.get(1)?;
+        Some((self.resolve_pick(a)?, self.resolve_pick(b)?))
+    }
+
+    fn resolve_pick<'a>(&'a self, spec: &'a ReaderSpec) -> Option<ReaderPick<'a>> {
+        let candidate = self.resolve_role(&spec.role)?;
+        Some(ReaderPick {
+            role: &spec.role,
+            candidate,
+            max_dim_px: spec.max_dim_px.unwrap_or_else(|| self.image_max_dim_px()),
+            max_tokens: spec.max_tokens.unwrap_or(self.decoding.max_tokens_vlm),
+        })
+    }
+
+    fn find_vlm(&self, id: &str) -> Option<&CandidateConfig> {
+        self.candidates.vlm.iter().find(|c| c.id == id)
+    }
+
+    fn find_llm(&self, id: &str) -> Option<&CandidateConfig> {
+        self.candidates.llm.iter().find(|c| c.id == id)
+    }
+
+    fn find_fallback(&self, id: &str, wanted_role: &str) -> Option<&CandidateConfig> {
+        self.fallback.candidates.iter().find(|c| {
+            c.id == id
+                && c.role.as_deref().is_some_and(|r| r == wanted_role || r == "llm_and_vlm")
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_absent_resolves_to_none_not_an_error() {
+        let cfg: ModelsConfig = toml::from_str(
+            r#"
+            [decoding]
+            temperature = 0.0
+            seed = 42
+            max_tokens_vlm = 400
+            max_tokens_llm = 300
+            [image_preprocessing]
+            candidate_max_dimensions_px = [512, 1024]
+            [candidates]
+            vlm = []
+            llm = []
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.vlm_primary().is_none());
+        assert!(cfg.vlm_escalation().is_none());
+        assert!(cfg.vlm_fallback().is_none());
+        assert!(cfg.llm_primary().is_none());
+        assert!(cfg.llm_fallback().is_none());
+        assert_eq!(cfg.image_max_dim_px(), 1024);
+    }
+
+    #[test]
+    fn selected_present_resolves_the_named_candidate() {
+        let cfg: ModelsConfig = toml::from_str(
+            r#"
+            [decoding]
+            temperature = 0.0
+            seed = 42
+            max_tokens_vlm = 400
+            max_tokens_llm = 300
+            [image_preprocessing]
+            candidate_max_dimensions_px = [512, 1024]
+            [selected]
+            vlm_primary = "vendor/VlmA"
+            vlm_escalation = "vendor/VlmB"
+            vlm_fallback = "vendor/VlmC"
+            llm_primary = "vendor/LlmA"
+            llm_fallback = "vendor/LlmB"
+            image_max_dim_px = 768
+            [[candidates.vlm]]
+            id = "vendor/VlmA"
+            provider = "p1"
+            model_revision = "rev1"
+            [[candidates.vlm]]
+            id = "vendor/VlmB"
+            provider = "p2"
+            model_revision = "rev2"
+            [[candidates.vlm]]
+            id = "vendor/VlmC"
+            provider = "p4"
+            model_revision = "rev4"
+            [[candidates.llm]]
+            id = "vendor/LlmA"
+            provider = "p3"
+            model_revision = "rev3"
+            [[candidates.llm]]
+            id = "vendor/LlmB"
+            provider = "p5"
+            model_revision = "rev5"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.vlm_primary().unwrap().id, "vendor/VlmA");
+        assert_eq!(cfg.vlm_escalation().unwrap().id, "vendor/VlmB");
+        assert_eq!(cfg.vlm_fallback().unwrap().id, "vendor/VlmC");
+        assert_eq!(cfg.llm_primary().unwrap().id, "vendor/LlmA");
+        assert_eq!(cfg.llm_fallback().unwrap().id, "vendor/LlmB");
+        assert_eq!(cfg.image_max_dim_px(), 768);
+    }
+
+    fn minimal_cfg_with_selected() -> ModelsConfig {
+        toml::from_str(
+            r#"
+            [decoding]
+            temperature = 0.0
+            seed = 42
+            max_tokens_vlm = 400
+            max_tokens_llm = 300
+            [image_preprocessing]
+            candidate_max_dimensions_px = [512, 1024]
+            [selected]
+            vlm_primary = "vendor/VlmA"
+            vlm_escalation = "vendor/VlmB"
+            vlm_fallback = "vendor/VlmC"
+            [candidates]
+            llm = []
+            [[candidates.vlm]]
+            id = "vendor/VlmA"
+            provider = "p1"
+            model_revision = "rev1"
+            [[candidates.vlm]]
+            id = "vendor/VlmB"
+            provider = "p2"
+            model_revision = "rev2"
+            [[candidates.vlm]]
+            id = "vendor/VlmC"
+            provider = "p3"
+            model_revision = "rev3"
+            "#,
+        )
+        .unwrap()
+    }
+
+    fn event_with(
+        event_type: crate::engine::types::EventType,
+        status: crate::engine::types::Status,
+        category: &str,
+    ) -> Event {
+        use crate::engine::types::{Direction, Flexibility};
+        Event {
+            id: "event_x".into(),
+            event_type,
+            description: "x".into(),
+            category: category.into(),
+            direction: Direction::Debit,
+            amount: None,
+            currency: "INR".into(),
+            event_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            settlement_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+            status,
+            linked_event_id: None,
+            flexibility: Flexibility::Fixed,
+            minimum_allowed_amount: None,
+        }
+    }
+
+    #[test]
+    fn vlm_mode_defaults_to_escalate_and_reads_agreement_explicitly() {
+        let escalate: ModelsConfig = toml::from_str(
+            "[decoding]\ntemperature=0.0\nseed=42\nmax_tokens_vlm=1\nmax_tokens_llm=1\n[image_preprocessing]\ncandidate_max_dimensions_px=[1]\n[candidates]\nvlm=[]\nllm=[]\n",
+        )
+        .unwrap();
+        assert_eq!(escalate.vlm_mode(), VlmMode::Escalate);
+
+        let agreement: ModelsConfig = toml::from_str(
+            "[decoding]\ntemperature=0.0\nseed=42\nmax_tokens_vlm=1\nmax_tokens_llm=1\n[image_preprocessing]\ncandidate_max_dimensions_px=[1]\n[selected]\nvlm_mode=\"agreement\"\n[candidates]\nvlm=[]\nllm=[]\n",
+        )
+        .unwrap();
+        assert_eq!(agreement.vlm_mode(), VlmMode::Agreement);
+    }
+
+    /// Built-in routing (user decision `decision.vlm_setup`): classification comes only
+    /// from event_type/status/category, and the pending/scheduled-bill class routes to
+    /// vlm_primary + vlm_fallback specifically (board:verify.image_agree_preaudit: gemma
+    /// drops due-date fields on that shape), not the default vlm_primary + vlm_escalation
+    /// pair every other class uses.
+    #[test]
+    fn builtin_routing_classifies_and_pairs_readers_correctly() {
+        use crate::engine::types::{EventType, Status};
+        let cfg = minimal_cfg_with_selected();
+
+        let payslip = event_with(EventType::Income, Status::Settled, "salary");
+        assert_eq!(cfg.classify_event(&payslip), "income_payslip");
+        let (a, b) = cfg.readers_for(&payslip).expect("pair resolves");
+        assert_eq!((a.role, &a.candidate.id[..]), ("vlm_primary", "vendor/VlmA"));
+        assert_eq!((b.role, &b.candidate.id[..]), ("vlm_escalation", "vendor/VlmB"));
+
+        let pending_bill = event_with(EventType::Expense, Status::Pending, "utilities");
+        assert_eq!(cfg.classify_event(&pending_bill), "pending_bill_due_date");
+        let (a, b) = cfg.readers_for(&pending_bill).expect("pair resolves");
+        assert_eq!((a.role, &a.candidate.id[..]), ("vlm_primary", "vendor/VlmA"));
+        assert_eq!((b.role, &b.candidate.id[..]), ("vlm_fallback", "vendor/VlmC"));
+        assert_eq!(b.max_tokens, 1500); // Kimi-K3 thinking-model budget (ml-engineer #204)
+
+        let scheduled_bill = event_with(EventType::Expense, Status::Scheduled, "healthcare");
+        assert_eq!(cfg.classify_event(&scheduled_bill), "pending_bill_due_date");
+
+        let settled = event_with(EventType::Expense, Status::Settled, "groceries");
+        assert_eq!(cfg.classify_event(&settled), "settled_expense_receipt");
+        let (a, b) = cfg.readers_for(&settled).expect("pair resolves");
+        assert_eq!((a.role, b.role), ("vlm_primary", "vlm_escalation"));
+        assert_eq!((a.max_dim_px, b.max_dim_px), (1024, 768));
+    }
+
+    #[test]
+    fn readers_for_is_none_when_a_role_does_not_resolve() {
+        use crate::engine::types::{EventType, Status};
+        // No [selected] at all -> every role resolves to None.
+        let cfg: ModelsConfig = toml::from_str(
+            "[decoding]\ntemperature=0.0\nseed=42\nmax_tokens_vlm=1\nmax_tokens_llm=1\n[image_preprocessing]\ncandidate_max_dimensions_px=[1]\n[candidates]\nvlm=[]\nllm=[]\n",
+        )
+        .unwrap();
+        let event = event_with(EventType::Income, Status::Settled, "salary");
+        assert!(cfg.readers_for(&event).is_none());
+    }
+}

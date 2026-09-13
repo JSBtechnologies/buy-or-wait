@@ -8,7 +8,7 @@
     },
     "record_schema_ref": "code/prompts/message_extraction.v1.md",
     "figure_schema_ref": "code/prompts/image_transcription.v1.md",
-    "how_to_score": "Run each bake-off candidate model against every item with the referenced prompt file, temperature 0, 5 repeats. Compare parsed JSON to `expected` field-by-field. For images 06-16 (no `expected`), there is no ground truth — score only stability (identical output across the 5 runs) and cross-model agreement, per PLAN.md Phase 2d.",
+    "how_to_score": "Run each bake-off candidate model against every item with the referenced prompt file, temperature 0, 5 repeats. Compare parsed JSON to `expected` field-by-field. For images with `labeled: false` (no `expected`), there is no ground truth — score only stability (identical output across the 5 runs) and cross-model agreement, per PLAN.md Phase 2d. image_10/image_11 were added after the initial 5 per verifier bus #130 (gold spot-checked against a real forecast-affecting discrepancy on image_10).",
     "skeleton_families_survey": {
       "total_messages": 215,
       "note": "After masking numbers/dates/company-service-names, ~209/215 messages collapse into a small number of true semantic template families (see record_types_covered below), each present in both English and Indonesian with only the employer/service name, amount, and date varying. This is the basis for template induction (PLAN.md §3 batching lever): a skeleton already resolved by one model call is parsed deterministically for every later message that normalizes to the same skeleton.",
@@ -177,8 +177,59 @@
     { "image_id": "image_08", "user_id": "user_48", "request_id": "request_48", "related_event_id": "event_4535", "labeled": false, "purpose": "cross_model_agreement",
       "note": "event_4535 is 'Property maintenance invoice' (blank amount, settled 2026-07-24). message_35 (same request) confirms the payment date but not the amount, deliberately pointing the amount back to this image only." },
     { "image_id": "image_09", "user_id": "user_55", "request_id": "request_55", "related_event_id": "event_5170", "labeled": false, "purpose": "cross_model_agreement" },
-    { "image_id": "image_10", "user_id": "user_64", "request_id": "request_64", "related_event_id": "event_6033", "labeled": false, "purpose": "cross_model_agreement" },
-    { "image_id": "image_11", "user_id": "user_73", "request_id": "request_73", "related_event_id": "event_6859", "labeled": false, "purpose": "cross_model_agreement" },
+    {
+      "image_id": "image_10", "user_id": "user_64", "request_id": "request_64", "related_event_id": "event_6033",
+      "labeled": true, "source": "verifier bus #130 (gold added to extraction's set per lead)",
+      "event_context": {
+        "event_type": "expense", "category": "groceries", "status": "pending",
+        "description": "Large grocery tax invoice", "event_date": "2024-06-03", "settlement_date": "2024-06-10",
+        "currency": "INR", "amount": "BLANK"
+      },
+      "expected_figures": {
+        "doc_type": "invoice", "currency": "INR",
+        "subtotal": 72045.00, "tax": 7634.26, "total": 79679.26,
+        "amount_due": null, "amount_paid": null, "balance_due": 79679.26,
+        "gross_pay": null, "deductions": null, "net_pay": null,
+        "previous_balance": null, "amount_due_before_date": null, "amount_due_before_date_value": null,
+        "amount_due_after_date": null, "document_date": null, "period_label": null,
+        "line_items_sum_check": 72045.00
+      },
+      "reconciliation": {
+        "tax_breakdown": "CGST2.5 1513.13 + SGST2.5 1513.13 + CGST20 2304.00 + SGST20 2304.00 = 7634.26 (two GST rate bands on different items; summed into the single 'tax' field)",
+        "subtotal_plus_tax": "72045.00 + 7634.26 = 79679.26 (matches Total and Balance Due, nothing paid yet)",
+        "status": "PASS"
+      },
+      "selector_input": {"event_type": "expense", "status": "pending"},
+      "expected_selected_amount": 79679.26,
+      "expected_selected_field": "balance_due",
+      "note": "verifier #130: unreserving this event's real amount (vs. treating it as unresolved/omitted) changes request_64's amount_safe_to_pay from ~0 to 42,376.90 — a case where getting the image figure right materially changes the recommendation, not just a rounding nit."
+    },
+    {
+      "image_id": "image_11", "user_id": "user_73", "request_id": "request_73", "related_event_id": "event_6859",
+      "labeled": true, "source": "verifier bus #130 (gold added to extraction's set per lead)",
+      "event_context": {
+        "event_type": "expense", "category": "healthcare", "status": "scheduled",
+        "description": "Hospital bill payable", "event_date": "2023-01-19", "settlement_date": "2023-01-23",
+        "currency": "INR", "amount": "BLANK"
+      },
+      "expected_figures": {
+        "doc_type": "invoice", "currency": "INR",
+        "subtotal": null, "tax": null, "total": 3650.00,
+        "amount_due": 3650.00, "amount_paid": 0.00, "balance_due": 3650.00,
+        "gross_pay": null, "deductions": null, "net_pay": null,
+        "previous_balance": null, "amount_due_before_date": null, "amount_due_before_date_value": null,
+        "amount_due_after_date": null, "document_date": "2023-01-19", "period_label": null,
+        "line_items_sum_check": null
+      },
+      "reconciliation": {
+        "paid_plus_balance": "Amount Paid 0.00 + Balance 3650.00 = 3650.00 (matches Total Bill Amount and Amount Payable)",
+        "status": "PASS"
+      },
+      "selector_input": {"event_type": "expense", "status": "scheduled"},
+      "expected_selected_amount": 3650.00,
+      "expected_selected_field": "balance_due",
+      "note": "verifier #130: row unchanged either way (3650.00 both before and after using this figure) — a lower-stakes case than image_10, useful as a simple confirming data point for the VLM selector."
+    },
     { "image_id": "image_12", "user_id": "user_78", "request_id": "request_78", "related_event_id": "event_7307", "labeled": false, "purpose": "cross_model_agreement" },
     { "image_id": "image_13", "user_id": "user_84", "request_id": "request_84", "related_event_id": "event_7941", "labeled": false, "purpose": "cross_model_agreement",
       "note": "event_7941 is 'Tote bag order' (blank amount, settled 2026-04-03). message_64 confirms the payment date/currency (INR) but not the amount, same pattern as image_08." },
