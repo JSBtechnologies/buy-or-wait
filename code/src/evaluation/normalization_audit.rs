@@ -310,6 +310,66 @@ mod tests {
         assert_eq!(read_currency("rupiah?"), CurrencyRead::Unknown);
     }
 
+    /// Differential report vs extraction's normalize.rs over S7.4 shapes and edge cases.
+    /// UNSAFE = extraction yields a value this reader does not (different value, ambiguous, not
+    /// money, unparseable); CONSERVATIVE = extraction rejects what this reader resolves.
+    #[test]
+    #[ignore]
+    fn differential_vs_extract_normalize() {
+        use crate::extract::normalize as ext;
+        let amounts = [
+            "3,00,000.00", "12,34,567", "9,99,999.99", "1,00,00,000.50", "100,00,000", "4,321,000", "65,432.10", "12.345.678", "1.234.567,89",
+            "10.000,00", "$41,75", "1,50", "12,5", "3217 00", "1 000", "₹3141.00", "Rs.7000", "Rs 0.00", "Rs. 1,00,000/-", "IDR 70,000", "USD 12.5",
+            "51234.0", "2717", "1.5", "5.250", "IDR 5.250", "1,500", "7,321.0\n0", "07203051188", "712345678901234", "8906143890487", "411056",
+            "0412", "EMP-0042", "12%", "1,2,3", "12.3456", "-50", "Rp 43.339.000", "₹ 2,854", "$5,00",
+        ];
+        let mut unsafe_ = 0;
+        for hint in [None, Some("INR"), Some("IDR"), Some("USD")] {
+            for raw in amounts {
+                let e = ext::parse_amount(raw, hint);
+                let m = read_amount(raw, hint);
+                let tag = match (&e, &m) {
+                    (Some(a), AmountRead::Value(b)) if (a * 100.0).round() as Cents == *b => continue,
+                    (None, AmountRead::Value(_)) => "CONSERVATIVE",
+                    (None, _) => continue,
+                    (Some(_), _) => {
+                        unsafe_ += 1;
+                        "UNSAFE"
+                    }
+                };
+                println!("{tag} amount {raw:?} hint={hint:?} extract={e:?} verifier={m:?}");
+            }
+        }
+        for raw in ["05/09/24", "11/08/23", "01/10/2025", "27/03/2026", "07-06-2026", "18-01-23 12:19 PM", "09-Mar-2027", "4 Sep 2020 10:15 PM", "24 July 2026", "2025-04-17", "Sep-2021", "04/04/2024", "13/13/2024", "CHARGED ON"] {
+            let e = ext::parse_date(raw);
+            let m = read_date(raw);
+            let tag = match (&e, &m) {
+                (Some(a), DateRead::Date(b)) if a == b => continue,
+                (None, DateRead::Date(_)) => "CONSERVATIVE",
+                (None, _) => continue,
+                (Some(_), _) => {
+                    unsafe_ += 1;
+                    "UNSAFE"
+                }
+            };
+            println!("{tag} date {raw:?} extract={e:?} verifier={m:?}");
+        }
+        for raw in ["₹", "Rs.", "RS", "Rupees", "INR", "$", "US$", "null", "Amount", "PHP", "KMR", "PKR", "Rp", "€", "rupiah?", ""] {
+            let e = ext::parse_currency(raw);
+            let m = read_currency(raw);
+            let same = match (&e, &m) {
+                (Some(a), CurrencyRead::Iso(b)) => a == b,
+                (None, CurrencyRead::Absent | CurrencyRead::Unknown) => true,
+                _ => false,
+            };
+            if !same {
+                let tag = if e.is_some() { unsafe_ += 1; "UNSAFE" } else { "CONSERVATIVE" };
+                println!("{tag} currency {raw:?} extract={e:?} verifier={m:?}");
+            }
+        }
+        println!("UNSAFE_TOTAL {unsafe_}");
+    }
+
     fn code(f: Option<Finding>) -> Option<&'static str> {
         f.map(|x| x.code)
     }
