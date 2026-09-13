@@ -138,6 +138,10 @@ impl AnthropicClient {
         self.cache_dir.join(format!("{key}.json"))
     }
 
+    fn cache_path_run(&self, key: &str, run_idx: u32) -> PathBuf {
+        self.cache_dir.join(format!("{key}__run{run_idx}.json"))
+    }
+
     fn record_usage(&self, usage: &Usage) {
         self.usage_log.lock().expect("usage_log mutex poisoned").push(usage.clone());
     }
@@ -176,6 +180,25 @@ impl AnthropicClient {
         let response = self.call_with_retry(call)?;
         let key = cache_key_for(call);
         self.write_cache(&self.cache_path(&key), &response);
+        self.record_usage(&response.usage);
+        Ok(response)
+    }
+
+    /// Same as `chat_completion_cold`, but also persists this run's raw
+    /// response under its own `{key}__run{run_idx}.json` file so an N-run
+    /// stability sweep (same cache key every run, by construction) doesn't
+    /// lose runs 1..N-1 when run N overwrites the canonical cache file.
+    /// Mirrors `HfClient::chat_completion_cold_numbered` (analyst request,
+    /// bus topic `blocker`, RULES.md#S5).
+    pub fn chat_completion_cold_numbered(
+        &self,
+        call: &ModelCall,
+        run_idx: u32,
+    ) -> Result<ModelResponse> {
+        let response = self.call_with_retry(call)?;
+        let key = cache_key_for(call);
+        self.write_cache(&self.cache_path(&key), &response);
+        self.write_cache(&self.cache_path_run(&key, run_idx), &response);
         self.record_usage(&response.usage);
         Ok(response)
     }

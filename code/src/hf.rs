@@ -235,6 +235,10 @@ impl HfClient {
         self.cache_dir.join(format!("{key}.json"))
     }
 
+    fn cache_path_run(&self, key: &str, run_idx: u32) -> PathBuf {
+        self.cache_dir.join(format!("{key}__run{run_idx}.json"))
+    }
+
     /// Run one chat completion. Cache-first; on a miss, calls the router
     /// with retry/backoff and writes the result back to the cache.
     pub fn chat_completion(&self, call: &ModelCall) -> Result<ModelResponse> {
@@ -263,6 +267,29 @@ impl HfClient {
         let response = self.call_with_retry(call)?;
         let key = cache_key_for(call);
         self.write_cache(&self.cache_path(&key), &response);
+        self.record_usage(&response.usage);
+        Ok(response)
+    }
+
+    /// Same as `chat_completion_cold`, but also persists this run's raw
+    /// response under its own `{key}__run{run_idx}.json` file, alongside the
+    /// canonical `{key}.json` (still overwritten each run, unchanged, so
+    /// `--rescore-from-cache` keeps working off the latest response).
+    /// Without this, a stability sweep (N runs of the identical call, same
+    /// cache key by construction) only ever leaves the *last* run's raw text
+    /// on disk -- runs 1..N-1 are silently lost once run N writes over them.
+    /// A sign-off audit needs every run's raw response persisted for review
+    /// without re-calling the API (analyst request, bus topic `blocker`,
+    /// RULES.md#S5).
+    pub fn chat_completion_cold_numbered(
+        &self,
+        call: &ModelCall,
+        run_idx: u32,
+    ) -> Result<ModelResponse> {
+        let response = self.call_with_retry(call)?;
+        let key = cache_key_for(call);
+        self.write_cache(&self.cache_path(&key), &response);
+        self.write_cache(&self.cache_path_run(&key, run_idx), &response);
         self.record_usage(&response.usage);
         Ok(response)
     }

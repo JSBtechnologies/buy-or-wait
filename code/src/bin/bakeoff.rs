@@ -578,6 +578,7 @@ fn image_call(
     prompt: &PromptSet,
     image_b64: &str,
     rescore_from_cache: bool,
+    run_idx: Option<u32>,
 ) -> Result<(Option<Value>, Usage)> {
     let is_anthropic = candidate.provider == "anthropic";
     let call = ModelCall {
@@ -608,11 +609,15 @@ fn image_call(
         let ac = anthropic_client.context("anthropic candidate but no AnthropicClient configured")?;
         if rescore_from_cache {
             ac.chat_completion(&call)?
+        } else if let Some(idx) = run_idx {
+            ac.chat_completion_cold_numbered(&call, idx)?
         } else {
             ac.chat_completion_cold(&call)?
         }
     } else if rescore_from_cache {
         client.chat_completion(&call)?
+    } else if let Some(idx) = run_idx {
+        client.chat_completion_cold_numbered(&call, idx)?
     } else {
         client.chat_completion_cold(&call)?
     };
@@ -664,7 +669,7 @@ fn run_vlm_candidate(
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, max_dim)?;
-            let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
+            let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache, None);
             let parsed = match outcome {
                 Ok((parsed, _usage)) => {
                     consecutive_failures = 0;
@@ -722,7 +727,7 @@ fn run_vlm_candidate(
                 eprintln!("  [{}] run {}/{runs}: calling {} ...", candidate.id, run_idx + 1, img.image_id);
                 let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
                 let b64 = downscale_and_encode(&path, chosen_max_dim)?;
-                let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
+                let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache, Some(run_idx));
                 let parsed = match outcome {
                     Ok((parsed, usage)) => {
                         consecutive_failures = 0;
