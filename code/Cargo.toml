@@ -8,10 +8,6 @@ default-run = "buyorwait"
 name = "buyorwait"
 path = "src/main.rs"
 
-[[bin]]
-name = "bakeoff"
-path = "src/bin/bakeoff.rs"
-
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

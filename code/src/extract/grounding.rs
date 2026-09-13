@@ -1,8 +1,8 @@
 //! Literal-grounding rejection (PLAN.md §2.10/§3): a number a model claims to have read
 //! from a message must actually appear in that message's text, or the fact is rejected
-//! before it ever reaches the ledger. Images are grounded by arithmetic reconciliation
-//! instead (`extract::images::reconciles`), since a receipt figure has no separate source
-//! text to check against.
+//! before it ever reaches the ledger. Images are grounded by the OCR witness gate instead
+//! (`extract::witness`/`extract::images::resolve_blank_amount_ocr`), since a receipt figure
+//! has no separate source text to check against.
 
 /// True if `amount` appears in `text` as a number, tolerant of thousands separators,
 /// currency-code prefixes ("IDR 42750000"), and decimal formatting ("1,037.52" / "1037.52").
