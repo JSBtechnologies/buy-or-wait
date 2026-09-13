@@ -230,6 +230,11 @@ pub struct Read {
     /// v1 `after_amount`; v2 `amount_due_after_cutoff`.
     #[serde(default, alias = "amount_due_after_cutoff")]
     pub after_amount: Option<f64>,
+    /// main.rs (26fe32f) persists the cutoff as one nested object
+    /// `{due_date, before_amount, after_amount}` (null when the read resolved none); mapped onto
+    /// the flat fields above by `Provenance::normalize`.
+    #[serde(default)]
+    pub cutoff: Option<CutoffObj>,
     /// Every other field of the read, kept so a renamed cutoff field cannot silently switch
     /// the due-date rule off (IA13).
     #[serde(flatten)]
@@ -278,6 +283,16 @@ fn unmapped_cutoff_fields(r: &Read) -> Vec<String> {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CutoffObj {
+    #[serde(default, alias = "due_cutoff_date")]
+    pub due_date: Option<String>,
+    #[serde(default, alias = "amount_due_by_cutoff")]
+    pub before_amount: Option<f64>,
+    #[serde(default, alias = "amount_due_after_cutoff")]
+    pub after_amount: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Provenance {
     pub image_id: String,
     pub class: Option<String>,
@@ -285,16 +300,36 @@ pub struct Provenance {
     pub mode: Option<String>,
     pub reads: Vec<Read>,
     pub outcome: String,
+    #[serde(default)]
     pub evidence: Option<Value>,
+    /// main.rs (26fe32f) shape: the applied figure and its event instead of an `evidence` record.
+    #[serde(default)]
+    pub accepted_amount: Option<f64>,
+    #[serde(default)]
+    pub event_id: Option<String>,
 }
 
 impl Provenance {
+    /// Fold the nested `cutoff` object into the flat read fields (flat values win).
+    fn normalize(&mut self) {
+        for r in &mut self.reads {
+            if let Some(c) = r.cutoff.take() {
+                r.due_date = r.due_date.take().or(c.due_date);
+                r.before_amount = r.before_amount.or(c.before_amount);
+                r.after_amount = r.after_amount.or(c.after_amount);
+            }
+        }
+    }
+
     fn evidence_event_amount(&self) -> (Option<String>, Option<f64>) {
         let body = self.evidence.as_ref().and_then(|e| e.get("fact")).and_then(|f| f.get("EventAmount"));
-        (
-            body.and_then(|b| b.get("event_id")).and_then(Value::as_str).map(String::from),
-            body.and_then(|b| b.get("amount")).and_then(Value::as_i64).map(|m| m as f64 / crate::engine::money::SCALE as f64),
-        )
+        match body {
+            Some(b) => (
+                b.get("event_id").and_then(Value::as_str).map(String::from),
+                b.get("amount").and_then(Value::as_i64).map(|m| m as f64 / crate::engine::money::SCALE as f64),
+            ),
+            None => (self.accepted_amount.and(self.event_id.clone()), self.accepted_amount),
+        }
     }
 }
 
@@ -565,8 +600,11 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
     let mut provs: Vec<Provenance> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&prov_dir) {
         for entry in rd.flatten() {
-            match serde_json::from_str(&std::fs::read_to_string(entry.path())?) {
-                Ok(p) => provs.push(p),
+            match serde_json::from_str::<Provenance>(&std::fs::read_to_string(entry.path())?) {
+                Ok(mut p) => {
+                    p.normalize();
+                    provs.push(p)
+                }
                 Err(err) => out.push(fail(&entry.file_name().to_string_lossy(), "IA0_provenance_unreadable", err.to_string())),
             }
         }
@@ -1030,6 +1068,18 @@ tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
         let e = ocr("o02b", vec![w(o(200000.0), None, None)], "witness_accept", Some(200000.0));
         assert!(e.contains(&"IA15_accept_without_witness") && e.contains(&"IA4_no_agreement"), "{e:?}");
         assert!(ocr("o02c", vec![w(o(200000.0), None, None)], "fail_closed", None).is_empty());
+
+        // The shape main.rs persists (26fe32f): nested `cutoff`, top-level accepted_amount/event_id,
+        // no evidence record. image_05 at 704.05 after the cutoff is still caught; 822.05 passes.
+        let persisted = |tag: &str, amount: f64| {
+            let prov = json!({"image_id": "image_05", "event_id": "event_1786", "class": "", "mode": "ocr", "outcome": "witness_accept", "accepted_amount": amount,
+                "reads": [{"role": "ocr", "model_id": "baidu/Unlimited-OCR", "model_revision": "", "max_dim_px": 0, "reconciled": true, "selected_amount": amount,
+                    "cutoff": {"due_date": "06-Feb-2026", "before_amount": 704.05, "after_amount": 822.05}, "witness": "cutoff_after_exceeds_witnessed_before", "ocr_notes": []}]});
+            errors(&run(tag, "image_05", prov, HF))
+        };
+        assert!(persisted("p05ok", 822.05).is_empty(), "{:?}", persisted("p05ok2", 822.05));
+        let e = persisted("p05bad", 704.05);
+        assert!(e.contains(&"IA6_outcome_mismatch") && !e.contains(&"IA13_unmapped_cutoff_field"), "{e:?}");
     }
 
     #[test]

@@ -144,9 +144,11 @@ pub fn cash_moving_unaccepted(code_dir: &Path, repo_root: &Path, dataset_dir: &P
             }
         }
     }
+    // Only users the run decides requests for: an image of a sample-only user never feeds output.csv.
+    let users: std::collections::BTreeSet<&str> = ds.requests.iter().map(|r| r.user_id.as_str()).collect();
     Ok(gold
         .iter()
-        .filter(|(_, g)| ds.events.get(&g.event_id).is_some_and(|e| matches!(e.status.as_str(), "pending" | "scheduled")))
+        .filter(|(_, g)| ds.events.get(&g.event_id).is_some_and(|e| matches!(e.status.as_str(), "pending" | "scheduled") && users.contains(e.user_id.as_str())))
         .filter(|(image, _)| !applied.contains(*image))
         .map(|(image, g)| format!("{image} ({})", g.event_id))
         .collect())
