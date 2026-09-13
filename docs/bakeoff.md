@@ -41,27 +41,42 @@ main` is run in this worktree.
 
 ## Step 3 — Bake-off run (results)
 
-Each candidate run 3x at `temperature=0`, fixed `seed`, against the identical gold subset with identical prompts (PLAN.md Phase 2d). Scored against `docs/gold_subset.json` as corrected in `3df3082` (message_10 -> `salary_first_confirmed`). Nothing here is a pick — the user chooses.
+Scored against `docs/gold_subset.json` as of `3f1c26a` (message_10 corrected to `salary_first_confirmed` in `3df3082`; image_10/image_11 gold added in `3f1c26a`, **7 labeled + 9 unlabeled images** — an earlier version of this table said "5 labeled" from a stale binary whose header text hadn't picked up the image_10/11 addition; the underlying scoring already used all 7). Selected-figure/reconciliation metrics use **production's own selector code**, `buyorwait::extract::images::{select, reconciles}` (merged from main), not a bake-off reimplementation, rescored via `--rescore-from-cache true` (zero new calls) after extraction's selector fixes (`53a2c1f`, `46d2972`) landed. Nothing here is a pick — the user chooses.
 
 **Production weight note (from the lead):** extraction's deterministic parser now covers 214/215 messages; the LLM is called for exactly 1 message (`msg_86`) in production, while the VLM is called for all 16 images. Weight the VLM table far more heavily than the LLM table when choosing — the VLM choice is the one that matters at scale.
 
+**Caveat (image_07/11/12):** these 3 images had known selector bugs, now fixed; verdicts on them may still shift slightly as extraction's parse-layer work continues (analyst's audit: 36→58→68/100 as further currency/reconciliation tweaks land). Flagged with ⚠ below.
+
 ### VLM candidates (image -> typed figure schema)
 
-| Model | Provider | Chosen res. (px) | Field accuracy vs gold (5 labeled) | Valid-JSON rate | Stability (3 runs, 16 images) | Cross-model agreement (11 unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run (16 images) |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Qwen/Qwen3-VL-235B-A22B-Instruct | deepinfra | 1024 | 77.5% | 100.0% | 31.2% | 92.9% | 936 | 184 | 5861 | $0.00035 | $0.0056 |
-| Qwen/Qwen3-VL-30B-A3B-Instruct | deepinfra | 1024 | 69.8% | 100.0% | 100.0% | 92.9% | 936 | 163 | 6151 | $0.00024 | $0.0038 |
-| google/gemma-4-31B-it | deepinfra | 768 | 86.2% | 97.9% | 56.2% | 92.9% | 545 | 171 | 8871 | $0.00014 | $0.0022 |
-| Qwen/Qwen3.5-397B-A17B | deepinfra | 512 | 0.0% | 0.0% | 100.0% | 92.9% | 432 | 400 | 7472 | $0.00139 | $0.0223 |
+3 finalists topped up to **N=5** (board decision.bakeoff_runs); `Qwen3.5-397B-A17B` stays at N=3 (screened out, not topped up).
 
-**ml-engineer recommendation (VLM, non-binding — the user decides):** `Qwen/Qwen3-VL-30B-A3B-Instruct` via `deepinfra` at 1024px. Highest weighted score across field accuracy, stability, valid-JSON rate, and cost/item; re-check against the actual field-accuracy/cost numbers above before deciding.
+| Model | Provider | Chosen res. (px) | N | Field accuracy vs gold (7 labeled) | Valid-JSON rate | All-field stability | Cross-model agreement (9 unlabeled) | Avg input tok/item | Avg output tok/item | p50 latency (ms) | Est. cost/item | Est. cost/full run (16 images) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen/Qwen3-VL-235B-A22B-Instruct | deepinfra | 1024 | 5 | 74.6% | 100.0% | 100.0% | 100.0% | 936 | 185 | 8215 | $0.00035 | $0.0056 |
+| Qwen/Qwen3-VL-30B-A3B-Instruct | deepinfra | 1024 | 5 | 69.8% | 100.0% | 100.0% | 100.0% | 936 | 163 | 6479 | $0.00024 | $0.0038 |
+| google/gemma-4-31B-it | deepinfra | 768 | 5 | 84.1% | 100.0% | 100.0% | 100.0% | 557 | 174 | 6567 | $0.00014 | $0.0022 |
+| Qwen/Qwen3.5-397B-A17B | deepinfra | 512 | 3 | 0.0% | 0.0% | 100.0% | 92.0% | 432 | 400 | 6460 | $0.00139 | $0.0223 |
 
-Resolution sweep detail (labeled-image field accuracy per candidate max dimension):
+**Selected-figure metrics** (lead directive: the one amount the engine's deterministic selector would hand the engine matters more than raw all-field JSON identity):
 
-- `Qwen/Qwen3-VL-235B-A22B-Instruct`: 512px=59%, 768px=75%, 1024px=78%, 1536px=76%
+| Model | Selected-figure accuracy (of 6 checkable labeled images) | Selected-figure stability | Reconciliation pass rate |
+|---|---|---|---|
+| Qwen/Qwen3-VL-235B-A22B-Instruct | 83.3% (5/6) | 100.0% | 66.7% |
+| Qwen/Qwen3-VL-30B-A3B-Instruct | 83.3% (5/6) | 100.0% | 16.7% |
+| google/gemma-4-31B-it | 83.3% (5/6) | 100.0% | 66.7% |
+| Qwen/Qwen3.5-397B-A17B | 0.0% (0/6) | 100.0% | 0.0% |
+
+All three finalists tie on selected-figure accuracy (83.3%) and stability (100%) at N=5; gemma-4-31B-it and Qwen3-VL-235B-A22B-Instruct both reconcile at 66.7% vs Qwen3-VL-30B-A3B-Instruct's 16.7%. image_05 (`amount_due_after_date`, cutoff-date logic) is null/wrong for every primary candidate — a shared gap, not one model's weakness.
+
+**No ml-engineer recommendation restated here** (a prior weighted auto-recommendation folding in cost/valid-JSON contradicted the lead's plain field-accuracy-then-stability ranking; removed rather than re-litigated — see the user's `[selected]` decision below, which already picked `Qwen3-VL-235B-A22B-Instruct` as primary and `gemma-4-31B-it` as escalation).
+
+Resolution sweep detail (labeled-image field accuracy per candidate max dimension, from the N=3 screen):
+
+- `Qwen/Qwen3-VL-235B-A22B-Instruct`: 512px=59%, 768px=75%, 1024px=79%, 1536px=76%
 - `Qwen/Qwen3-VL-30B-A3B-Instruct`: 512px=47%, 768px=63%, 1024px=70%, 1536px=67%
-- `google/gemma-4-31B-it`: 512px=70%, 768px=86%, 1024px=82%, 1536px=79%
-- `Qwen/Qwen3.5-397B-A17B`: 512px=0%, 768px=0%, 1024px=0%, 1536px=0%
+- `google/gemma-4-31B-it`: 512px=82%, 768px=87%, 1024px=82%, 1536px=79%
+- `Qwen/Qwen3.5-397B-A17B`: 512px=0%, 768px=0%, 1024px=0%, 1536px=0% (thinking model; see Backup models section — same failure mode as the Kimi-K3 backup candidate)
 
 ### LLM candidates (message -> typed records)
 
@@ -77,6 +92,106 @@ Resolution sweep detail (labeled-image field accuracy per candidate max dimensio
 "Est. cost/full run" for messages uses 13 as a lower-bound proxy from the gold subset's distinct `record_type` shapes — now superseded by the lead's harder number: extraction's deterministic parser covers 214/215 messages, so production LLM volume is 1 message (`msg_86`), not 13.
 
 (Bake-off messages are batched one call per run for the whole 47-message gold subset, matching the batching lever being judged; a real per-user batch in production is far smaller — per-item token/cost figures above divide the batch call by its message count.)
+
+## Backup models (user request: a "close to a guarantee" tiebreaker/fallback)
+
+Separate from the primary bake-off above; catalog lives in `code/config/models.toml`'s `[[fallback.candidates]]` (activation only via `[selected].vlm_fallback`/`.llm_fallback`, never automatic). The user set a 5-criterion gate (board decision.backup_gate), **all required**:
+
+1. Valid-JSON 100% over N=5
+2. 0 false-accepts on the audit set (reconciles=true but the selected amount is actually wrong)
+3. Selected-figure accuracy ≥ the best primary VLM candidate's (83.3%, see above)
+4. N=5 stability on the selected amount
+5. ≥2 live providers for the model (so one outage doesn't break it)
+
+### ⚠️ Credit exhaustion mid-run — data below is incomplete
+
+Mid-testing, the shared `HF_TOKEN` **fully depleted its monthly included
+credits** (`HTTP 402: "You have depleted your monthly included credits.
+Purchase pre-paid credits to continue using Inference Providers."`).
+Confirmed **account-wide, not provider-specific**: a direct probe against
+`openai/gpt-oss-120b` via a completely different provider (`novita`) hit the
+same 402. This blocks **all further live model calls team-wide**, including
+the eventual production cold run, until pre-paid credits are added or the
+monthly cycle resets. Posted as an urgent blocker (bus topic `blocker`).
+
+Every number below is genuine (real API responses, no fabrication), but
+several runs were cut short mid-way by the credit wall. Where that
+happened it's called out explicitly, and stability numbers from a
+`--rescore-from-cache` pass are marked as **not real N=5 stability** — a
+cache-replay of the same cached response 5x is trivially "stable" and
+proves nothing about actual run-to-run variance.
+
+### Candidate selection
+
+`moonshotai/Kimi-K3` (multimodal, covers both LLM and VLM fallback roles,
+already the routing table's tiebreaker pending this test) plus the
+strongest other live multimodal candidate found: `moonshotai/Kimi-K2.6`.
+`zai-org/GLM-4.6V` and `baidu/ERNIE-4.5-VL-424B-A47B-Base-PT` were
+considered but **disqualified before testing** — both have exactly 1 live
+provider on the router, failing gate criterion 5 outright.
+
+### Gate results: VLM role
+
+| Model | Live providers | Criterion 1: valid-JSON@N=5 | Criterion 2: 0 false-accepts | Criterion 3: selected-fig. acc ≥ 83.3% | Criterion 4: real N=5 stability | Criterion 5: ≥2 providers | **Gate verdict** |
+|---|---|---|---|---|---|---|---|
+| `moonshotai/Kimi-K3` | 5 (deepinfra, together, fireworks-ai, baseten, featherless-ai) | **FAIL** — 25% on the 4-image sign-off audit (max_tokens=1500), 68.8% on the 16-image gate sample (max_tokens=2000); never reached 100% at any tested budget | **FAIL** (moot — never reaches a checkable selected figure reliably enough to even test this) | **FAIL** — 33.3% best sample (2/6, max_tokens=2000), 0.0% on the audit subset (max_tokens=1500) | Not measurable (credit wall hit before a real N=5 completed; only cache-replay data exists) | **PASS** | **FAILS THE GATE** |
+| `moonshotai/Kimi-K2.6` | 5 (novita, fireworks-ai, featherless-ai, baseten, deepinfra) | **UNTESTED** — 0 successful calls before the credit wall hit | **UNTESTED** | **UNTESTED** | **UNTESTED** | **PASS** | **BLOCKED, not evaluated** |
+
+**Why Kimi-K3 fails, in the model's own words:** it is a thinking/reasoning
+model. At the harness default (`max_tokens_vlm=400`), it burns the entire
+budget on hidden `reasoning_content` before ever emitting visible
+`content` — confirmed by direct probe (finish_reason `"length"`, `content`
+empty, `reasoning_content` populated). At `max_tokens=1500` on `image_01`
+specifically, it produces exact, correct JSON (`net_pay: 4365000`, exact
+match) — proving it *can* work. But on the harder 4-image sign-off set
+(`image_02`, `image_05`, `image_10`, `image_11` — the cases the analyst
+flagged, board decision #215) at that same 1500-token budget, only 1 of 4
+images produced valid JSON at all; the other 3 were still truncated
+mid-reasoning. Output tokens (including reasoning) ran **1,258–1,445
+tokens/item** even when it succeeded — 7–8x every primary VLM candidate's
+budget, at 6–19x the per-token price. `image_05` (`amount_due_after_date`,
+the cutoff-date case the lead/analyst asked about by name) never produced
+a usable figure at any tested budget, for either Kimi model or, notably,
+**any of the three primary candidates either** — this is a shared gap in
+the current selector/prompt for that one case, not Kimi-specific.
+
+**Per the lead's contingency:** since Kimi-K3 (the routing table's current
+tiebreaker) fails the gate, `moonshotai/Kimi-K2.6` becomes the candidate —
+but it cannot be evaluated at all right now; every one of its calls in the
+gate run hit the credit wall before a single response came back. **No VLM
+candidate on the HF router currently clears this gate with the available
+evidence.** The user has a parked non-HF option (board
+decision.claude_backup) if a guarantee-grade fallback is needed sooner
+than credits can be restored and Kimi-K2.6 retested.
+
+### Gate results: LLM role (secondary — msg_86 only in production)
+
+| Model | Live providers | Field accuracy (47 labeled) | Valid-JSON@N=3 | Notes |
+|---|---|---|---|---|
+| `deepseek-ai/DeepSeek-V4-Pro-0813` | 5 (novita, together, fireworks-ai, baseten, deepinfra) | 100.0% | 100.0% | Completed cleanly before the credit wall hit. Fast (p50 1.4s), cheap ($0.0013/full-run at the 13-skeleton estimate). Same DeepSeek lineage as the primary LLM candidate (DeepSeek-V3.2) — known vendor behavior. Strongest LLM backup candidate tested. |
+| `zai-org/GLM-5.3` | 5 (novita, together, fireworks-ai, zai-org, baseten) | 100.0%¹ | **0.0%** | ¹ Vacuous: field accuracy defaults to 100% when there is nothing to check (0 valid parses), not a real pass. p50 latency 54.3s/call — reasoning-model-scale latency with no successful output. Effectively failed. |
+| `moonshotai/Kimi-K3` | 5 (see above) | UNAVAILABLE | UNAVAILABLE | Hit the credit wall before completing. |
+
+**Reading this table:** `DeepSeek-V4-Pro-0813` is the only LLM backup
+candidate with a clean, real pass so far. Not gated as strictly as VLM
+(lead: LLM backup is lower-stakes — msg_86 is the only production LLM
+call), but the same "no fabricated confidence" rule applies: GLM-5.3's
+100% is not real and Kimi-K3-as-LLM is simply untested.
+
+### Recommendation (non-binding — the user decides)
+
+1. **Do not activate `vlm_fallback = Kimi-K3`** in `[selected]` — it fails
+   the gate on real evidence, not merely "untested."
+2. **Kimi-K2.6 is the next candidate per the lead's contingency**, but
+   needs actual testing once credits are restored — right now it has
+   zero data, which is not the same as passing.
+3. **If a backup is needed before that retest can happen**, the user's
+   parked Claude-adapter option (board decision.claude_backup) is the only
+   currently-known path that doesn't depend on the same depleted HF
+   account.
+4. For LLM, `DeepSeek-V4-Pro-0813` is a solid backup candidate on the
+   evidence gathered so far, though LLM backup selection is lower-stakes
+   given msg_86 is the only production LLM call.
 
 ## Future refinement: fine-tuning / LoRA adapters
 
