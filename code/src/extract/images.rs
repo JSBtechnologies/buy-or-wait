@@ -1352,49 +1352,55 @@ pub fn resolve_blank_amount_ocr(
         prov.ocr_notes.push("no_final_label".to_string());
     }
 
-    // User ruling `ruling.total_or_witnessed_sum` point 2: when no total field is readable
-    // at all, OR the printed total field select() found has no witness of its own (e.g. a
-    // parse artifact from a merged multi-column row), fall back to a witnessed line-item/
-    // charges sum before failing closed. Never lets the sum override a *witnessed* printed
-    // total -- only steps in when the primary candidate can't stand on its own.
-    let primary_witness = selected
-        .and_then(|amount| witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope).map(|hit| (amount, hit)));
+    // User ruling `ruling.total_trumps_all` (refines `ruling.lone_printed_total`): the exact
+    // field `select()` already resolves for this event's status/scope (the printed total
+    // family for a settled read, the printed still-owed amount -- balance due or the dated
+    // after-cutoff figure -- for a pending/scheduled one; `select_pending_or_scheduled`'s own
+    // logic is that exception, unchanged here) is accepted outright: it beats a computed sum,
+    // an amount-in-words reading, a missing witness, and any other final-labeled field that
+    // happens to disagree (a breakdown/contradiction never rejects it). The one carve-out is a
+    // bare-subtotal duplicate (`target_is_bare_subtotal`, `ruling.total_or_witnessed_sum`
+    // image_04: the real total was never printed at all, cut off below the crop) -- that is
+    // never a genuine printed total to begin with, so it still needs independent corroboration.
+    let printed_total = selected.filter(|&amount| {
+        !witness::target_is_bare_subtotal(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope)
+    });
 
-    // `lone_printed_total` marks the third case below: `select()` found a value straight from
-    // a printed final-labeled field (not a computed sum), but neither the primary witness nor
-    // the sum fallback corroborates it. Distinct from a COMPUTED sum, which always requires a
-    // witness by construction (`witnessed_line_item_sum` only ever returns `Some` when one
-    // matches) -- this is a value the document itself printed under a final label.
-    let (amount, witness_hit, lone_printed_total) = match primary_witness {
-        Some((amount, hit)) => (amount, Some(hit), false),
-        None => match witness::witnessed_line_item_sum(&figures, scope, ROUNDING_TOLERANCE_2TERM) {
-            Some((sum_amount, kind)) => (sum_amount, Some((kind, sum_amount)), false),
-            None => match selected {
-                Some(amount) => (amount, None, true),
-                None => {
-                    return outcome("fail_closed", vec![prov], None);
-                }
-            },
-        },
+    let (amount, witness_hit, printed_total_accept) = match printed_total {
+        Some(amount) => {
+            // Still surface a real corroborating identity as the witness label when one
+            // exists -- purely informational now, never required for acceptance.
+            let hit = witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
+            (amount, hit, true)
+        }
+        None => {
+            // No printed total at all (or only a bare-subtotal duplicate) -- a value only
+            // stands with independent corroboration: `ruling.total_or_witnessed_sum`'s
+            // witnessed line-item/charges sum fallback, never self-witnessed.
+            let primary_witness = selected.and_then(|amount| {
+                witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope).map(|hit| (amount, hit))
+            });
+            match primary_witness {
+                Some((amount, hit)) => (amount, Some(hit), false),
+                None => match witness::witnessed_line_item_sum(&figures, scope, ROUNDING_TOLERANCE_2TERM) {
+                    Some((sum_amount, kind)) => (sum_amount, Some((kind, sum_amount)), false),
+                    None => {
+                        return outcome("fail_closed", vec![prov], None);
+                    }
+                },
+            }
+        }
     };
 
     let contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
 
-    // User ruling `ruling.lone_printed_total`: a printed final-labeled total is accepted even
-    // without a witness -- a computed sum still needs one (module doc above), and a value that
-    // is merely a bare-subtotal duplicate (`target_is_bare_subtotal`, image_04: the real total
-    // was never printed at all, cut off below the crop) still isn't a genuine final read either,
-    // so it still requires one too.
-    let printed_total_ok =
-        lone_printed_total && !witness::target_is_bare_subtotal(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope);
-
     prov.witness = witness_hit
         .map(|(kind, _)| kind.label().to_string())
-        .or_else(|| printed_total_ok.then(|| "printed_final_label_only".to_string()));
+        .or_else(|| printed_total_accept.then(|| "printed_final_label_only".to_string()));
     prov.witness_computed = witness_hit.map(|(_, computed)| computed);
     prov.contradiction = contradiction.map(|(field, value)| format!("{field}={value}"));
 
-    if prov.witness.is_none() || prov.contradiction.is_some() {
+    if !printed_total_accept && (prov.witness.is_none() || prov.contradiction.is_some()) {
         prov.ocr_notes.push(if prov.witness.is_none() { "no_witness".to_string() } else { "contradiction".to_string() });
         return outcome("fail_closed", vec![prov], None);
     }
