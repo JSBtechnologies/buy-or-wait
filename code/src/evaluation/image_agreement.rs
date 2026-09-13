@@ -445,13 +445,13 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
         if link.get(&image_id) != Some(&event_id) {
             out.push(fail(&rid, "IA2_event_link", format!("{image_id} fact event {event_id} vs images.csv {:?}", link.get(&image_id))));
         }
-        if *outcome == "missing" {
-            out.push(fail(&rid, "IA4_no_agreement", format!("{image_id} applied although routing accepts nothing: {notes}")));
-            continue;
-        }
         let status = ds.events.get(&event_id).map(|e| e.status.as_str()).unwrap_or("");
         if matches!(status, "pending" | "scheduled") && amount.map(|a| a <= 0.0).unwrap_or(true) {
             out.push(fail(&rid, "IA11_nonpositive_cash_moving", format!("{image_id} {status} event applied {amount:?}")));
+        }
+        if *outcome == "missing" {
+            out.push(fail(&rid, "IA4_no_agreement", format!("{image_id} applied although routing accepts nothing: {notes}")));
+            continue;
         }
         if let (Some(a), Some(b)) = (amount, accepted) {
             if !close(a, *b, routing.tolerance) {
