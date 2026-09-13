@@ -1239,11 +1239,9 @@ mod tests {
     }
 
     /// TEMPORARY duplicate of `tests/llm_generalization_fixtures.rs` (ml-engineer step 5,
-    /// lead request 2026-09-12): that integration test can't build right now because
-    /// `cargo test` (anything beyond `--lib`) also compiles `src/main.rs`, which is blocked
-    /// on board:blocker.main_anthropic_wiring (owner: integrator, not touched here). This
-    /// copy runs under `--lib` to verify `docs/llm_generalization_fixtures.json` is correct
-    /// today; delete it once the integration test runs for real (main.rs fixed).
+    /// lead request 2026-09-12). This copy runs under `--lib` to verify
+    /// `docs/llm_generalization_fixtures.json` is correct today; delete it once the
+    /// integration test is confirmed to run the same check for real.
     #[test]
     fn llm_generalization_fixtures_are_internally_consistent() {
         use std::fs;

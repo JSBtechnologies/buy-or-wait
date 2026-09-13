@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use buyorwait::anthropic::AnthropicClient;
 use buyorwait::engine::ledger::Fact;
 use buyorwait::engine::session::Session;
 use buyorwait::engine::types::{Event, PaymentOption, RateTable, RequestSpec};
@@ -143,11 +142,13 @@ fn main() -> anyhow::Result<ExitCode> {
 
     // Which models (if any) to call live this run. With `[selected]` absent from
     // config/models.toml (the state before the user picks, PLAN.md Phase 2d),
-    // vlm_primary()/llm_primary() are both None and the whole model path below stays
-    // inactive -- this run is then behaviorally identical to the deterministic-evidence-only
-    // baseline (PLAN.md Phase 3: byte-identical output is required either way).
+    // llm_primary() is None and the message-extraction model path below stays inactive --
+    // this run is then behaviorally identical to the deterministic-evidence-only baseline
+    // (PLAN.md Phase 3: byte-identical output is required either way). The HF VLM image path
+    // and the Anthropic tiebreak were removed (user cleanup, board:cleanup.remove_vlm_anthropic):
+    // blank-amount images resolve from the OCR path only (`resolve_blank_amount_ocr` above).
     let models_config = ModelsConfig::load(Path::new("config/models.toml"))?;
-    let use_models = models_config.vlm_primary().is_some() || models_config.llm_primary().is_some();
+    let use_models = models_config.llm_primary().is_some();
 
     // ml-engineer's HfClient owns the actual HF router calls and their own on-disk cache
     // (PLAN.md §2.11); `--cold` wipes it the same way as `store/cache` and `store/processed`
@@ -170,15 +171,6 @@ fn main() -> anyhow::Result<ExitCode> {
     } else {
         None
     };
-    // Backup frontier model for the VLM agreement tiebreak (decision.claude_backup). Also
-    // only constructed when a model is actually selected; ANTHROPIC_API_KEY may be unset
-    // even then, in which case the tiebreak path is simply unavailable this run.
-    let anthropic_client: Option<AnthropicClient> = if use_models { AnthropicClient::new().ok() } else { None };
-    let image_prompt = if models_config.vlm_primary().is_some() && hf_client.is_some() {
-        Some(prompts::load(Path::new("prompts/image_transcription.v1.md"), "User prompt template")?)
-    } else {
-        None
-    };
     let message_prompt = if models_config.llm_primary().is_some() && hf_client.is_some() {
         Some(prompts::load(Path::new("prompts/message_extraction.v1.md"), "User prompt template")?)
     } else {
@@ -187,9 +179,7 @@ fn main() -> anyhow::Result<ExitCode> {
     let model_ctx = ModelContext {
         config: &models_config,
         client: hf_client.as_ref(),
-        anthropic: anthropic_client.as_ref(),
         cold,
-        image_prompt: image_prompt.as_ref(),
         message_prompt: message_prompt.as_ref(),
         ocr_results: &ocr_results,
     };
@@ -210,7 +200,6 @@ fn main() -> anyhow::Result<ExitCode> {
             &payment_options,
             rates.clone(),
             &invariants,
-            dataset_dir,
             &model_ctx,
             &processed_store,
         ) {
@@ -251,9 +240,6 @@ fn main() -> anyhow::Result<ExitCode> {
     // zeros (PLAN.md §6.5) so signoff's usage-report check passes on a 0-call run.
     let mut pricing = load_pricing(Path::new("config/models.toml"))?;
     let mut usage_records: Vec<hf::Usage> = hf_client.as_ref().map(HfClient::usage_records).unwrap_or_default();
-    if let Some(client) = anthropic_client.as_ref() {
-        usage_records.extend(client.usage_records());
-    }
     // AGENTS.md §6.5: the report must summarize the FINAL run's providers/models, calls,
     // tokens, and cost -- OCR is a real model path, not a footnote, so its calls become
     // ordinary `hf::Usage` records (one per page, matching how HF calls are counted) and a
@@ -385,9 +371,7 @@ fn run_ask(args: &[String]) -> anyhow::Result<ExitCode> {
 struct ModelContext<'a> {
     config: &'a ModelsConfig,
     client: Option<&'a HfClient>,
-    anthropic: Option<&'a AnthropicClient>,
     cold: bool,
-    image_prompt: Option<&'a PromptSet>,
     message_prompt: Option<&'a PromptSet>,
     /// OCR results cached at ingestion (fleet/specs/ocr_vllm_pipeline.md), keyed by
     /// `image_id`. Populated independent of `[selected]` -- OCR is the default image path,
@@ -398,8 +382,8 @@ struct ModelContext<'a> {
 
 /// One user's session, bound and decided for one request (PLAN.md §2.5: one session per
 /// user, evidence and `decide` never take a user id). Evidence is the deterministic,
-/// zero-token skeleton parser, plus (only when `model_ctx` has a selected model) a VLM
-/// read for each of this user's blank-amount events and an LLM read for messages the
+/// zero-token skeleton parser, plus an OCR-cache read for each of this user's blank-amount
+/// events and (only when `model_ctx` has a selected LLM) an LLM read for messages the
 /// skeleton parser doesn't recognize.
 #[allow(clippy::too_many_arguments)]
 fn decide_one(
@@ -411,7 +395,6 @@ fn decide_one(
     payment_options: &[model::RequestPaymentOption],
     rates: Arc<RateTable>,
     invariants: &Invariants,
-    dataset_dir: &Path,
     model_ctx: &ModelContext,
     processed_store: &ProcessedStore,
 ) -> anyhow::Result<(model::OutputRow, Result<Vec<Finding>, InvariantViolation>)> {
@@ -421,11 +404,10 @@ fn decide_one(
     let home_currency = session.profile().home_currency.clone();
     let mut facts = deterministic_evidence(&evidence.messages, &home_currency);
 
-    // Blank-amount image resolution (fleet/specs/ocr_vllm_pipeline.md work item B2): OCR,
-    // cached at ingestion and keyed by image_id, is the default path -- a deterministic
-    // reader + witness gate, no live call here. The legacy Qwen/gemma fixed-key VLM path
-    // stays compiled (ml-engineer work item A4) but only runs as a fallback when OCR has no
-    // cached read for this image AND a VLM is explicitly selected in `[selected]`.
+    // Blank-amount image resolution (fleet/specs/ocr_vllm_pipeline.md work item B2; VLM/
+    // Anthropic path removed, board:cleanup.remove_vlm_anthropic): OCR, cached at ingestion
+    // and keyed by image_id, is the only image path -- a deterministic reader + witness
+    // gate, no live call here.
     for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
         let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
             continue;
@@ -438,45 +420,8 @@ fn decide_one(
             }
         };
 
-        let resolution = if let Some(ocr_result) = model_ctx.ocr_results.get(&image.image_id) {
-            Some(images::resolve_blank_amount_ocr(ocr_result, &image.image_id, &typed_event))
-        } else if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
-            if model_ctx.config.vlm_primary().is_some() {
-                let image_max_dim_px = model_ctx.config.image_max_dim_px();
-                let image_path = dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
-                let history: Vec<Event> = events
-                    .iter()
-                    .filter(|e| e.user_id == request.user_id)
-                    .filter_map(|e| Event::from_model(e).ok())
-                    .collect();
-                // resolve_blank_amount dispatches on config.vlm_mode() (escalate vs.
-                // two-model agreement) internally now, per extraction's decision.vlm_setup.
-                match images::resolve_blank_amount(
-                    client,
-                    model_ctx.anthropic,
-                    model_ctx.cold,
-                    prompt,
-                    image_max_dim_px,
-                    &image_path,
-                    &image.image_id,
-                    model_ctx.config,
-                    &typed_event,
-                    &history,
-                ) {
-                    Ok(resolution) => Some(resolution),
-                    Err(e) => {
-                        eprintln!("vlm: {} failed: {e:#}", image.image_id);
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let Some(resolution) = resolution else { continue };
+        let Some(ocr_result) = model_ctx.ocr_results.get(&image.image_id) else { continue };
+        let resolution = images::resolve_blank_amount_ocr(ocr_result, &image.image_id, &typed_event);
         let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {
             Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
             _ => None,
@@ -633,7 +578,6 @@ fn load_pricing(path: &Path) -> anyhow::Result<HashMap<String, hf::Pricing>> {
     }
     #[derive(Deserialize)]
     struct CandidatesConfig {
-        vlm: Vec<CandidateConfig>,
         llm: Vec<CandidateConfig>,
     }
     #[derive(Deserialize)]
@@ -652,7 +596,7 @@ fn load_pricing(path: &Path) -> anyhow::Result<HashMap<String, hf::Pricing>> {
     let config: ModelsConfig = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("failed to parse {}: {e}", path.display()))?;
     let mut pricing = HashMap::new();
-    for c in config.candidates.vlm.into_iter().chain(config.candidates.llm) {
+    for c in config.candidates.llm {
         pricing.insert(
             c.id,
             hf::Pricing {
