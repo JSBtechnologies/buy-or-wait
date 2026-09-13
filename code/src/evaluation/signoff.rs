@@ -149,9 +149,8 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         }
     }
 
-    // Image amounts only through the witness gate (OCR / witness modes) or, for legacy routed
-    // provenance, [vlm_routing] agreement; no Claude dependency (RULES.md S8).
-    match super::image_agreement::check(&repo_for_code.join("code"), dataset_dir, &repo_for_code.join("code/config/models.toml")) {
+    // Image amounts only through the OCR witness gate.
+    match super::image_agreement::check(&repo_for_code.join("code"), dataset_dir) {
         Err(e) => {
             gate_ran = false;
             s.check("image amounts: witness gate", false, format!("could not run: {e}"))
@@ -311,12 +310,11 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Mutation (analyst #276): a self-consistent 10x lakh misread by one reader must fail the
-    /// accuracy gate on BOTH the no-single-read-acceptance rule (IA4) and the audit-gold comparison
-    /// (FA1). The reference and the 10x figure come from RULES.md at test time; routing is
-    /// decision.vlm_routing_v3 in config/models.toml shape (235B + gemma readers, claude tiebreak).
+    /// Mutation (analyst #276): a 10x lakh misread must fail the accuracy gate on BOTH the witness
+    /// gate (IA4/IA15 when unwitnessed) and the audit-gold comparison (FA1). The reference and the
+    /// 10x figure come from RULES.md at test time; provenance is the OCR shape main.rs persists.
     #[test]
-    fn ten_x_single_read_fails_agreement_and_gold() {
+    fn ten_x_misread_fails_witness_gate_and_gold() {
         use serde_json::{json, Value};
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let dataset = repo.join("dataset");
@@ -329,66 +327,37 @@ mod tests {
         let misread = truth * 10.0;
         assert!(!g.amounts.contains(&(g.amounts[0] * 10)), "10x must not be an accepted alt rendering");
 
-        const Q: &str = "Qwen/Qwen3-VL-235B-A22B-Instruct";
-        const G: &str = "google/gemma-4-31B-it";
-        const C: &str = "claude-opus-5";
-        let config = format!(
-            "[selected]\nvlm_primary = \"{Q}\"\nvlm_escalation = \"{G}\"\nvlm_fallback = \"{C}\"\n\n\
-             [vlm_routing]\ndefault_class = \"settled_expense_receipt\"\ntolerance = 0.01\n\n\
-             [[vlm_routing.classes]]\nname = \"pending_bill_due_date\"\nevent_types = []\nstatuses = [\"pending\", \"scheduled\"]\ncategories = []\n\
-             readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }} ]\n\
-             tiebreak = {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }}\n\n\
-             [[vlm_routing.classes]]\nname = \"settled_expense_receipt\"\nstatuses = [\"settled\"]\n\
-             readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }} ]\n\
-             tiebreak = {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }}\n"
-        );
-        let read = |role: &str, model: &str, px: u32, tokens: u32, ok: bool, amt: Option<f64>| {
-            json!({"role": role, "model_id": model, "model_revision": "x", "max_dim_px": px, "max_tokens": tokens, "reconciled": ok,
-                   "selected_amount": amt, "currency": "INR", "due_date": null, "before_amount": null, "after_amount": null, "error": null})
+        let read = |amt: Option<f64>, witness: Option<&str>| {
+            json!({"role": "ocr", "model_id": "baidu/Unlimited-OCR", "model_revision": "", "max_dim_px": 0, "reconciled": true,
+                   "selected_amount": amt, "cutoff": null, "witness": witness, "ocr_notes": []})
         };
         // Runs the gate's image contributors on a temp code dir; returns (false-accept codes, gold facts checked).
         let gate = |tag: &str, reads: Vec<Value>, outcome: &str, applied: f64| -> (Vec<&'static str>, usize) {
             let code = std::env::temp_dir().join(format!("verifier_10x_{tag}_{}", std::process::id()));
             std::fs::create_dir_all(code.join("store/processed/image_reads")).unwrap();
             std::fs::create_dir_all(code.join("store/processed/evidence")).unwrap();
-            let evidence = json!({"record_id": format!("{image}#{outcome}:vlm_primary"), "source": "Image", "observed_at": "2024-01-01T00:00:00",
+            let evidence = json!({"record_id": format!("{image}#ocr"), "source": "Image", "observed_at": "2024-01-01T00:00:00",
                 "fact": {"EventAmount": {"event_id": g.event_id, "amount": (applied * crate::engine::money::SCALE as f64).round() as i64, "currency": "INR"}}});
-            let prov = json!({"image_id": image, "class": "pending_bill_due_date", "mode": "agreement", "reads": reads, "outcome": outcome, "evidence": evidence});
+            let prov = json!({"image_id": image, "event_id": g.event_id, "class": "", "mode": "ocr", "reads": reads, "outcome": outcome, "accepted_amount": applied});
             std::fs::write(code.join(format!("store/processed/image_reads/{image}.json")), prov.to_string()).unwrap();
             std::fs::write(code.join("store/processed/evidence/request_x.json"), json!([evidence]).to_string()).unwrap();
-            std::fs::write(code.join("models.toml"), &config).unwrap();
-            let agreement = super::super::image_agreement::check(&code, &dataset, &code.join("models.toml")).unwrap();
-            assert!(!agreement.iter().any(|f| f.code.starts_with("IA9") || f.code == "IA0_provenance_unreadable"), "fixture config/provenance invalid: {agreement:?}");
+            let gate_f = super::super::image_agreement::check(&code, &dataset).unwrap();
+            assert!(!gate_f.iter().any(|f| f.code == "IA0_provenance_unreadable"), "fixture provenance invalid: {gate_f:?}");
             let (gold_f, n) = super::super::false_accepts::image_gold_findings(&code, Some(&repo)).unwrap();
             std::fs::remove_dir_all(&code).ok();
-            (false_accepts_in(&agreement).chain(gold_f.iter()).map(|f| f.code).collect(), n)
+            (false_accepts_in(&gate_f).chain(gold_f.iter()).map(|f| f.code).collect(), n)
         };
-        let fails_both = |codes: &[&str]| codes.contains(&"IA4_no_agreement") && codes.contains(&"FA1_image_amount_wrong");
 
-        // 1. One reconciled 10x read, recorded and applied as an agreement.
-        let (c, n) = gate("single", vec![read("vlm_primary", Q, 1024, 400, true, Some(misread))], "agree", misread);
-        assert!(n == 1 && fails_both(&c), "{c:?}");
+        // 1. An unwitnessed 10x read recorded and applied as an accept: witness gate and gold both fail.
+        let (c, n) = gate("nowitness", vec![read(Some(misread), None)], "witness_accept", misread);
+        assert!(n == 1 && c.contains(&"IA4_no_agreement") && c.contains(&"IA15_accept_without_witness") && c.contains(&"FA1_image_amount_wrong"), "{c:?}");
 
-        // 2. Agreeing-looking: the same 235B read again under the second reader's role.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(misread));
-        let (c, _) = gate("selfagree", vec![q.clone(), read("vlm_escalation", Q, 768, 400, true, Some(misread))], "agree", misread);
-        assert!(fails_both(&c), "{c:?}");
-
-        // 3. The second reader failed (no figure): still a single read.
-        let (c, _) = gate("otherfailed", vec![q.clone(), read("vlm_escalation", G, 768, 400, false, None)], "agree", misread);
-        assert!(fails_both(&c), "{c:?}");
-
-        // 4. The second reader reads the true figure: disagreement, no tiebreak -> nothing may be applied.
-        let (c, _) = gate("disagree", vec![q.clone(), read("vlm_escalation", G, 768, 400, true, Some(truth))], "agree", misread);
-        assert!(fails_both(&c), "{c:?}");
-
-        // 5. Defense in depth: two routed models make the same 10x error (agreement accepts it);
-        //    the audit-gold comparison alone still fails the gate.
-        let (c, _) = gate("twomodels", vec![q, read("vlm_escalation", G, 768, 400, false, None), read("vlm_fallback", C, 1024, 4000, true, Some(misread))], "tiebreak_accept", misread);
+        // 2. Defense in depth: a witnessed 10x misread passes the witness gate; gold alone fails it.
+        let (c, _) = gate("witnessed", vec![read(Some(misread), Some("amount_in_words"))], "witness_accept", misread);
         assert_eq!(c, vec!["FA1_image_amount_wrong"], "{c:?}");
 
-        // Control: routed agreement on the true figure passes the gate.
-        let (c, _) = gate("control", vec![read("vlm_primary", Q, 1024, 400, true, Some(truth)), read("vlm_escalation", G, 768, 400, true, Some(truth))], "agree", truth);
+        // Control: the witnessed true figure passes.
+        let (c, _) = gate("control", vec![read(Some(truth), Some("total_minus_paid"))], "witness_accept", truth);
         assert!(c.is_empty(), "{c:?}");
     }
 }
