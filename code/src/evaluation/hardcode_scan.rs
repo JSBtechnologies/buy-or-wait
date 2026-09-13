@@ -198,7 +198,16 @@ pub fn scan(code_dir: &Path, dataset_dir: &Path, gold: Option<&Path>, rules_md: 
         let rel = f.strip_prefix(code_dir).unwrap_or(&f).display().to_string().replace('\\', "/");
         let comment_free: String = test_part.lines().map(|l| if l.trim_start().starts_with("//") { "" } else { l }).collect::<Vec<_>>().join("\n");
         for (line, vals, tok) in literal_values(&comment_free) {
-            if let Some(hit) = vals.iter().find(|v| images.contains(v)) {
+            // Appearance only matters for distinctive figures (>= 4 significant digits); round
+            // numbers like 100000 or 723 coincide with test fixtures by chance.
+            let distinctive = |c: &Cents| {
+                let mut v = *c;
+                while v > 0 && v % 10 == 0 {
+                    v /= 10;
+                }
+                v >= 1000
+            };
+            if let Some(hit) = vals.iter().find(|v| images.contains(v) && distinctive(v)) {
                 out.push(Finding {
                     request_id: format!("{rel}:{}", base_line + line),
                     severity: Severity::Warn,

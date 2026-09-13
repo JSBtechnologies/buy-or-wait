@@ -119,7 +119,7 @@ pub fn blank_amount_findings(inp: &Inputs, d: &Decision, session: &Session) -> V
                 }
             }
             AmountSource::Evidence(rec) => {
-                if image_of.get(e.event.id.as_str()) != Some(&rec.as_str()) {
+                if image_of.get(e.event.id.as_str()) != Some(&rec.split('#').next().unwrap_or("")) {
                     out.push(finding(id, Severity::Error, "BA5_amount_not_from_linked_image", format!("{} filled by {rec}, linked image is {:?}", e.event.id, image_of.get(e.event.id.as_str()))));
                 }
                 if e.amount.map(|a| a <= Money::ZERO).unwrap_or(true) {
