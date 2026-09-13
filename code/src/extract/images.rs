@@ -703,15 +703,17 @@ fn resolve_blank_amount_escalate(
 /// `event_type`/`status`/`category`, never the model's own `doc_type`) to a pair of reader
 /// roles, each with its own resolution/token budget. Both read the image independently; if
 /// their selected amounts agree (within the documented rounding tolerance), that figure is
-/// trusted. On disagreement, or when one reader is missing/unreconciled, `vlm_fallback`
-/// tiebreaks — but ONLY when it names a genuinely independent third candidate: if it's
-/// already one of this class's two primary readers, calling it again would just "tiebreak"
-/// against its own cached answer and decide alone (analyst audit #214), so no tiebreak is
-/// attempted at all in that case. A tiebreak match must ALSO satisfy any due-date cutoff any
-/// of the three reads resolved (analyst audit #203) — matching a stale pre-cutoff figure
-/// numerically is not enough. Two readers both failing to reconcile is never covered by a
-/// lone fallback read (analyst audit #214: "(None,None) also accepts one read" was a bug,
-/// not a feature — two-model agreement never trusts exactly one model).
+/// trusted. On disagreement, or when one reader is missing/unreconciled, the class's own
+/// `tiebreak` reader (user decision `decision.tiebreak_distinct`) is called — a class's
+/// `tiebreak` role is enforced distinct from both its primary `readers` at
+/// `ModelsConfig::load()` (hard error), so there is no runtime self-tiebreak case to guard
+/// here: calling it is always a genuinely independent third read (analyst audit #214/#219 —
+/// the image_05 false accept was exactly a self-tiebreak, Kimi matching its own cached
+/// answer 5/5). A tiebreak match must ALSO satisfy any due-date cutoff any of the three reads
+/// resolved (analyst audit #203) — matching a stale pre-cutoff figure numerically is not
+/// enough. Two readers both failing to reconcile is never covered by a lone tiebreak read
+/// (analyst audit #214: "(None,None) also accepts one read" was a bug, not a feature —
+/// two-model agreement never trusts exactly one model).
 fn resolve_blank_amount_agreement(
     client: &HfClient,
     cold: bool,
@@ -754,30 +756,17 @@ fn resolve_blank_amount_agreement(
         }
     }
 
-    let Some(fallback) = config.vlm_fallback() else {
+    let Some(tb_pick) = config.tiebreak_for(event) else {
         return Ok(outcome("no_agreement", reads, None));
     };
-    if fallback.id == pick_a.candidate.id || fallback.id == pick_b.candidate.id {
-        // No genuinely independent third reader configured for this class -- never
-        // "tiebreak" a candidate against its own earlier (cache-identical) answer.
-        return Ok(outcome("no_agreement", reads, None));
-    }
-
-    let fb_max_dim = config.image_max_dim_px();
-    let b64_fb = if fb_max_dim == pick_a.max_dim_px {
+    let b64_fb = if tb_pick.max_dim_px == pick_a.max_dim_px {
         b64_a.clone()
-    } else if fb_max_dim == pick_b.max_dim_px {
+    } else if tb_pick.max_dim_px == pick_b.max_dim_px {
         b64_b.clone()
     } else {
-        downscale_and_encode(image_path, fb_max_dim)?
+        downscale_and_encode(image_path, tb_pick.max_dim_px)?
     };
-    let fb_pick = ReaderPick {
-        role: "vlm_fallback",
-        candidate: fallback,
-        max_dim_px: fb_max_dim,
-        max_tokens: decoding.max_tokens_vlm,
-    };
-    let prov_fb = read_candidate(client, cold, prompt, decoding, fb_pick, &b64_fb, image_id, event);
+    let prov_fb = read_candidate(client, cold, prompt, decoding, tb_pick, &b64_fb, image_id, event);
     reads.push(prov_fb.clone());
 
     let Some(amt_fb) = prov_fb.selected_amount else {
@@ -800,7 +789,7 @@ fn resolve_blank_amount_agreement(
     match matched_role {
         Some(role) if satisfies_cutoff(amt_fb) => {
             let currency = prov_fb.currency.clone().unwrap_or_else(|| event.currency.clone());
-            let evidence = build_evidence(image_id, event, amt_fb, currency, &[&role, "vlm_fallback"]);
+            let evidence = build_evidence(image_id, event, amt_fb, currency, &[&role, &prov_fb.role]);
             Ok(outcome("tiebreak_accept", reads, Some(evidence)))
         }
         _ => Ok(outcome("no_agreement", reads, None)),
