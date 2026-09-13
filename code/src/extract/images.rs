@@ -14,11 +14,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use chrono::NaiveDate;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
 use crate::engine::money::Money;
 use crate::engine::types::{Event, EventType, Status};
-use crate::extract::model_config::{CandidateConfig, DecodingConfig, ModelsConfig, VlmMode};
+use crate::extract::model_config::{CandidateConfig, DecodingConfig, ModelsConfig, ReaderPick, VlmMode};
 use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
 use crate::hf::{ContentPart, HfClient, ModelCall};
@@ -85,78 +86,151 @@ impl DocType {
 
 /// Every labeled figure the VLM transcribed off one document. Every field but `doc_type` is
 /// nullable: a figure not printed on the page stays `None`, never an inferred zero.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Deserialized via `RawImageFigures` (below), never derived directly, so every field can
+/// be coerced by JSON type AND the three due-date fields can recover a date string a model
+/// dropped into the wrong (numeric) field.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImageFigures {
     pub doc_type: Option<DocType>,
-    #[serde(default, deserialize_with = "lenient_string")]
     pub currency: Option<String>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub subtotal: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub tax: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub total: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_due: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_paid: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub balance_due: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub gross_pay: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub deductions: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub net_pay: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub previous_balance: Option<f64>,
-    // analyst audit board:verify.image05_shapes: cached reads for image_05 put a date
-    // string where a number was expected on this trio (or vice versa) roughly as often as
-    // not -- strict typing on any one of the three failed the WHOLE ImageFigures parse
-    // instead of leaving just that field unusable. `lenient_f64`/`lenient_string` accept
-    // whichever JSON type actually showed up and coerce it (or give up to `None`), never a
-    // hard error.
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_due_before_date: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_string")]
     pub amount_due_before_date_value: Option<String>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub amount_due_after_date: Option<f64>,
-    #[serde(default, deserialize_with = "lenient_string")]
     pub document_date: Option<String>,
-    #[serde(default, deserialize_with = "lenient_string")]
     pub period_label: Option<String>,
-    #[serde(default, deserialize_with = "lenient_f64")]
     pub line_items_sum_check: Option<f64>,
+}
+
+impl<'de> Deserialize<'de> for ImageFigures {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        RawImageFigures::deserialize(deserializer).map(ImageFigures::from)
+    }
+}
+
+/// Every field captured as a raw `serde_json::Value` first (or absent), so the conversion
+/// below can coerce by actual JSON type and cross-reference fields — neither is possible
+/// with independent per-field `deserialize_with` visitors (analyst audits #184/#194/#200:
+/// doc_type/currency/paid+total misreads; #203: a date string landing in a numeric
+/// before/after field must be recovered as the cutoff, which requires seeing all three
+/// due-date fields together).
+#[derive(Debug, Default, Deserialize)]
+struct RawImageFigures {
+    #[serde(default)]
+    doc_type: Option<Value>,
+    #[serde(default)]
+    currency: Option<Value>,
+    #[serde(default)]
+    subtotal: Option<Value>,
+    #[serde(default)]
+    tax: Option<Value>,
+    #[serde(default)]
+    total: Option<Value>,
+    #[serde(default)]
+    amount_due: Option<Value>,
+    #[serde(default)]
+    amount_paid: Option<Value>,
+    #[serde(default)]
+    balance_due: Option<Value>,
+    #[serde(default)]
+    gross_pay: Option<Value>,
+    #[serde(default)]
+    deductions: Option<Value>,
+    #[serde(default)]
+    net_pay: Option<Value>,
+    #[serde(default)]
+    previous_balance: Option<Value>,
+    #[serde(default)]
+    amount_due_before_date: Option<Value>,
+    #[serde(default)]
+    amount_due_before_date_value: Option<Value>,
+    #[serde(default)]
+    amount_due_after_date: Option<Value>,
+    #[serde(default)]
+    document_date: Option<Value>,
+    #[serde(default)]
+    period_label: Option<Value>,
+    #[serde(default)]
+    line_items_sum_check: Option<Value>,
 }
 
 /// Accepts a JSON number or a numeric-looking string; anything else (including a date
 /// string landing in a numeric field) is `None` rather than a hard parse error.
-fn lenient_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|v| match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.trim().replace(',', "").parse::<f64>().ok(),
+fn coerce_f64(v: &Option<Value>) -> Option<f64> {
+    match v.as_ref()? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().replace(',', "").parse::<f64>().ok(),
         _ => None,
-    }))
+    }
 }
 
-/// Accepts a JSON string, or coerces a JSON number to its string form (e.g. a number
-/// landing in what should have been a date-string field); anything else is `None`.
-fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|v| match v {
-        serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Number(n) => Some(n.to_string()),
+/// Accepts a JSON string, or coerces a JSON number to its string form; anything else is
+/// `None`.
+fn coerce_string(v: &Option<Value>) -> Option<String> {
+    match v.as_ref()? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
         _ => None,
-    }))
+    }
 }
+
+/// `Some(the string)` only when `v` is a JSON string that itself parses as a date — used to
+/// recover a cutoff date a model put in a numeric before/after field instead of the
+/// `_value` field (analyst audit #203).
+fn date_string_hint(v: &Option<Value>) -> Option<String> {
+    match v.as_ref()? {
+        Value::String(s) if parse_date(s).is_some() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+impl From<RawImageFigures> for ImageFigures {
+    fn from(raw: RawImageFigures) -> Self {
+        let mut before_value = coerce_string(&raw.amount_due_before_date_value);
+        if before_value.as_deref().and_then(parse_date).is_none() {
+            before_value = date_string_hint(&raw.amount_due_before_date)
+                .or_else(|| date_string_hint(&raw.amount_due_after_date))
+                .or(before_value);
+        }
+        ImageFigures {
+            doc_type: raw
+                .doc_type
+                .as_ref()
+                .and_then(Value::as_str)
+                .map(DocType::from_free_text),
+            currency: coerce_string(&raw.currency),
+            subtotal: coerce_f64(&raw.subtotal),
+            tax: coerce_f64(&raw.tax),
+            total: coerce_f64(&raw.total),
+            amount_due: coerce_f64(&raw.amount_due),
+            amount_paid: coerce_f64(&raw.amount_paid),
+            balance_due: coerce_f64(&raw.balance_due),
+            gross_pay: coerce_f64(&raw.gross_pay),
+            deductions: coerce_f64(&raw.deductions),
+            net_pay: coerce_f64(&raw.net_pay),
+            previous_balance: coerce_f64(&raw.previous_balance),
+            amount_due_before_date: coerce_f64(&raw.amount_due_before_date),
+            amount_due_before_date_value: before_value,
+            amount_due_after_date: coerce_f64(&raw.amount_due_after_date),
+            document_date: coerce_string(&raw.document_date),
+            period_label: coerce_string(&raw.period_label),
+            line_items_sum_check: coerce_f64(&raw.line_items_sum_check),
+        }
+    }
+}
+
 
 /// Rounding tolerance for reconciliation checks combining two printed terms (e.g.
 /// subtotal+tax=total). Analyst audit RULES.md S5 image_07: subtotal 8,122 + tax 406.10 =
@@ -192,33 +266,45 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
         // not the expense amount; the printed total is the authoritative figure whenever
         // it's present, with amount_paid only as a fallback when no total is printed.
         (_, Status::Settled) => figures.total.or(figures.amount_paid),
-        (_, Status::Pending | Status::Scheduled) => {
-            if let (Some(before), Some(after)) =
-                (figures.amount_due_before_date, figures.amount_due_after_date)
-            {
-                // analyst audit board:verify.image05_shapes: several cached reads never
-                // land a usable cutoff date in amount_due_before_date_value at all (it's
-                // absent, or a stray number landed there instead of a date string).
-                if let Some(cutoff) =
-                    figures.amount_due_before_date_value.as_deref().and_then(parse_date)
-                {
-                    return Some(if event.cash_date() > cutoff { after } else { before });
-                }
-                // No reliable cutoff date to choose between them: the conservative choice
-                // is the larger figure, never the smaller -- under-reserving a pending debt
-                // risks a plan that later breaches the minimum balance; over-reserving only
-                // costs safety margin, never correctness.
-                return Some(before.max(after));
-            }
-            // Only one of before/after is present with no date to resolve it (or neither
-            // is present at all): not safe to treat that lone value as authoritative on its
-            // own -- fall through to whatever else the page states. If nothing here
-            // resolves either, `select` returns `None` and the caller escalates rather than
-            // guessing (never accepts an unresolved lone due-date figure as-is).
-            figures.balance_due.or(figures.amount_due)
-        }
+        (_, Status::Pending | Status::Scheduled) => select_pending_or_scheduled(figures, event),
         _ => figures.total,
     }
+}
+
+/// Never treat exactly-zero (or negative) as the selected amount for a still-outstanding
+/// debit: `Status::Pending`/`Status::Scheduled` are by construction money not yet moved, so
+/// a 0 reading is a stale/misplaced figure, not "nothing owed" (analyst audit #203).
+fn positive(amount: Option<f64>) -> Option<f64> {
+    amount.filter(|v| *v > 0.0)
+}
+
+fn select_pending_or_scheduled(figures: &ImageFigures, event: &Event) -> Option<f64> {
+    // A cutoff may come from the labeled `_value` field directly, or be recovered from a
+    // date string a model dropped into a numeric before/after field (`RawImageFigures`'s
+    // conversion already folds that recovery into `amount_due_before_date_value`).
+    if let Some(cutoff) = figures.amount_due_before_date_value.as_deref().and_then(parse_date) {
+        // analyst audit #203: once the cutoff is known, the required side is exact -- never
+        // fall back to the other (known-wrong-for-this-date) side, and never fall through
+        // to balance_due/amount_due either. Missing the required side means escalate.
+        return if event.cash_date() > cutoff {
+            positive(figures.amount_due_after_date)
+        } else {
+            positive(figures.amount_due_before_date)
+        };
+    }
+    if let (Some(before), Some(after)) =
+        (figures.amount_due_before_date, figures.amount_due_after_date)
+    {
+        // No reliable cutoff date to choose between them: the conservative choice is the
+        // larger figure, never the smaller -- under-reserving a pending debt risks a plan
+        // that later breaches the minimum balance; over-reserving only costs safety margin.
+        return positive(Some(before.max(after)));
+    }
+    // Only one of before/after is present with no date to resolve it (or neither is present
+    // at all): not safe to treat that lone value as authoritative on its own -- fall through
+    // to whatever else the page states. If nothing here resolves either, `select` returns
+    // `None` and the caller escalates rather than guessing.
+    positive(figures.balance_due).or_else(|| positive(figures.amount_due))
 }
 
 /// Every check that has the data to run, must pass, or the figure is rejected
@@ -378,6 +464,7 @@ fn call_vlm(
     prompt: &PromptSet,
     decoding: &DecodingConfig,
     candidate: &CandidateConfig,
+    max_tokens: u32,
     image_b64: &str,
 ) -> anyhow::Result<ImageFigures> {
     let call = ModelCall {
@@ -392,13 +479,49 @@ fn call_vlm(
         ],
         temperature: decoding.temperature,
         seed: decoding.seed,
-        max_tokens: decoding.max_tokens_vlm,
+        max_tokens,
         json_response: candidate.supports_structured_output,
     };
     let response =
         if cold { client.chat_completion_cold(&call)? } else { client.chat_completion(&call)? };
+    // Kimi-K3 (a thinking model, ml-engineer #204/lead) returns reasoning text ahead of the
+    // JSON answer at any max_tokens generous enough to let it finish; `parse_json_reply`
+    // already locates the JSON body rather than requiring the whole reply to be JSON.
     let value = parse_json_reply(&response.raw_text)?;
     Ok(serde_json::from_value(value)?)
+}
+
+/// Per-read provenance (verifier #205 contract, board:verify.image_agreement): the
+/// integrator persists one of these per attempted read to
+/// `store/processed/image_reads/<image_id>.json` so a read's outcome is auditable
+/// independent of whether it ended up contributing to the final evidence.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageReadProvenance {
+    pub role: String,
+    pub model_id: String,
+    pub model_revision: String,
+    pub max_dim_px: u32,
+    pub max_tokens: u32,
+    pub reconciled: bool,
+    pub selected_amount: Option<f64>,
+    pub currency: Option<String>,
+    /// The due-date cutoff this read itself resolved, if any (labeled or recovered).
+    pub due_date: Option<String>,
+    pub before_amount: Option<f64>,
+    pub after_amount: Option<f64>,
+    pub error: Option<String>,
+}
+
+/// Full resolution for one blank-amount event: every read attempted, the outcome, and the
+/// evidence (if any) that resulted. `class`/`mode` place the decision in context for audit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageResolution {
+    pub image_id: String,
+    pub class: Option<String>,
+    pub mode: String,
+    pub reads: Vec<ImageReadProvenance>,
+    pub outcome: String,
+    pub evidence: Option<EvidenceRecord>,
 }
 
 /// End-to-end resolution for one blank-amount event with a linked image (PLAN.md §2.3,
@@ -406,8 +529,9 @@ fn call_vlm(
 /// - `Escalate`: the original primary -> escalation -> fallback chain, accepting the first
 ///   reconciling read.
 /// - `Agreement`: two independent readers (chosen by `config.readers_for(event)`'s
-///   deterministic event-class routing) must select the same amount before it's trusted;
-///   `vlm_fallback` tiebreaks on disagreement or a missing reader.
+///   deterministic event-class routing, each with its own resolution/token budget) must
+///   select the same amount before it's trusted; `vlm_fallback` tiebreaks on disagreement
+///   or a missing reader.
 ///
 /// When the user has not picked a model yet (`[selected]` absent from
 /// `config/models.toml`), the caller simply does not call this function; the model path is
@@ -421,7 +545,7 @@ pub fn resolve_blank_amount(
     image_id: &str,
     config: &ModelsConfig,
     event: &Event,
-) -> anyhow::Result<Option<EvidenceRecord>> {
+) -> anyhow::Result<ImageResolution> {
     match config.vlm_mode() {
         VlmMode::Escalate => resolve_blank_amount_escalate(
             client,
@@ -436,58 +560,10 @@ pub fn resolve_blank_amount(
             config.vlm_fallback(),
             event,
         ),
-        VlmMode::Agreement => resolve_blank_amount_agreement(
-            client,
-            cold,
-            prompt,
-            &config.decoding,
-            image_max_dim_px,
-            image_path,
-            image_id,
-            config,
-            event,
-        ),
-    }
-}
-
-/// The original chain: downscale, transcribe with the primary VLM, select + reconcile; on
-/// a reconciliation failure (or a malformed/unparseable reply), escalate once to the second
-/// configured model — a fresh read, not a retry of the same call — and try again, then the
-/// backup frontier model. Still failing, or nothing configured beyond primary: `None`.
-/// Never a guess, never a zero.
-#[allow(clippy::too_many_arguments)]
-fn resolve_blank_amount_escalate(
-    client: &HfClient,
-    cold: bool,
-    prompt: &PromptSet,
-    decoding: &DecodingConfig,
-    image_max_dim_px: u32,
-    image_path: &Path,
-    image_id: &str,
-    vlm_primary: Option<&CandidateConfig>,
-    vlm_escalation: Option<&CandidateConfig>,
-    vlm_fallback: Option<&CandidateConfig>,
-    event: &Event,
-) -> anyhow::Result<Option<EvidenceRecord>> {
-    let Some(vlm_primary) = vlm_primary else { return Ok(None) };
-    let image_b64 = downscale_and_encode(image_path, image_max_dim_px)?;
-
-    let attempt = |candidate: &CandidateConfig| -> anyhow::Result<Option<EvidenceRecord>> {
-        match call_vlm(client, cold, prompt, decoding, candidate, &image_b64) {
-            Ok(figures) => Ok(to_evidence(image_id, &figures, event)),
-            Err(e) => {
-                eprintln!("vlm: {image_id} via {}: {e:#}", candidate.id);
-                Ok(None)
-            }
-        }
-    };
-
-    for candidate in [Some(vlm_primary), vlm_escalation, vlm_fallback].into_iter().flatten() {
-        if let Some(record) = attempt(candidate)? {
-            return Ok(Some(record));
+        VlmMode::Agreement => {
+            resolve_blank_amount_agreement(client, cold, prompt, &config.decoding, image_path, image_id, config, event)
         }
     }
-    Ok(None)
 }
 
 fn read_candidate(
@@ -495,18 +571,55 @@ fn read_candidate(
     cold: bool,
     prompt: &PromptSet,
     decoding: &DecodingConfig,
-    candidate: &CandidateConfig,
+    pick: ReaderPick<'_>,
     image_b64: &str,
     image_id: &str,
     event: &Event,
-) -> Option<(f64, String)> {
-    match call_vlm(client, cold, prompt, decoding, candidate, image_b64) {
-        Ok(figures) => selected_figure(&figures, event),
+) -> ImageReadProvenance {
+    let mut prov = ImageReadProvenance {
+        role: pick.role.to_string(),
+        model_id: pick.candidate.id.clone(),
+        model_revision: pick.candidate.model_revision.clone(),
+        max_dim_px: pick.max_dim_px,
+        max_tokens: pick.max_tokens,
+        reconciled: false,
+        selected_amount: None,
+        currency: None,
+        due_date: None,
+        before_amount: None,
+        after_amount: None,
+        error: None,
+    };
+    match call_vlm(client, cold, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
+        Ok(figures) => {
+            prov.due_date = figures.amount_due_before_date_value.clone();
+            prov.before_amount = figures.amount_due_before_date;
+            prov.after_amount = figures.amount_due_after_date;
+            prov.reconciled = reconciles(&figures, event);
+            if prov.reconciled {
+                prov.selected_amount = select(&figures, event);
+                if prov.selected_amount.is_some() {
+                    prov.currency =
+                        Some(figures.currency.clone().unwrap_or_else(|| event.currency.clone()));
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("vlm: {image_id} via {}: {e:#}", candidate.id);
-            None
+            eprintln!("vlm: {image_id} via {}: {e:#}", pick.candidate.id);
+            prov.error = Some(e.to_string());
         }
     }
+    prov
+}
+
+/// What a read's OWN resolved cutoff (if any) requires the final amount to equal — mirrors
+/// `select_pending_or_scheduled`'s cutoff branch, applied to provenance rather than
+/// `ImageFigures` directly, so the two-model tiebreak can cross-check against it without
+/// keeping every read's raw figures around.
+fn cutoff_requirement(prov: &ImageReadProvenance, event: &Event) -> Option<f64> {
+    let cutoff = prov.due_date.as_deref().and_then(parse_date)?;
+    let required = if event.cash_date() > cutoff { prov.after_amount } else { prov.before_amount };
+    required.filter(|v| *v > 0.0)
 }
 
 fn build_evidence(
@@ -531,17 +644,13 @@ fn build_evidence(
     }
 }
 
-/// Two-model agreement (user decision `decision.vlm_setup`, board:verify.image_agree_preaudit):
-/// `config.readers_for(event)` routes this event's class (income/payslip, pending/scheduled
-/// bill, or settled expense/receipt — from `event_type`/`status`/`category`, never the
-/// model's own `doc_type`) to a pair of reader roles. Both read the image independently;
-/// if their selected amounts agree (within the documented rounding tolerance), that figure
-/// is trusted. On disagreement, or when one reader is missing/unreconciled, `vlm_fallback`
-/// tiebreaks: with one prior read, fallback must match it; with two that disagreed,
-/// fallback must match one of them; with neither having reconciled at all, fallback's own
-/// reconciling read is the only evidence available and is accepted alone. Any case fallback
-/// cannot resolve: `None` — never a guess.
-fn resolve_blank_amount_agreement(
+/// The original chain: downscale, transcribe with the primary VLM, select + reconcile; on
+/// a reconciliation failure (or a malformed/unparseable reply), escalate once to the second
+/// configured model — a fresh read, not a retry of the same call — and try again, then the
+/// backup frontier model. Still failing, or nothing configured beyond primary: no evidence.
+/// Never a guess, never a zero.
+#[allow(clippy::too_many_arguments)]
+fn resolve_blank_amount_escalate(
     client: &HfClient,
     cold: bool,
     prompt: &PromptSet,
@@ -549,60 +658,152 @@ fn resolve_blank_amount_agreement(
     image_max_dim_px: u32,
     image_path: &Path,
     image_id: &str,
-    config: &ModelsConfig,
+    vlm_primary: Option<&CandidateConfig>,
+    vlm_escalation: Option<&CandidateConfig>,
+    vlm_fallback: Option<&CandidateConfig>,
     event: &Event,
-) -> anyhow::Result<Option<EvidenceRecord>> {
-    let Some((role_a, candidate_a, role_b, candidate_b)) = config.readers_for(event) else {
-        return Ok(None);
+) -> anyhow::Result<ImageResolution> {
+    let outcome = |outcome: &str, reads: Vec<ImageReadProvenance>, evidence: Option<EvidenceRecord>| ImageResolution {
+        image_id: image_id.to_string(),
+        class: None,
+        mode: "escalate".to_string(),
+        reads,
+        outcome: outcome.to_string(),
+        evidence,
     };
+    let Some(vlm_primary) = vlm_primary else { return Ok(outcome("no_route", vec![], None)) };
     let image_b64 = downscale_and_encode(image_path, image_max_dim_px)?;
 
-    let read_a = read_candidate(client, cold, prompt, decoding, candidate_a, &image_b64, image_id, event);
-    let read_b = read_candidate(client, cold, prompt, decoding, candidate_b, &image_b64, image_id, event);
+    let mut reads = Vec::new();
+    for (role, candidate) in [
+        ("vlm_primary", Some(vlm_primary)),
+        ("vlm_escalation", vlm_escalation),
+        ("vlm_fallback", vlm_fallback),
+    ]
+    .into_iter()
+    .filter_map(|(r, c)| c.map(|c| (r, c)))
+    {
+        let pick = ReaderPick { role, candidate, max_dim_px: image_max_dim_px, max_tokens: decoding.max_tokens_vlm };
+        let prov = read_candidate(client, cold, prompt, decoding, pick, &image_b64, image_id, event);
+        if let (true, Some(amount), Some(currency)) =
+            (prov.reconciled, prov.selected_amount, prov.currency.clone())
+        {
+            reads.push(prov);
+            let evidence = build_evidence(image_id, event, amount, currency, &[role]);
+            return Ok(outcome("single_reconciled_accept", reads, Some(evidence)));
+        }
+        reads.push(prov);
+    }
+    Ok(outcome("no_reconciling_read", reads, None))
+}
 
-    if let (Some((amt_a, cur_a)), Some((amt_b, _))) = (&read_a, &read_b) {
-        if close(*amt_a, *amt_b, ROUNDING_TOLERANCE_2TERM) {
-            return Ok(Some(build_evidence(image_id, event, *amt_a, cur_a.clone(), &[role_a, role_b])));
+/// Two-model agreement (user decision `decision.vlm_setup`, board:verify.image_agree_preaudit
+/// + board:verify.image_agree_audit): `config.readers_for(event)` routes this event's class
+/// (income/payslip, pending/scheduled bill, or settled expense/receipt — from
+/// `event_type`/`status`/`category`, never the model's own `doc_type`) to a pair of reader
+/// roles, each with its own resolution/token budget. Both read the image independently; if
+/// their selected amounts agree (within the documented rounding tolerance), that figure is
+/// trusted. On disagreement, or when one reader is missing/unreconciled, `vlm_fallback`
+/// tiebreaks — but ONLY when it names a genuinely independent third candidate: if it's
+/// already one of this class's two primary readers, calling it again would just "tiebreak"
+/// against its own cached answer and decide alone (analyst audit #214), so no tiebreak is
+/// attempted at all in that case. A tiebreak match must ALSO satisfy any due-date cutoff any
+/// of the three reads resolved (analyst audit #203) — matching a stale pre-cutoff figure
+/// numerically is not enough. Two readers both failing to reconcile is never covered by a
+/// lone fallback read (analyst audit #214: "(None,None) also accepts one read" was a bug,
+/// not a feature — two-model agreement never trusts exactly one model).
+fn resolve_blank_amount_agreement(
+    client: &HfClient,
+    cold: bool,
+    prompt: &PromptSet,
+    decoding: &DecodingConfig,
+    image_path: &Path,
+    image_id: &str,
+    config: &ModelsConfig,
+    event: &Event,
+) -> anyhow::Result<ImageResolution> {
+    let class = config.classify_event(event).to_string();
+    let outcome = |outcome: &str, reads: Vec<ImageReadProvenance>, evidence: Option<EvidenceRecord>| ImageResolution {
+        image_id: image_id.to_string(),
+        class: Some(class.clone()),
+        mode: "agreement".to_string(),
+        reads,
+        outcome: outcome.to_string(),
+        evidence,
+    };
+
+    let Some((pick_a, pick_b)) = config.readers_for(event) else {
+        return Ok(outcome("no_route", vec![], None));
+    };
+
+    let b64_a = downscale_and_encode(image_path, pick_a.max_dim_px)?;
+    let b64_b = if pick_b.max_dim_px == pick_a.max_dim_px {
+        b64_a.clone()
+    } else {
+        downscale_and_encode(image_path, pick_b.max_dim_px)?
+    };
+    let prov_a = read_candidate(client, cold, prompt, decoding, pick_a, &b64_a, image_id, event);
+    let prov_b = read_candidate(client, cold, prompt, decoding, pick_b, &b64_b, image_id, event);
+    let mut reads = vec![prov_a.clone(), prov_b.clone()];
+
+    if let (Some(amt_a), Some(amt_b)) = (prov_a.selected_amount, prov_b.selected_amount) {
+        if close(amt_a, amt_b, ROUNDING_TOLERANCE_2TERM) {
+            let currency = prov_a.currency.clone().unwrap_or_else(|| event.currency.clone());
+            let evidence = build_evidence(image_id, event, amt_a, currency, &[&prov_a.role, &prov_b.role]);
+            return Ok(outcome("agree", reads, Some(evidence)));
         }
     }
 
-    // Disagreement, or one/both readers missing/unreconciled: tiebreak with vlm_fallback.
-    let Some(fallback) = config.vlm_fallback() else { return Ok(None) };
-    let Some((amt_fb, cur_fb)) =
-        read_candidate(client, cold, prompt, decoding, fallback, &image_b64, image_id, event)
-    else {
-        return Ok(None);
+    let Some(fallback) = config.vlm_fallback() else {
+        return Ok(outcome("no_agreement", reads, None));
+    };
+    if fallback.id == pick_a.candidate.id || fallback.id == pick_b.candidate.id {
+        // No genuinely independent third reader configured for this class -- never
+        // "tiebreak" a candidate against its own earlier (cache-identical) answer.
+        return Ok(outcome("no_agreement", reads, None));
+    }
+
+    let fb_max_dim = config.image_max_dim_px();
+    let b64_fb = if fb_max_dim == pick_a.max_dim_px {
+        b64_a.clone()
+    } else if fb_max_dim == pick_b.max_dim_px {
+        b64_b.clone()
+    } else {
+        downscale_and_encode(image_path, fb_max_dim)?
+    };
+    let fb_pick = ReaderPick {
+        role: "vlm_fallback",
+        candidate: fallback,
+        max_dim_px: fb_max_dim,
+        max_tokens: decoding.max_tokens_vlm,
+    };
+    let prov_fb = read_candidate(client, cold, prompt, decoding, fb_pick, &b64_fb, image_id, event);
+    reads.push(prov_fb.clone());
+
+    let Some(amt_fb) = prov_fb.selected_amount else {
+        return Ok(outcome("no_agreement", reads, None));
     };
 
-    match (&read_a, &read_b) {
-        (Some((amt_a, _)), Some((amt_b, _))) => {
-            if close(amt_fb, *amt_a, ROUNDING_TOLERANCE_2TERM) {
-                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_a, "vlm_fallback"])))
-            } else if close(amt_fb, *amt_b, ROUNDING_TOLERANCE_2TERM) {
-                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_b, "vlm_fallback"])))
-            } else {
-                Ok(None) // all three disagree -- never guess which is right
-            }
+    let cutoff_requirement =
+        [&prov_a, &prov_b, &prov_fb].iter().find_map(|p| cutoff_requirement(p, event));
+    let satisfies_cutoff =
+        |amount: f64| cutoff_requirement.is_none_or(|req| close(amount, req, ROUNDING_TOLERANCE_2TERM));
+
+    let matched_role = if prov_a.selected_amount.is_some_and(|a| close(amt_fb, a, ROUNDING_TOLERANCE_2TERM)) {
+        Some(prov_a.role.clone())
+    } else if prov_b.selected_amount.is_some_and(|b| close(amt_fb, b, ROUNDING_TOLERANCE_2TERM)) {
+        Some(prov_b.role.clone())
+    } else {
+        None
+    };
+
+    match matched_role {
+        Some(role) if satisfies_cutoff(amt_fb) => {
+            let currency = prov_fb.currency.clone().unwrap_or_else(|| event.currency.clone());
+            let evidence = build_evidence(image_id, event, amt_fb, currency, &[&role, "vlm_fallback"]);
+            Ok(outcome("tiebreak_accept", reads, Some(evidence)))
         }
-        (Some((amt_a, _)), None) => {
-            if close(amt_fb, *amt_a, ROUNDING_TOLERANCE_2TERM) {
-                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_a, "vlm_fallback"])))
-            } else {
-                Ok(None)
-            }
-        }
-        (None, Some((amt_b, _))) => {
-            if close(amt_fb, *amt_b, ROUNDING_TOLERANCE_2TERM) {
-                Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &[role_b, "vlm_fallback"])))
-            } else {
-                Ok(None)
-            }
-        }
-        (None, None) => {
-            // Nothing to tiebreak against: fallback's own reconciling read is the only
-            // evidence available this run.
-            Ok(Some(build_evidence(image_id, event, amt_fb, cur_fb, &["vlm_fallback"])))
-        }
+        _ => Ok(outcome("no_agreement", reads, None)),
     }
 }
 
@@ -851,6 +1052,40 @@ mod tests {
         assert_eq!(select(&figures, &event), None);
     }
 
+    /// analyst audit #203: a pending/scheduled debit never selects a zero -- a stale
+    /// balance_due=0 must fall through to amount_due (or whatever else resolves it), not be
+    /// accepted as "nothing owed" (the row is pending/scheduled by construction).
+    #[test]
+    fn pending_never_selects_zero_falls_through_to_amount_due() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            balance_due: Some(0.0),
+            amount_due: Some(822.05),
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert_eq!(select(&figures, &event), Some(822.05));
+    }
+
+    /// analyst audit #203: once a cutoff IS known and the cash date is past it, the
+    /// after-cutoff figure is required exactly -- never fall back to the before-cutoff
+    /// figure (which is known-wrong for this date) or to balance_due/amount_due.
+    #[test]
+    fn image_05_known_cutoff_requires_after_never_falls_back_to_before() {
+        let figures = ImageFigures {
+            doc_type: Some(DocType::Bill),
+            currency: Some("INR".into()),
+            amount_due_before_date: Some(704.05),
+            amount_due_before_date_value: Some("2026-02-06".into()),
+            amount_due_after_date: None, // missing -- must not fall back to before (704.05)
+            balance_due: Some(704.05),   // must not fall back here either
+            ..Default::default()
+        };
+        let event = pending_utilities_event(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap());
+        assert_eq!(select(&figures, &event), None);
+    }
+
     /// analyst audit "Shape B", the other 2 reads: after-cutoff (822.05) landed in
     /// balance_due instead of amount_due_after_date. The fallback still resolves it.
     #[test]
@@ -941,7 +1176,7 @@ mod tests {
         .expect("image_transcription.v1.md should parse");
         let client = crate::hf::HfClient::new().expect("HF_TOKEN must be set");
         let event = income_event();
-        let record = resolve_blank_amount(
+        let resolution = resolve_blank_amount(
             &client,
             false,
             &prompt,
@@ -951,8 +1186,8 @@ mod tests {
             &cfg,
             &event,
         )
-        .expect("call should not error")
-        .expect("image_01 should resolve to a figure");
+        .expect("call should not error");
+        let record = resolution.evidence.expect("image_01 should resolve to a figure");
         match record.fact {
             Fact::EventAmount { amount, .. } => assert_eq!(amount, Money::from_f64(4_365_000.0)),
             other => panic!("expected EventAmount, got {other:?}"),
