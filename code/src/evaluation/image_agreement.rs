@@ -1,44 +1,39 @@
-//! Signoff check for board `decision.vlm_setup` (user decision) as built: image-derived
+//! Signoff check for board decisions `vlm_setup`, `tiebreak_distinct` and `vlm_routing_v2`,
+//! against the design as built by extraction (32c17d5, shape posted in extract#234): image-derived
 //! `EventAmount`s are accepted only per the routing table in `config/models.toml`.
 //!
-//! Routing table (config; the verifier validates against it, nothing hardcoded):
+//! Routing table (`[vlm_routing]`, extraction's `VlmRoutingConfig`; must be explicit in config
+//! for signoff, the verifier validates against it and hardcodes no model):
 //! ```toml
 //! [vlm_routing]
-//! tolerance = 0.01                                        # documented rounding tolerance (<= 1.0)
-//! fallback = { model = "moonshotai/Kimi-K3", max_dim_px = 1024 }
-//!
-//! [[vlm_routing.classes]]                                 # first match wins, in file order
-//! name = "pending_bill_with_cutoff"
-//! match = { statuses = ["pending", "scheduled"], categories = ["utilities"], settles_after_event = true }
-//! readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 },
-//!             { model = "moonshotai/Kimi-K3", max_dim_px = 1024 } ]
-//! cutoff_rule = true                                      # every read (incl. tiebreak) must satisfy the due-date cutoff
-//! fallback = { model = "google/gemma-4-31B-it", max_dim_px = 768 }  # class tiebreak; omitted = global
-//!
+//! default_class = "settled_expense_receipt"
+//! tolerance = 1.0                                   # optional; else the documented 1.0, capped at 1.0
 //! [[vlm_routing.classes]]
-//! name = "default"                                        # no `match` = matches everything
-//! readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 },
-//!             { model = "google/gemma-4-31B-it", max_dim_px = 768 } ]
+//! name = "pending_bill_due_date"
+//! statuses = ["pending", "scheduled"]               # event_types / statuses / categories; empty = any
+//! readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
+//!             { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 1500 } ]
+//! tiebreak = { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 }   # optional
 //! ```
-//! Board decision.tiebreak_distinct: a class's tiebreak model must differ from every reader of that
-//! class (IA12, checked on the table itself and on each provenance).
-//! `match` keys (all optional, all must hold): statuses, categories, event_types, directions,
-//! settles_after_event (settlement_date > event_date). The class is recomputed from the event row.
+//! Roles resolve through `[selected]` (vlm_primary / vlm_escalation / vlm_fallback), so a model
+//! swap (e.g. routing v2: claude-opus-5 in the fallback role, served by provider "anthropic")
+//! needs no change here. Without an explicit `tiebreak`, the tiebreak is the one VLM role that is
+//! not a class reader, at the resolution/tokens that role has in any other class (else
+//! `[selected].image_max_dim_px`). decision.tiebreak_distinct: the tiebreak model must differ
+//! from both class readers (IA12).
 //!
-//! Provenance (written by the shipped run): `store/processed/image_reads/<image_id>.json`
-//! ```json
-//! { "image_id": "image_05", "event_id": "event_1786", "class": "pending_bill_with_cutoff",
-//!   "reads": [ { "role": "reader" | "fallback", "model_id": "…", "model_revision": "…", "max_dim_px": 1024,
-//!                "reconciled": true, "selected_amount": 822.05,
-//!                "cutoff": { "due_date": "2026-02-06", "before_amount": 704.05, "after_amount": 822.05 } } ],
-//!   "outcome": "agree" | "fallback_tiebreak" | "missing", "accepted_amount": 822.05 }
-//! ```
-//! A read counts only if: its model and max_dim_px are the ones routed for its role and class; it
-//! reconciled and selected a figure; for pending/scheduled events the figure is > 0; and when it
-//! carries cutoff data (mandatory in `cutoff_rule` classes) the figure is the after-cutoff amount
-//! iff the event's cash date is after the due date, else the before-cutoff amount.
-//! Accept: all class readers count and agree within tolerance → `agree`; else a counting fallback
-//! read agrees with a counting reader → `fallback_tiebreak`; else `missing`.
+//! Provenance (`store/processed/image_reads/<image_id>.json`, extraction's `ImageResolution`):
+//! `{ image_id, class, mode, reads: [{ role, model_id, model_revision, max_dim_px, max_tokens,
+//! reconciled, selected_amount, currency, due_date, before_amount, after_amount, error, ... }],
+//! outcome: "agree" | "tiebreak_accept" | "no_agreement" | "no_route", evidence }`. Extra read
+//! fields (e.g. `provider`) are accepted; agreement and the audit gold gate apply the same way.
+//!
+//! A read counts only if its model, max_dim_px and max_tokens are those routed for its slot, it
+//! reconciled and selected a figure, the figure is > 0 for pending/scheduled events, and it
+//! equals the due-date cutoff requirement when any read of the image resolved one (after-cutoff
+//! amount iff the cash date is after the due date). Accept: both class readers count and agree
+//! within tolerance → agree; else a counting tiebreak read agrees with a counting reader →
+//! tiebreak; else nothing is accepted (missing, never a guess).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -52,86 +47,142 @@ use super::contract::{Finding, Severity};
 use super::data::{Dataset, Event};
 
 pub const MAX_TOLERANCE: f64 = 1.0;
+pub const DEFAULT_TOLERANCE: f64 = 1.0;
+const VLM_ROLES: [&str; 3] = ["vlm_primary", "vlm_escalation", "vlm_fallback"];
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Reader {
-    pub model: String,
-    pub max_dim_px: u32,
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlotCfg {
+    pub role: String,
+    pub max_dim_px: Option<u32>,
+    pub max_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Match {
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassCfg {
+    pub name: String,
+    #[serde(default)]
+    pub event_types: Vec<String>,
     #[serde(default)]
     pub statuses: Vec<String>,
     #[serde(default)]
     pub categories: Vec<String>,
-    #[serde(default)]
-    pub event_types: Vec<String>,
-    #[serde(default)]
-    pub directions: Vec<String>,
-    pub settles_after_event: Option<bool>,
+    pub readers: Vec<SlotCfg>,
+    pub tiebreak: Option<SlotCfg>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum FallbackSpec {
-    Reader(Reader),
-    Keyword(String),
+struct RoutingCfg {
+    default_class: Option<String>,
+    #[serde(default)]
+    classes: Vec<ClassCfg>,
+    tolerance: Option<f64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+struct SelectedCfg {
+    vlm_primary: Option<String>,
+    vlm_escalation: Option<String>,
+    vlm_fallback: Option<String>,
+    image_max_dim_px: Option<u32>,
+}
+
+/// A resolved reading slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Slot {
+    pub role: String,
+    pub model: String,
+    pub max_dim_px: u32,
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Class {
     pub name: String,
-    #[serde(default, rename = "match")]
-    pub matcher: Option<Match>,
-    pub readers: Vec<Reader>,
-    #[serde(default)]
-    pub cutoff_rule: bool,
-    pub fallback: Option<FallbackSpec>,
+    pub cfg: ClassCfg,
+    pub readers: Vec<Slot>,
+    pub tiebreak: Option<Slot>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Routing {
     pub tolerance: f64,
-    pub fallback: Option<Reader>,
+    pub default_class: Option<String>,
     pub classes: Vec<Class>,
+    /// Config problems found while resolving (unresolvable roles, tiebreak == reader).
+    pub problems: Vec<Finding>,
+}
+
+fn fail(id: &str, code: &'static str, detail: String) -> Finding {
+    Finding { request_id: id.to_string(), severity: Severity::Error, code, detail }
 }
 
 impl Routing {
     pub fn from_models_toml(text: &str) -> Result<Option<Routing>> {
         let v: toml::Value = toml::from_str(text).context("parse models.toml")?;
-        match v.get("vlm_routing") {
-            None => Ok(None),
-            Some(r) => Ok(Some(r.clone().try_into().map_err(|e| anyhow!("[vlm_routing]: {e}"))?)),
+        let Some(r) = v.get("vlm_routing") else { return Ok(None) };
+        let cfg: RoutingCfg = r.clone().try_into().map_err(|e| anyhow!("[vlm_routing]: {e}"))?;
+        let sel: SelectedCfg = v.get("selected").cloned().map(|s| s.try_into()).transpose().map_err(|e| anyhow!("[selected]: {e}"))?.unwrap_or_default();
+        let model_of = |role: &str| match role {
+            "vlm_primary" => sel.vlm_primary.clone(),
+            "vlm_escalation" => sel.vlm_escalation.clone(),
+            "vlm_fallback" => sel.vlm_fallback.clone(),
+            _ => None,
+        };
+        let global_px = sel.image_max_dim_px.unwrap_or(1024);
+        let mut problems = Vec::new();
+        let resolve = |s: &SlotCfg, problems: &mut Vec<Finding>, class: &str| -> Option<Slot> {
+            match model_of(&s.role) {
+                Some(model) => Some(Slot { role: s.role.clone(), model, max_dim_px: s.max_dim_px.unwrap_or(global_px), max_tokens: s.max_tokens }),
+                None => {
+                    problems.push(fail("config", "IA9_unresolved_role", format!("class {class}: role {} does not resolve through [selected]", s.role)));
+                    None
+                }
+            }
+        };
+        // Resolution/tokens a role has anywhere in the table (for a derived tiebreak slot).
+        let role_spec = |role: &str| cfg.classes.iter().flat_map(|c| c.readers.iter().chain(c.tiebreak.iter())).find(|s| s.role == role && s.max_dim_px.is_some()).cloned();
+        let mut classes = Vec::new();
+        for c in &cfg.classes {
+            let readers: Vec<Slot> = c.readers.iter().filter_map(|s| resolve(s, &mut problems, &c.name)).collect();
+            if readers.len() != 2 {
+                problems.push(fail("config", "IA9_class_needs_two_readers", format!("class {} resolves {} readers", c.name, readers.len())));
+            }
+            let tiebreak = match &c.tiebreak {
+                Some(t) => resolve(t, &mut problems, &c.name),
+                None => {
+                    let remaining: Vec<&str> = VLM_ROLES.iter().copied().filter(|r| !c.readers.iter().any(|s| s.role == *r)).collect();
+                    match remaining.as_slice() {
+                        [role] => {
+                            let spec = role_spec(role).unwrap_or(SlotCfg { role: role.to_string(), max_dim_px: None, max_tokens: None });
+                            model_of(role).map(|model| Slot { role: role.to_string(), model, max_dim_px: spec.max_dim_px.unwrap_or(global_px), max_tokens: spec.max_tokens })
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            if let Some(t) = &tiebreak {
+                if readers.iter().any(|r| r.model == t.model) {
+                    problems.push(fail("config", "IA12_tiebreak_equals_reader", format!("class {} tiebreak {} ({}) is also one of its readers", c.name, t.model, t.role)));
+                }
+            }
+            classes.push(Class { name: c.name.clone(), cfg: c.clone(), readers, tiebreak });
         }
+        let tolerance = cfg.tolerance.unwrap_or(DEFAULT_TOLERANCE);
+        if !(0.0..=MAX_TOLERANCE).contains(&tolerance) {
+            problems.push(fail("config", "IA8_tolerance_out_of_range", format!("tolerance {tolerance} not in [0, {MAX_TOLERANCE}]")));
+        }
+        Ok(Some(Routing { tolerance, default_class: cfg.default_class, classes, problems }))
     }
 
+    /// Deterministic class from the event row: first class whose non-empty filters all match,
+    /// else `default_class`.
     pub fn class_for(&self, e: &Event) -> Option<&Class> {
-        self.classes.iter().find(|c| {
-            let Some(m) = &c.matcher else { return true };
-            let inlist = |list: &Vec<String>, v: &str| list.is_empty() || list.iter().any(|x| x == v);
-            inlist(&m.statuses, &e.status)
-                && inlist(&m.categories, &e.category)
-                && inlist(&m.event_types, &e.event_type)
-                && inlist(&m.directions, &e.direction)
-                && m.settles_after_event.map(|want| (e.cash_date() > e.event_date) == want).unwrap_or(true)
-        })
+        let ok = |list: &Vec<String>, v: &str| list.is_empty() || list.iter().any(|x| x == v);
+        self.classes
+            .iter()
+            .find(|c| ok(&c.cfg.event_types, &e.event_type) && ok(&c.cfg.statuses, &e.status) && ok(&c.cfg.categories, &e.category))
+            .or_else(|| self.default_class.as_ref().and_then(|d| self.classes.iter().find(|c| &c.name == d)))
     }
-
-    pub fn fallback_for<'a>(&'a self, c: &'a Class) -> Option<&'a Reader> {
-        match &c.fallback {
-            Some(FallbackSpec::Keyword(k)) if k == "none" => None,
-            Some(FallbackSpec::Reader(r)) => Some(r),
-            _ => self.fallback.as_ref(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Cutoff {
-    pub due_date: Option<String>,
-    pub before_amount: Option<f64>,
-    pub after_amount: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,101 +191,125 @@ pub struct Read {
     pub model_id: String,
     #[serde(default)]
     pub model_revision: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
     pub max_dim_px: Option<u32>,
+    pub max_tokens: Option<u32>,
     pub reconciled: bool,
     pub selected_amount: Option<f64>,
     #[serde(default)]
-    pub cutoff: Option<Cutoff>,
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub before_amount: Option<f64>,
+    #[serde(default)]
+    pub after_amount: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Provenance {
     pub image_id: String,
-    pub event_id: String,
-    pub class: String,
+    pub class: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
     pub reads: Vec<Read>,
     pub outcome: String,
-    pub accepted_amount: Option<f64>,
+    pub evidence: Option<Value>,
 }
 
-fn fail(id: &str, code: &'static str, detail: String) -> Finding {
-    Finding { request_id: id.to_string(), severity: Severity::Error, code, detail }
+impl Provenance {
+    fn evidence_event_amount(&self) -> (Option<String>, Option<f64>) {
+        let body = self.evidence.as_ref().and_then(|e| e.get("fact")).and_then(|f| f.get("EventAmount"));
+        (
+            body.and_then(|b| b.get("event_id")).and_then(Value::as_str).map(String::from),
+            body.and_then(|b| b.get("amount")).and_then(Value::as_i64).map(|m| m as f64 / crate::engine::money::SCALE as f64),
+        )
+    }
 }
 
 fn parse_day(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").or_else(|_| NaiveDate::parse_from_str(s, "%d-%b-%Y")).ok()
+    ["%Y-%m-%d", "%d-%b-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%Y"].iter().find_map(|f| NaiveDate::parse_from_str(s.trim(), f).ok())
 }
 
-/// Why a read does not count (None = it counts).
-fn read_problem(read: &Read, routed: Option<&Reader>, class: &Class, event: &Event, tol: f64) -> Option<String> {
-    let Some(routed) = routed else { return Some("model/role not routed for this class".into()) };
-    if read.model_id != routed.model || read.max_dim_px != Some(routed.max_dim_px) {
-        return Some(format!("routed {}@{} but read is {}@{:?}", routed.model, routed.max_dim_px, read.model_id, read.max_dim_px));
+/// Cutoff requirement resolved by one read: after-cutoff amount iff cash date > due date.
+fn requirement(r: &Read, e: &Event) -> Option<f64> {
+    let due = r.due_date.as_deref().and_then(parse_day)?;
+    let req = if e.cash_date() > due { r.after_amount } else { r.before_amount };
+    req.filter(|v| *v > 0.0)
+}
+
+fn close(a: f64, b: f64, tol: f64) -> bool {
+    (a - b).abs() <= tol + 1e-9
+}
+
+fn slot_problem(r: &Read, slot: &Slot) -> Option<String> {
+    if r.model_id != slot.model || r.max_dim_px != Some(slot.max_dim_px) {
+        return Some(format!("slot {} routes {}@{} but read is {}@{:?}", slot.role, slot.model, slot.max_dim_px, r.model_id, r.max_dim_px));
     }
-    if !read.reconciled {
-        return Some("not reconciled".into());
-    }
-    let Some(amount) = read.selected_amount else { return Some("no selected figure".into()) };
-    if matches!(event.status.as_str(), "pending" | "scheduled") && amount <= 0.0 {
-        return Some(format!("{} event figure {amount} <= 0", event.status));
-    }
-    match &read.cutoff {
-        None if class.cutoff_rule => Some("cutoff_rule class but read carries no cutoff data".into()),
-        None => None,
-        Some(c) => {
-            let (Some(due), Some(before), Some(after)) = (c.due_date.as_deref().and_then(parse_day), c.before_amount, c.after_amount) else {
-                return if class.cutoff_rule { Some("cutoff data incomplete (due date / before / after)".into()) } else { None };
-            };
-            let expected = if event.cash_date() > due { after } else { before };
-            if (amount - expected).abs() > tol + 1e-9 {
-                Some(format!("cutoff rule: cash date {} vs due {due} expects {expected}, read selected {amount}", event.cash_date()))
-            } else {
-                None
-            }
+    if let (Some(want), Some(got)) = (slot.max_tokens, r.max_tokens) {
+        if want != got {
+            return Some(format!("slot {} routes max_tokens {want} but read used {got}", slot.role));
         }
     }
+    None
 }
 
-/// Recompute (outcome, amount) for a provenance under the routing table.
-pub fn decide(routing: &Routing, class: &Class, p: &Provenance, event: &Event) -> (&'static str, Option<f64>, Vec<String>) {
+/// Recompute (outcome, amount, notes) for one provenance under the routing.
+pub fn decide(routing: &Routing, class: &Class, p: &Provenance, e: &Event) -> (&'static str, Option<f64>, Vec<String>) {
     let tol = routing.tolerance;
     let mut notes = Vec::new();
-    let mut reader_amounts: Vec<Option<f64>> = Vec::new();
-    for routed in &class.readers {
-        let read = p.reads.iter().find(|r| r.role == "reader" && r.model_id == routed.model);
-        let amt = match read {
-            None => {
-                notes.push(format!("{} read missing", routed.model));
+    let reqs: Vec<f64> = p.reads.iter().filter_map(|r| requirement(r, e)).collect();
+    if reqs.windows(2).any(|w| !close(w[0], w[1], tol)) {
+        notes.push(format!("reads resolve conflicting cutoff requirements {reqs:?}"));
+        return ("missing", None, notes);
+    }
+    let req = reqs.first().copied();
+    let counts = |r: &Read, slot: &Slot, notes: &mut Vec<String>| -> Option<f64> {
+        let why = slot_problem(r, slot)
+            .or_else(|| (!r.reconciled).then(|| "not reconciled".to_string()))
+            .or_else(|| r.selected_amount.is_none().then(|| "no selected figure".to_string()))
+            .or_else(|| {
+                let a = r.selected_amount.unwrap();
+                (matches!(e.status.as_str(), "pending" | "scheduled") && a <= 0.0).then(|| format!("{} event figure {a} <= 0", e.status))
+            })
+            .or_else(|| {
+                let a = r.selected_amount.unwrap();
+                req.filter(|q| !close(a, *q, tol)).map(|q| format!("cutoff requires {q} (cash date {}), read selected {a}", e.cash_date()))
+            });
+        match why {
+            Some(w) => {
+                notes.push(format!("{} {}: {w}", r.role, r.model_id));
                 None
             }
-            Some(r) => match read_problem(r, Some(routed), class, event, tol) {
-                Some(why) => {
-                    notes.push(format!("{}: {why}", r.model_id));
-                    None
-                }
-                None => r.selected_amount,
-            },
-        };
-        reader_amounts.push(amt);
-    }
-    let close = |a: f64, b: f64| (a - b).abs() <= tol + 1e-9;
-    if !reader_amounts.is_empty() && reader_amounts.iter().all(Option::is_some) {
-        let first = reader_amounts[0].unwrap();
-        if reader_amounts.iter().all(|a| close(a.unwrap(), first)) {
-            return ("agree", Some(first), notes);
+            None => r.selected_amount,
         }
-        notes.push("readers disagree".into());
+    };
+    let mut reader_amounts = Vec::new();
+    for slot in &class.readers {
+        match p.reads.iter().find(|r| r.role == slot.role && r.model_id == slot.model) {
+            None => {
+                notes.push(format!("{} read missing", slot.role));
+                reader_amounts.push(None);
+            }
+            Some(r) => reader_amounts.push(counts(r, slot, &mut notes)),
+        }
     }
-    if let Some(fb_routed) = routing.fallback_for(class) {
-        if let Some(fr) = p.reads.iter().find(|r| r.role == "fallback" && !class.readers.iter().any(|x| x.model == r.model_id)) {
-            match read_problem(fr, Some(fb_routed), class, event, tol) {
-                Some(why) => notes.push(format!("fallback {}: {why}", fr.model_id)),
-                None => {
-                    let f = fr.selected_amount.unwrap();
-                    if reader_amounts.iter().flatten().any(|a| close(*a, f)) {
-                        return ("fallback_tiebreak", Some(f), notes);
+    if reader_amounts.len() == 2 {
+        if let (Some(a), Some(b)) = (reader_amounts[0], reader_amounts[1]) {
+            if close(a, b, tol) {
+                return ("agree", Some(a), notes);
+            }
+            notes.push("readers disagree".into());
+        }
+    }
+    if let Some(tb) = &class.tiebreak {
+        if !class.readers.iter().any(|r| r.model == tb.model) {
+            let reader_models: Vec<&str> = class.readers.iter().map(|r| r.model.as_str()).collect();
+            if let Some(tr) = p.reads.iter().find(|r| !reader_models.contains(&r.model_id.as_str())) {
+                if let Some(f) = counts(tr, tb, &mut notes) {
+                    if reader_amounts.iter().flatten().any(|a| close(*a, f, tol)) {
+                        return ("tiebreak", Some(f), notes);
                     }
-                    notes.push(format!("fallback {f} matches no counting reader"));
+                    notes.push(format!("tiebreak {f} matches no counting reader"));
                 }
             }
         }
@@ -242,20 +317,12 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, event: &Event) -
     ("missing", None, notes)
 }
 
-/// Table-level rules (no evidence needed): tolerance bound, tiebreak distinct from class readers.
-pub fn validate_table(routing: &Routing) -> Vec<Finding> {
-    let mut out = Vec::new();
-    if !(0.0..=MAX_TOLERANCE).contains(&routing.tolerance) {
-        out.push(fail("config", "IA8_tolerance_out_of_range", format!("tolerance {} not in [0, {MAX_TOLERANCE}]", routing.tolerance)));
+fn outcome_class(recorded: &str) -> &'static str {
+    match recorded {
+        "agree" => "agree",
+        "tiebreak_accept" => "tiebreak",
+        _ => "missing",
     }
-    for c in &routing.classes {
-        if let Some(fb) = routing.fallback_for(c) {
-            if c.readers.iter().any(|r| r.model == fb.model) {
-                out.push(fail("config", "IA12_tiebreak_equals_reader", format!("class {} tiebreak {} is also one of its readers {:?}", c.name, fb.model, c.readers.iter().map(|r| &r.model).collect::<Vec<_>>())));
-            }
-        }
-    }
-    out
 }
 
 /// Check persisted image EventAmounts and provenance under `code_dir` against the routing table.
@@ -263,8 +330,19 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
     let processed = code_dir.join("store/processed");
     let mut out = Vec::new();
 
-    // Image EventAmounts in applied evidence.
-    let mut facts: Vec<(String, String, String, Option<f64>)> = Vec::new(); // (request, image, event, amount)
+    let routing = match std::fs::read_to_string(models_toml).map_err(anyhow::Error::from).and_then(|t| Routing::from_models_toml(&t)) {
+        Ok(r) => r,
+        Err(e) => {
+            out.push(fail("config", "IA9_no_routing_table", e.to_string()));
+            return Ok(out);
+        }
+    };
+    if let Some(r) = &routing {
+        out.extend(r.problems.iter().cloned());
+    }
+
+    // Image EventAmounts in applied evidence: (request, image, event, amount).
+    let mut facts: Vec<(String, String, String, Option<f64>)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(processed.join("evidence")) {
         for e in rd.flatten() {
             let rid = e.file_name().to_string_lossy().trim_end_matches(".json").to_string();
@@ -281,22 +359,11 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
         }
     }
     let prov_dir = processed.join("image_reads");
-    let has_provenance = prov_dir.exists();
-    let routing = match std::fs::read_to_string(models_toml).map_err(anyhow::Error::from).and_then(|t| Routing::from_models_toml(&t)) {
-        Ok(r) => r,
-        Err(e) => {
-            out.push(fail("config", "IA9_no_routing_table", e.to_string()));
-            return Ok(out);
-        }
-    };
-    if let Some(r) = &routing {
-        out.extend(validate_table(r));
-    }
-    if facts.is_empty() && !has_provenance {
-        return Ok(out); // model path not run: only the table is checked
+    if facts.is_empty() && !prov_dir.exists() {
+        return Ok(out); // model path not run: only the table (if any) is checked
     }
     let Some(routing) = routing else {
-        out.push(fail("config", "IA9_no_routing_table", format!("{} has no [vlm_routing] but image evidence exists", models_toml.display())));
+        out.push(fail("config", "IA9_no_routing_table", format!("{} has no explicit [vlm_routing] but image evidence exists", models_toml.display())));
         return Ok(out);
     };
 
@@ -310,56 +377,61 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
 
     let mut decided: HashMap<String, (&'static str, Option<f64>, String)> = HashMap::new();
     if let Ok(rd) = std::fs::read_dir(&prov_dir) {
-        for e in rd.flatten() {
-            let p: Provenance = match serde_json::from_str(&std::fs::read_to_string(e.path())?) {
+        for entry in rd.flatten() {
+            let p: Provenance = match serde_json::from_str(&std::fs::read_to_string(entry.path())?) {
                 Ok(p) => p,
                 Err(err) => {
-                    out.push(fail(&e.file_name().to_string_lossy(), "IA0_provenance_unreadable", err.to_string()));
+                    out.push(fail(&entry.file_name().to_string_lossy(), "IA0_provenance_unreadable", err.to_string()));
                     continue;
                 }
             };
-            if link.get(&p.image_id) != Some(&p.event_id) {
-                out.push(fail(&p.image_id, "IA2_event_link", format!("provenance event {} but images.csv links {:?}", p.event_id, link.get(&p.image_id))));
-                continue;
-            }
-            let Some(event) = ds.events.get(&p.event_id) else {
-                out.push(fail(&p.image_id, "IA2_event_link", format!("unknown event {}", p.event_id)));
+            let Some(event_id) = link.get(&p.image_id) else {
+                out.push(fail(&p.image_id, "IA2_event_link", "image not in images.csv".into()));
                 continue;
             };
+            let (ev_event, ev_amount) = p.evidence_event_amount();
+            if ev_event.as_ref().is_some_and(|x| x != event_id) {
+                out.push(fail(&p.image_id, "IA2_event_link", format!("evidence targets {ev_event:?}, images.csv links {event_id}")));
+            }
+            let Some(event) = ds.events.get(event_id) else { continue };
             let Some(class) = routing.class_for(event) else {
-                out.push(fail(&p.image_id, "IA10_no_class", format!("no routing class matches {} ({} {} {})", event.event_id, event.status, event.category, event.event_type)));
+                out.push(fail(&p.image_id, "IA10_no_class", format!("no routing class for {event_id}")));
                 continue;
             };
-            if p.class != class.name {
-                out.push(fail(&p.image_id, "IA10_class_mismatch", format!("provenance class {} but routing table gives {} for {}", p.class, class.name, event.event_id)));
+            if p.class.as_deref() != Some(class.name.as_str()) {
+                out.push(fail(&p.image_id, "IA10_class_mismatch", format!("provenance class {:?} but routing table gives {} for {event_id}", p.class, class.name)));
             }
-            let fallback = routing.fallback_for(class);
-            for r in p.reads.iter().filter(|r| r.role == "fallback") {
-                if class.readers.iter().any(|x| x.model == r.model_id) {
-                    out.push(fail(&p.image_id, "IA12_tiebreak_equals_reader", format!("tiebreak read {} is one of class {} readers", r.model_id, class.name)));
-                }
-            }
+            let reader_models: Vec<&str> = class.readers.iter().map(|r| r.model.as_str()).collect();
             for r in &p.reads {
-                let routed = match r.role.as_str() {
-                    "reader" => class.readers.iter().find(|x| x.model == r.model_id),
-                    "fallback" => fallback,
-                    _ => None,
-                };
-                if routed.map(|x| x.model != r.model_id || Some(x.max_dim_px) != r.max_dim_px).unwrap_or(true) {
-                    out.push(fail(&p.image_id, "IA3_reader_not_routed", format!("{} read {}@{:?} is not routed for class {}", r.role, r.model_id, r.max_dim_px, class.name)));
+                let routed = class.readers.iter().find(|s| s.role == r.role && s.model == r.model_id).or(class.tiebreak.as_ref().filter(|t| t.model == r.model_id));
+                match routed {
+                    None => out.push(fail(&p.image_id, "IA3_reader_not_routed", format!("read {} {}@{:?} is neither a reader nor the tiebreak of class {}", r.role, r.model_id, r.max_dim_px, class.name))),
+                    Some(slot) => {
+                        if let Some(why) = slot_problem(r, slot) {
+                            out.push(fail(&p.image_id, "IA3_reader_not_routed", why));
+                        }
+                    }
                 }
+            }
+            if p.reads.iter().filter(|r| !reader_models.contains(&r.model_id.as_str())).count() > 1 {
+                out.push(fail(&p.image_id, "IA3_reader_not_routed", "more than one non-reader read".into()));
             }
             let (outcome, amount, notes) = decide(&routing, class, &p, event);
-            if outcome != p.outcome {
-                out.push(fail(&p.image_id, "IA6_outcome_mismatch", format!("recorded {} but routing gives {outcome}: {}", p.outcome, notes.join("; "))));
+            let recorded = outcome_class(&p.outcome);
+            if recorded != outcome {
+                // Recording an accept the rule does not give is an error; declining one it would
+                // give is safe (missing beats wrong) but not the decided routing.
+                let sev = if recorded == "missing" { Severity::Warn } else { Severity::Error };
+                out.push(Finding { request_id: p.image_id.clone(), severity: sev, code: "IA6_outcome_mismatch", detail: format!("recorded {} but routing gives {outcome}: {}", p.outcome, notes.join("; ")) });
             }
-            let same = match (amount, p.accepted_amount) {
-                (Some(a), Some(b)) => (a - b).abs() <= routing.tolerance + 1e-9,
-                (None, None) => true,
-                _ => false,
-            };
-            if !same {
-                out.push(fail(&p.image_id, "IA5_accepted_amount", format!("recorded {:?} but routing accepts {amount:?}", p.accepted_amount)));
+            if recorded != "missing" {
+                let same = match (amount, ev_amount) {
+                    (Some(a), Some(b)) => close(a, b, routing.tolerance),
+                    _ => false,
+                };
+                if !same {
+                    out.push(fail(&p.image_id, "IA5_accepted_amount", format!("evidence {ev_amount:?} but routing accepts {amount:?}")));
+                }
             }
             decided.insert(p.image_id.clone(), (outcome, amount, notes.join("; ")));
         }
@@ -373,16 +445,16 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
         if link.get(&image_id) != Some(&event_id) {
             out.push(fail(&rid, "IA2_event_link", format!("{image_id} fact event {event_id} vs images.csv {:?}", link.get(&image_id))));
         }
-        if *outcome == "missing" {
-            out.push(fail(&rid, "IA4_no_agreement", format!("{image_id} applied although routing accepts nothing: {notes}")));
-            continue;
-        }
         let status = ds.events.get(&event_id).map(|e| e.status.as_str()).unwrap_or("");
         if matches!(status, "pending" | "scheduled") && amount.map(|a| a <= 0.0).unwrap_or(true) {
             out.push(fail(&rid, "IA11_nonpositive_cash_moving", format!("{image_id} {status} event applied {amount:?}")));
         }
+        if *outcome == "missing" {
+            out.push(fail(&rid, "IA4_no_agreement", format!("{image_id} applied although routing accepts nothing: {notes}")));
+            continue;
+        }
         if let (Some(a), Some(b)) = (amount, accepted) {
-            if (a - b).abs() > routing.tolerance + 1e-9 {
+            if !close(a, *b, routing.tolerance) {
                 out.push(fail(&rid, "IA5_accepted_amount", format!("{image_id} applied {a} but routing accepts {b}")));
             }
         }
@@ -392,190 +464,177 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
 
 #[cfg(test)]
 mod tests {
+    //! Synthetic amounts only (no image audit figures). Events are real rows so classes derive
+    //! from the dataset: event_1786 pending utilities, event_6033 pending groceries, event_6859
+    //! scheduled healthcare, event_253 settled income, event_3231 settled dining.
     use super::*;
     use serde_json::json;
 
     const Q: &str = "Qwen/Qwen3-VL-235B-A22B-Instruct";
     const G: &str = "google/gemma-4-31B-it";
-    const K: &str = "moonshotai/Kimi-K3";
+    const C: &str = "claude-opus-5";
 
-    const ROUTING: &str = r#"
+    const CONFIG: &str = r#"
 [selected]
 vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+vlm_escalation = "google/gemma-4-31B-it"
+vlm_fallback = "claude-opus-5"
+image_max_dim_px = 1024
 
 [vlm_routing]
-tolerance = 0.01
-fallback = { model = "moonshotai/Kimi-K3", max_dim_px = 1024 }
+default_class = "settled_expense_receipt"
 
 [[vlm_routing.classes]]
-name = "pending_bill_with_cutoff"
-match = { statuses = ["pending", "scheduled"], categories = ["utilities"], settles_after_event = true }
-readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, { model = "moonshotai/Kimi-K3", max_dim_px = 1024 } ]
-cutoff_rule = true
-fallback = { model = "google/gemma-4-31B-it", max_dim_px = 768 }
+name = "income_payslip"
+event_types = ["income"]
+readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 } ]
 
 [[vlm_routing.classes]]
-name = "default"
-readers = [ { model = "Qwen/Qwen3-VL-235B-A22B-Instruct", max_dim_px = 1024 }, { model = "google/gemma-4-31B-it", max_dim_px = 768 } ]
+name = "pending_bill_due_date"
+statuses = ["pending", "scheduled"]
+readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 1500 } ]
+
+[[vlm_routing.classes]]
+name = "settled_expense_receipt"
+statuses = ["settled"]
+readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 } ]
 "#;
 
-    fn read(role: &str, model: &str, dim: u32, ok: bool, amt: f64) -> Value {
-        json!({"role": role, "model_id": model, "model_revision": "x", "max_dim_px": dim, "reconciled": ok, "selected_amount": amt})
+    fn read(role: &str, model: &str, px: u32, tokens: u32, ok: bool, amt: Option<f64>) -> Value {
+        json!({"role": role, "model_id": model, "model_revision": "x", "max_dim_px": px, "max_tokens": tokens, "reconciled": ok,
+               "selected_amount": amt, "currency": "INR", "due_date": null, "before_amount": null, "after_amount": null, "error": null})
     }
-
-    fn with_cutoff(mut r: Value, due: &str, before: f64, after: f64) -> Value {
-        r["cutoff"] = json!({"due_date": due, "before_amount": before, "after_amount": after});
+    fn anthropic(mut r: Value) -> Value {
+        r["provider"] = json!("anthropic");
         r
     }
-
-    fn prov(image: &str, event: &str, class: &str, reads: Vec<Value>, outcome: &str, acc: Option<f64>) -> Value {
-        json!({"image_id": image, "event_id": event, "class": class, "reads": reads, "outcome": outcome, "accepted_amount": acc})
+    fn cut(mut r: Value, due: &str, before: f64, after: f64) -> Value {
+        r["due_date"] = json!(due);
+        r["before_amount"] = json!(before);
+        r["after_amount"] = json!(after);
+        r
+    }
+    fn resolution(image: &str, event: &str, class: &str, reads: Vec<Value>, outcome: &str, amount: Option<f64>) -> Value {
+        let evidence = amount.map(|a| json!({"record_id": format!("{image}#agree:x"), "source": "Image", "observed_at": "2024-01-01T00:00:00",
+            "fact": {"EventAmount": {"event_id": event, "amount": (a * 10_000.0).round() as i64, "currency": "INR"}}}));
+        json!({"image_id": image, "class": class, "mode": "agreement", "reads": reads, "outcome": outcome, "evidence": evidence})
     }
 
-    /// Returns error codes for one image with the given provenance and applied amount (None = not applied).
-    fn run(tag: &str, image: &str, event: &str, provenance: Value, applied: Option<f64>, routing: &str) -> Vec<&'static str> {
-        let root = std::env::temp_dir().join(format!("verifier_ia2_{tag}_{}", std::process::id()));
+    fn run(tag: &str, image: &str, prov: Value, config: &str) -> Vec<(&'static str, Severity)> {
+        let root = std::env::temp_dir().join(format!("verifier_ia3_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(root.join("store/processed/image_reads")).unwrap();
         std::fs::create_dir_all(root.join("store/processed/evidence")).unwrap();
-        std::fs::write(root.join(format!("store/processed/image_reads/{image}.json")), provenance.to_string()).unwrap();
-        let ev: Vec<Value> = applied
-            .map(|a| vec![json!({"record_id": image, "source": "Image", "observed_at": "2024-01-01T00:00:00",
-                "fact": {"EventAmount": {"event_id": event, "amount": (a * 10_000.0).round() as i64, "currency": "INR"}}})])
-            .unwrap_or_default();
-        std::fs::write(root.join("store/processed/evidence/request_x.json"), Value::Array(ev).to_string()).unwrap();
-        let toml_path = root.join("models.toml");
-        std::fs::write(&toml_path, routing).unwrap();
+        let evidence = prov.get("evidence").cloned().filter(|e| !e.is_null()).map(|e| vec![e]).unwrap_or_default();
+        std::fs::write(root.join(format!("store/processed/image_reads/{image}.json")), prov.to_string()).unwrap();
+        std::fs::write(root.join("store/processed/evidence/request_x.json"), Value::Array(evidence).to_string()).unwrap();
+        std::fs::write(root.join("models.toml"), config).unwrap();
         let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
-        let f = check(&root, &dataset, &toml_path).unwrap();
+        let f = check(&root, &dataset, &root.join("models.toml")).unwrap();
         std::fs::remove_dir_all(&root).ok();
-        f.into_iter().map(|x| x.code).collect()
+        f.into_iter().map(|x| (x.code, x.severity)).collect()
+    }
+    fn errors(v: &[(&'static str, Severity)]) -> Vec<&'static str> {
+        v.iter().filter(|x| x.1 == Severity::Error).map(|x| x.0).collect()
     }
 
     #[test]
-    fn classes_come_from_the_config_table() {
-        let routing = Routing::from_models_toml(ROUTING).unwrap().unwrap();
+    fn table_resolves_classes_readers_and_distinct_tiebreaks() {
+        let r = Routing::from_models_toml(CONFIG).unwrap().unwrap();
+        assert!(r.problems.is_empty(), "{:?}", r.problems);
         let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
         let ds = Dataset::load(&dataset, &dataset.join("requests.csv")).unwrap();
-        let class = |e: &str| routing.class_for(&ds.events[e]).unwrap().name.clone();
-        assert_eq!(class("event_1786"), "pending_bill_with_cutoff"); // image_05 telecom bill, settles after due
-        for e in ["event_6033", "event_6859", "event_1442", "event_253", "event_7307"] {
-            assert_eq!(class(e), "default", "{e}");
-        }
-        assert!(Routing::from_models_toml("[selected]\nvlm_primary = \"x\"\n").unwrap().is_none());
-    }
-
-    #[test]
-    fn default_class_agreement_and_tiebreak() {
-        // image_10 (pending grocery invoice, default class): 235B@1024 + gemma@768 agree.
-        let ok = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, true, 79679.26)], "agree", Some(79679.26));
-        assert!(run("a", "image_10", "event_6033", ok, Some(79679.26), ROUTING).is_empty());
-        // Per-reader px: gemma at 1024 is not routed and does not count.
-        let px = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 1024, true, 79679.26)], "agree", Some(79679.26));
-        let c = run("b", "image_10", "event_6033", px, Some(79679.26), ROUTING);
-        assert!(c.contains(&"IA3_reader_not_routed") && c.contains(&"IA4_no_agreement"), "{c:?}");
-        // gemma rejected (reconcile fail), Kimi matches 235B: tiebreak accept.
-        let tie = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, false, 72045.0), read("fallback", K, 1024, true, 79679.26)], "fallback_tiebreak", Some(79679.26));
-        assert!(run("c", "image_10", "event_6033", tie, Some(79679.26), ROUTING).is_empty());
-        // Kimi matches gemma's figure but gemma did not reconcile: nothing counts -> missing.
-        let bad = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, false, 72045.0), read("fallback", K, 1024, true, 72045.0)], "missing", None);
-        assert!(run("d", "image_10", "event_6033", bad, None, ROUTING).is_empty());
-        // Recorded as a tiebreak and applied anyway: outcome mismatch and no agreement.
-        let lie = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, false, 72045.0), read("fallback", K, 1024, true, 72045.0)], "fallback_tiebreak", Some(72045.0));
-        let c = run("e", "image_10", "event_6033", lie, Some(72045.0), ROUTING);
-        assert!(c.contains(&"IA6_outcome_mismatch") && c.contains(&"IA4_no_agreement"), "{c:?}");
-    }
-
-    #[test]
-    fn pending_bill_class_routes_235b_and_kimi_with_cutoff() {
-        // image_05: due 06-Feb-2026, event settles 2026-02-09 -> after-cutoff 822.05.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let k = with_cutoff(read("reader", K, 1024, true, 822.05), "06-Feb-2026", 704.05, 822.05);
-        let ok = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k], "agree", Some(822.05));
-        assert!(run("f", "image_05", "event_1786", ok, Some(822.05), ROUTING).is_empty());
-        // gemma routed into this class is not allowed.
-        let g = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", G, 768, true, 822.05), "2026-02-06", 704.05, 822.05)], "agree", Some(822.05));
-        let c = run("g", "image_05", "event_1786", g, Some(822.05), ROUTING);
-        assert!(c.contains(&"IA3_reader_not_routed") && c.contains(&"IA4_no_agreement"), "{c:?}");
-        // The image_05 trap: both select 704.05 (before-cutoff) although cash date is after due.
-        let trap = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 704.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05)], "agree", Some(704.05));
-        let c = run("h", "image_05", "event_1786", trap, Some(704.05), ROUTING);
-        assert!(c.contains(&"IA4_no_agreement"), "{c:?}");
-        // Cutoff data missing in a cutoff_rule class: read does not count.
-        let nocut = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![read("reader", Q, 1024, true, 822.05), read("reader", K, 1024, true, 822.05)], "agree", Some(822.05));
-        assert!(run("i", "image_05", "event_1786", nocut, Some(822.05), ROUTING).contains(&"IA4_no_agreement"));
-        // 235B reads 0.0 on a pending bill: never counts; applying 0 fails.
-        let zero = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![with_cutoff(read("reader", Q, 1024, true, 0.0), "2026-02-06", 0.0, 0.0), with_cutoff(read("reader", K, 1024, true, 0.0), "2026-02-06", 0.0, 0.0)], "agree", Some(0.0));
-        let c = run("j", "image_05", "event_1786", zero, Some(0.0), ROUTING);
-        assert!(c.contains(&"IA4_no_agreement") && c.contains(&"IA6_outcome_mismatch"), "{c:?}");
-        // Wrong class recorded.
-        let wrong = prov("image_05", "event_1786", "default", vec![with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05), with_cutoff(read("reader", K, 1024, true, 822.05), "2026-02-06", 704.05, 822.05)], "agree", Some(822.05));
-        assert!(run("k", "image_05", "event_1786", wrong, Some(822.05), ROUTING).contains(&"IA10_class_mismatch"));
-    }
-
-    #[test]
-    fn tiebreak_model_must_differ_from_readers() {
-        // Table-level: default class tiebreak set to the 235B reader.
-        let bad_table = ROUTING.replace(
-            "fallback = { model = \"moonshotai/Kimi-K3\", max_dim_px = 1024 }",
-            "fallback = { model = \"Qwen/Qwen3-VL-235B-A22B-Instruct\", max_dim_px = 1024 }",
+        let class = |e: &str| r.class_for(&ds.events[e]).unwrap();
+        assert_eq!(class("event_1786").name, "pending_bill_due_date");
+        assert_eq!(class("event_6859").name, "pending_bill_due_date");
+        assert_eq!(class("event_253").name, "income_payslip");
+        assert_eq!(class("event_3231").name, "settled_expense_receipt");
+        // Routing v2 derived tiebreaks: gemma@768 for pending bills, claude-opus-5 elsewhere.
+        assert_eq!(class("event_1786").tiebreak.as_ref().map(|t| (t.model.as_str(), t.max_dim_px, t.max_tokens)), Some((G, 768, Some(400))));
+        assert_eq!(class("event_3231").tiebreak.as_ref().map(|t| (t.model.as_str(), t.max_dim_px, t.max_tokens)), Some((C, 1024, Some(1500))));
+        // Explicit tiebreak equal to a reader: IA12.
+        let bad = CONFIG.replace(
+            "{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 1500 } ]\n\n[[vlm_routing.classes]]\nname = \"settled_expense_receipt\"",
+            "{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 1500 } ]\ntiebreak = { role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 1500 }\n\n[[vlm_routing.classes]]\nname = \"settled_expense_receipt\"",
         );
-        let r = Routing::from_models_toml(&bad_table).unwrap().unwrap();
-        assert!(validate_table(&r).iter().any(|f| f.code == "IA12_tiebreak_equals_reader"));
-        assert!(validate_table(&Routing::from_models_toml(ROUTING).unwrap().unwrap()).is_empty());
-        // Checked even when no image facts exist yet.
-        let root = std::env::temp_dir().join(format!("verifier_ia2_table_{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("models.toml"), &bad_table).unwrap();
-        let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
-        assert!(check(&root, &dataset, &root.join("models.toml")).unwrap().iter().any(|f| f.code == "IA12_tiebreak_equals_reader"));
-        std::fs::remove_dir_all(&root).ok();
-
-        // Pending-bill class: 235B and Kimi disagree, gemma tiebreak matches 235B on the after-cutoff figure.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let k = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let g = with_cutoff(read("fallback", G, 768, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let tie = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, g], "fallback_tiebreak", Some(822.05));
-        assert!(run("n", "image_05", "event_1786", tie, Some(822.05), ROUTING).is_empty());
-        // Kimi (a reader of this class) recorded as the tiebreak: IA12 and no acceptance.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let g2 = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let kf = with_cutoff(read("fallback", K, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let dup = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, g2, kf], "fallback_tiebreak", Some(822.05));
-        let c = run("o", "image_05", "event_1786", dup, Some(822.05), ROUTING);
-        assert!(c.contains(&"IA12_tiebreak_equals_reader") && c.contains(&"IA4_no_agreement"), "{c:?}");
-        // gemma tiebreak picking the before-cutoff figure (cutoff rule applies to the tiebreak): no accept.
-        let q = with_cutoff(read("reader", Q, 1024, true, 822.05), "2026-02-06", 704.05, 822.05);
-        let k = with_cutoff(read("reader", K, 1024, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let gb = with_cutoff(read("fallback", G, 768, true, 704.05), "2026-02-06", 704.05, 822.05);
-        let before = prov("image_05", "event_1786", "pending_bill_with_cutoff", vec![q, k, gb], "missing", None);
-        assert!(run("p", "image_05", "event_1786", before, None, ROUTING).is_empty());
+        let rb = Routing::from_models_toml(&bad).unwrap().unwrap();
+        assert!(rb.problems.iter().any(|f| f.code == "IA12_tiebreak_equals_reader"), "{:?}", rb.problems);
     }
 
     #[test]
-    fn tiebreak_matched_read_must_satisfy_cutoff() {
-        // Default class, a bill page with a cutoff (image_02 rent, scheduled, settles 2023-08-16):
-        // 235B and gemma disagree; Kimi picks the before-cutoff figure matching gemma, but the
-        // cash date is after the due date -> neither counts -> missing, applying it fails.
-        let q = with_cutoff(read("reader", Q, 1024, true, 100000.0), "2023-08-11", 90000.0, 100000.0);
-        let g = with_cutoff(read("reader", G, 768, true, 90000.0), "2023-08-11", 90000.0, 100000.0);
-        let k = with_cutoff(read("fallback", K, 1024, true, 90000.0), "2023-08-11", 90000.0, 100000.0);
-        let p = prov("image_02", "event_1442", "default", vec![q, g, k], "fallback_tiebreak", Some(90000.0));
-        let c = run("l", "image_02", "event_1442", p, Some(90000.0), ROUTING);
-        assert!(c.contains(&"IA4_no_agreement") && c.contains(&"IA6_outcome_mismatch"), "{c:?}");
+    fn agreement_tiebreak_and_routing_violations() {
+        // Pending bill: 235B + claude (provider anthropic) agree on the after-cutoff figure.
+        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25)));
+        assert!(errors(&run("a", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG)).is_empty());
+
+        // Both agree on the before-cutoff figure although the cash date is after due: no accept.
+        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", 120.75, 150.25);
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
+        let e = errors(&run("b", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA6_outcome_mismatch"), "{e:?}");
+
+        // Readers disagree; gemma tiebreak (distinct, @768) matches 235B's after-cutoff figure: accept.
+        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
+        let g = read("vlm_escalation", G, 768, 400, true, Some(150.25));
+        assert!(errors(&run("c", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c, g], "tiebreak_accept", Some(150.25)), CONFIG)).is_empty());
+
+        // gemma tiebreak at 1024 px (global default instead of its own 768): not routed, no accept.
+        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
+        let g = read("vlm_fallback", G, 1024, 400, true, Some(150.25));
+        let e = errors(&run("d", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c, g], "tiebreak_accept", Some(150.25)), CONFIG));
+        assert!(e.contains(&"IA3_reader_not_routed") && e.contains(&"IA4_no_agreement"), "{e:?}");
+
+        // claude at 400 tokens where the pending class routes 1500: not its routed budget.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(5000.5));
+        let c = anthropic(read("vlm_fallback", C, 1024, 400, true, Some(5000.5)));
+        let e = errors(&run("e", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q, c], "agree", Some(5000.5)), CONFIG));
+        assert!(e.contains(&"IA3_reader_not_routed") && e.contains(&"IA4_no_agreement"), "{e:?}");
+
+        // Pending figure 0 from both readers: never counts.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(0.0));
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(0.0)));
+        let e = errors(&run("f", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q, c], "agree", Some(0.0)), CONFIG));
+        assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA11_nonpositive_cash_moving"), "{e:?}");
+
+        // Settled receipt: 235B@1024 + gemma@768 agree within tolerance 1.0: accept; evidence amount must match.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
+        let g = read("vlm_escalation", G, 768, 400, true, Some(812.00));
+        assert!(errors(&run("g", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q.clone(), g.clone()], "agree", Some(812.40)), CONFIG)).is_empty());
+        let e = errors(&run("h", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "agree", Some(700.0)), CONFIG));
+        assert!(e.contains(&"IA5_accepted_amount"), "{e:?}");
+
+        // Settled receipt, readers disagree, claude tiebreak matches gemma: accept.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(640.0));
+        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
+        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(812.40)));
+        assert!(errors(&run("h2", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g, c], "tiebreak_accept", Some(812.40)), CONFIG)).is_empty());
+
+        // Declining an accept the rule would give is safe (warning), never an error.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
+        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
+        let v = run("i", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "no_agreement", None), CONFIG);
+        assert!(errors(&v).is_empty() && v.contains(&("IA6_outcome_mismatch", Severity::Warn)), "{v:?}");
+
+        // Wrong class recorded.
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
+        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
+        assert!(errors(&run("j", "image_07", resolution("image_07", "event_3231", "income_payslip", vec![q, g], "agree", Some(812.40)), CONFIG)).contains(&"IA10_class_mismatch"));
     }
 
     #[test]
-    fn missing_routing_or_provenance_fails() {
-        let ok = prov("image_10", "event_6033", "default", vec![read("reader", Q, 1024, true, 79679.26), read("reader", G, 768, true, 79679.26)], "agree", Some(79679.26));
-        assert!(run("m", "image_10", "event_6033", ok, Some(79679.26), "[selected]\nvlm_primary = \"x\"\n").contains(&"IA9_no_routing_table"));
-        // Image fact without provenance.
-        let root = std::env::temp_dir().join(format!("verifier_ia2_noprov_{}", std::process::id()));
+    fn missing_table_or_provenance_fails() {
+        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
+        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
+        let p = resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "agree", Some(812.40));
+        assert!(errors(&run("k", "image_07", p, "[selected]\nvlm_primary = \"x\"\n")).contains(&"IA9_no_routing_table"));
+        let root = std::env::temp_dir().join(format!("verifier_ia3_noprov_{}", std::process::id()));
         std::fs::create_dir_all(root.join("store/processed/evidence")).unwrap();
-        std::fs::write(root.join("store/processed/evidence/request_73.json"), json!([{"record_id": "image_11", "source": "Image", "observed_at": "2023-01-19T00:00:00", "fact": {"EventAmount": {"event_id": "event_6859", "amount": 36_500_000_i64, "currency": "INR"}}}]).to_string()).unwrap();
-        let toml_path = root.join("models.toml");
-        std::fs::write(&toml_path, ROUTING).unwrap();
+        std::fs::write(root.join("store/processed/evidence/request_73.json"), json!([{"record_id": "image_11#agree:vlm_primary+vlm_fallback", "source": "Image", "observed_at": "2023-01-19T00:00:00", "fact": {"EventAmount": {"event_id": "event_6859", "amount": 25_000_000_i64, "currency": "INR"}}}]).to_string()).unwrap();
+        std::fs::write(root.join("models.toml"), CONFIG).unwrap();
         let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
-        assert!(check(&root, &dataset, &toml_path).unwrap().iter().any(|f| f.code == "IA1_no_agreement_provenance"));
+        assert!(check(&root, &dataset, &root.join("models.toml")).unwrap().iter().any(|f| f.code == "IA1_no_agreement_provenance"));
         std::fs::remove_dir_all(&root).ok();
     }
 }

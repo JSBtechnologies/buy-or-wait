@@ -122,9 +122,19 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
 
     // Evidence the pipeline applies == independent regeneration (snapshots + family coverage).
     let repo_for_code = dataset_dir.parent().unwrap_or(Path::new(".."));
+    // decision.accuracy_first: every false accept found by any check is collected for the hard gate.
+    let mut false_accepts: Vec<String> = Vec::new();
+    let mut gate_ran = true;
+    let collect = |f: &[super::contract::Finding], into: &mut Vec<String>| {
+        into.extend(f.iter().filter(|x| super::false_accepts::FALSE_ACCEPT_CODES.contains(&x.code)).map(|x| x.to_string()));
+    };
     match super::evidence_consistency::check(dataset_dir, &repo_for_code.join("code")) {
-        Err(e) => s.check("evidence consistency", false, format!("could not run: {e}")),
+        Err(e) => {
+            gate_ran = false;
+            s.check("evidence consistency", false, format!("could not run: {e}"))
+        }
         Ok(f) => {
+            collect(&f, &mut false_accepts);
             let errs: Vec<String> = f.iter().filter(|x| x.severity == Severity::Error).map(|x| x.to_string()).collect();
             let warns = f.len() - errs.len();
             s.check(
@@ -137,8 +147,12 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
 
     // Board decision.vlm_setup: image amounts only on 2-model agreement (or fallback tiebreak).
     match super::image_agreement::check(&repo_for_code.join("code"), dataset_dir, &repo_for_code.join("code/config/models.toml")) {
-        Err(e) => s.check("image amounts: 2-model agreement", false, format!("could not run: {e}")),
+        Err(e) => {
+            gate_ran = false;
+            s.check("image amounts: 2-model agreement", false, format!("could not run: {e}"))
+        }
         Ok(f) => {
+            collect(&f, &mut false_accepts);
             let image_facts = std::fs::read_dir(repo_for_code.join("code/store/processed/evidence"))
                 .map(|rd| rd.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).map(|t| t.matches("\"EventAmount\"").count()).sum::<usize>())
                 .unwrap_or(0);
@@ -149,6 +163,30 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
             );
         }
     }
+
+    // Image amounts vs hand-read audit gold, then the hard gate itself.
+    let mut image_facts_checked = 0;
+    match super::false_accepts::image_gold_findings(&repo_for_code.join("code"), Some(repo_for_code)) {
+        Err(e) => {
+            gate_ran = false;
+            s.check("image amounts equal audit gold", false, format!("could not run: {e}"));
+        }
+        Ok((f, n)) => {
+            image_facts_checked = n;
+            false_accepts.extend(f.iter().map(|x| x.to_string()));
+        }
+    }
+    s.check(
+        "HARD GATE decision.accuracy_first: 0 false accepts (development verification; a failure means investigate model vs analyst, never auto-correct)",
+        gate_ran && false_accepts.is_empty(),
+        if !gate_ran {
+            "a contributing check could not run: gate cannot pass".to_string()
+        } else if false_accepts.is_empty() {
+            format!("0 false accepts; {image_facts_checked} image facts compared with audit gold; model message facts grounded; no agreement-less image amounts")
+        } else {
+            format!("{} false accepts: {}", false_accepts.len(), false_accepts.join(" | "))
+        },
+    );
 
     // Engine-backed stage: re-run the batch path and check what the file alone cannot show.
     match super::mirror::run(dataset_dir, &dataset_dir.join("requests.csv"), &rows) {
@@ -201,11 +239,17 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
     // Hardcoded answers in the prediction path (lead: flag at final sign-off). Paths resolve
     // from the dataset dir's parent (repo root): code/src/{engine,extract}, docs/gold_subset.json.
     let repo = dataset_dir.parent().unwrap_or(Path::new(".."));
-    let hard = super::hardcode_scan::scan(&repo.join("code"), dataset_dir, Some(&repo.join("docs/gold_subset.json")))?;
+    let hard = super::hardcode_scan::scan(&repo.join("code"), dataset_dir, Some(&repo.join("docs/gold_subset.json")), Some(&repo.join("RULES.md")))?;
+    let hard_err: Vec<String> = hard.iter().filter(|f| f.severity == Severity::Error).map(|f| f.to_string()).collect();
+    let hard_warn: Vec<String> = hard.iter().filter(|f| f.severity == Severity::Warn).map(|f| f.to_string()).collect();
     s.check(
-        "no hardcoded ids/label figures in engine+extract",
-        hard.is_empty(),
-        if hard.is_empty() { "none found".to_string() } else { hard.iter().take(12).map(|f| f.to_string()).collect::<Vec<_>>().join(" | ") },
+        "prediction modules (engine, extract, main.rs) use no record ids, label/gold/audit figures or audit files",
+        hard_err.is_empty(),
+        if hard_err.is_empty() {
+            format!("none found; {} audit figures in test code (appearance warnings): {}", hard_warn.len(), hard_warn.iter().take(12).cloned().collect::<Vec<_>>().join(" | "))
+        } else {
+            hard_err.iter().take(12).cloned().collect::<Vec<_>>().join(" | ")
+        },
     );
 
     if let Some(rerun) = rerun {

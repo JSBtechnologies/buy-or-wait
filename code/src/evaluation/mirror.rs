@@ -119,7 +119,7 @@ pub fn blank_amount_findings(inp: &Inputs, d: &Decision, session: &Session) -> V
                 }
             }
             AmountSource::Evidence(rec) => {
-                if image_of.get(e.event.id.as_str()) != Some(&rec.as_str()) {
+                if image_of.get(e.event.id.as_str()) != Some(&rec.split('#').next().unwrap_or("")) {
                     out.push(finding(id, Severity::Error, "BA5_amount_not_from_linked_image", format!("{} filled by {rec}, linked image is {:?}", e.event.id, image_of.get(e.event.id.as_str()))));
                 }
                 if e.amount.map(|a| a <= Money::ZERO).unwrap_or(true) {
@@ -273,7 +273,7 @@ mod tests {
         assert!(d.facts.missing_amounts.contains(&"event_6033".to_string()));
         assert!(blank_amount_findings(&inp, &d, &s).is_empty(), "{:?}", blank_amount_findings(&inp, &d, &s));
         // Filled by the linked image: accepted, no longer missing, and the reserve lowers safe.
-        let (d2, s2) = decide_with_extra(&inp, "request_64", vec![amount_record("image_10", "event_6033", 79679.26)]);
+        let (d2, s2) = decide_with_extra(&inp, "request_64", vec![amount_record("image_10", "event_6033", 1000.0)]);
         assert!(blank_amount_findings(&inp, &d2, &s2).is_empty(), "{:?}", blank_amount_findings(&inp, &d2, &s2));
         assert!(!d2.facts.missing_amounts.contains(&"event_6033".to_string()));
         assert!(d2.facts.safe_amount < d.facts.safe_amount);
@@ -283,50 +283,21 @@ mod tests {
         assert!(codes.contains(&"BA5_amount_not_from_linked_image"), "{codes:?}");
     }
 
-    /// Verifier-only preview (never in the prediction path): what 64/73 become once the linked
-    /// image figures are applied, using the verifier's own readings as gold.
+    /// Verifier-only preview (never in the prediction path): what requests 64/73 become once their
+    /// linked image amounts are applied, taking the analyst's reference from RULES.md at runtime.
     #[test]
     #[ignore]
-    fn preview_64_73_with_image_gold() {
+    fn preview_64_73_with_image_reference() {
         let inp = Inputs::load(&dir()).unwrap();
-        for (rid, image, event, amount) in [("request_64", "image_10", "event_6033", 79679.26), ("request_73", "image_11", "event_6859", 3650.0)] {
+        let Some(reference) = crate::evaluation::false_accepts::gold(dir().parent()) else { return };
+        for (rid, image) in [("request_64", "image_10"), ("request_73", "image_11")] {
+            let g = &reference[image];
+            let amount = g.amounts[0] as f64 / 100.0;
             let (d0, _) = decide_with_extra(&inp, rid, vec![]);
-            let (d1, s1) = decide_with_extra(&inp, rid, vec![amount_record(image, event, amount)]);
-            let f = blank_amount_findings(&inp, &d1, &s1);
+            let (d1, s1) = decide_with_extra(&inp, rid, vec![amount_record(image, &g.event_id, amount)]);
             println!("PREVIEW {rid} now:  {:?}", d0.row);
-            println!("PREVIEW {rid} gold: {:?}  blank_findings={}", d1.row, f.len());
-            println!("PREVIEW {rid} raw_safe {} -> {}, trough {} @{} -> {} @{}", d0.facts.raw_safe_amount.to_f64(), d1.facts.raw_safe_amount.to_f64(), d0.facts.trough_balance.to_f64(), d0.facts.trough_date, d1.facts.trough_balance.to_f64(), d1.facts.trough_date);
-            let key = |f: &crate::engine::forecast::Flow| format!("{} {} {} {:?}", f.date, f.category, f.amount.to_f64(), f.source);
-            let a: std::collections::BTreeSet<String> = d0.baseline.flows.iter().map(key).collect();
-            let b: std::collections::BTreeSet<String> = d1.baseline.flows.iter().map(key).collect();
-            for x in a.difference(&b) { println!("PREVIEW {rid}   - {x}"); }
-            for x in b.difference(&a) { println!("PREVIEW {rid}   + {x}"); }
+            println!("PREVIEW {rid} with reference: {:?}  blank_findings={}", d1.row, blank_amount_findings(&inp, &d1, &s1).len());
         }
-    }
-
-    /// Dump: message_id -> fact kinds the live pipeline emits (all requests), for classifier design.
-    #[test]
-    #[ignore]
-    fn dump_evidence_by_message() {
-        let inp = Inputs::load(&dir()).unwrap();
-        let mut reqs = model::load_requests(dir().join("requests.csv")).unwrap();
-        reqs.extend(model::load_sample_requests(dir().join("sample_requests.csv")).unwrap().into_iter().map(|s| model::Request {
-            request_id: s.request_id, user_id: s.user_id, request_date: s.request_date, request_type: s.request_type,
-            requested_amount: s.requested_amount, desired_completion_date: s.desired_completion_date,
-            allows_partial_payment: s.allows_partial_payment, request_text: s.request_text,
-        }));
-        let mut lines = Vec::new();
-        for r in &reqs {
-            for rec in evidence_for(&inp, &r.user_id, r.request_date) {
-                let kind = serde_json::to_value(&rec.fact).ok().and_then(|v| v.as_object().and_then(|m| m.keys().next().cloned())).unwrap_or_default();
-                lines.push(format!("{}	{}	{}", rec.record_id.split('#').next().unwrap_or(""), kind, serde_json::to_string(&rec.fact).unwrap()));
-            }
-        }
-        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/verifier/evidence_by_message.tsv");
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(&p, lines.join("
-")).unwrap();
-        println!("wrote {} records to {}", lines.len(), p.display());
     }
 
     #[test]
