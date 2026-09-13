@@ -330,39 +330,46 @@ struct MessagesUsage {
 /// mode requires every property present, `null` included, when
 /// `additionalProperties: false`).
 pub fn image_figures_json_schema() -> Value {
-    let nullable_number = json!({ "type": ["number", "null"] });
-    let nullable_string = json!({ "type": ["string", "null"] });
+    // Two live-API constraints discovered the hard way (both confirmed via
+    // 400s, not assumed):
+    // 1. `{"type": ["number","null"]}` (a type ARRAY) is rejected when
+    //    paired with an `enum` on the same property.
+    // 2. Anthropic hard-caps a schema at 16 nullable/union-typed
+    //    properties ("too many parameters with union types ... causes
+    //    exponential compilation cost") — `anyOf`-per-field for all 18
+    //    fields exceeds that.
+    // Fix: no nullable/union types at all. Every field is plain-typed and
+    // NOT in `required`, so the model omits a figure it can't read instead
+    // of writing an explicit null — `ImageFigures`'s `Option<T>` fields
+    // deserialize identically whether a key is absent or `null`, so this
+    // changes nothing on the parsing side (extract::images::ImageFigures).
+    let number = json!({ "type": "number" });
+    let string = json!({ "type": "string" });
     json!({
         "type": "object",
         "properties": {
             "doc_type": {
-                "type": ["string", "null"],
-                "enum": ["payslip", "receipt", "invoice", "bill", "delivery_summary", "bank_statement_excerpt", "other", null]
+                "type": "string",
+                "enum": ["payslip", "receipt", "invoice", "bill", "delivery_summary", "bank_statement_excerpt", "other"]
             },
-            "currency": nullable_string,
-            "subtotal": nullable_number,
-            "tax": nullable_number,
-            "total": nullable_number,
-            "amount_due": nullable_number,
-            "amount_paid": nullable_number,
-            "balance_due": nullable_number,
-            "gross_pay": nullable_number,
-            "deductions": nullable_number,
-            "net_pay": nullable_number,
-            "previous_balance": nullable_number,
-            "amount_due_before_date": nullable_number,
-            "amount_due_before_date_value": nullable_string,
-            "amount_due_after_date": nullable_number,
-            "document_date": nullable_string,
-            "period_label": nullable_string,
-            "line_items_sum_check": nullable_number,
+            "currency": string,
+            "subtotal": number,
+            "tax": number,
+            "total": number,
+            "amount_due": number,
+            "amount_paid": number,
+            "balance_due": number,
+            "gross_pay": number,
+            "deductions": number,
+            "net_pay": number,
+            "previous_balance": number,
+            "amount_due_before_date": number,
+            "amount_due_before_date_value": string,
+            "amount_due_after_date": number,
+            "document_date": string,
+            "period_label": string,
+            "line_items_sum_check": number,
         },
-        "required": [
-            "doc_type", "currency", "subtotal", "tax", "total", "amount_due",
-            "amount_paid", "balance_due", "gross_pay", "deductions", "net_pay",
-            "previous_balance", "amount_due_before_date", "amount_due_before_date_value",
-            "amount_due_after_date", "document_date", "period_label", "line_items_sum_check"
-        ],
         "additionalProperties": false
     })
 }
@@ -372,23 +379,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_figures_schema_lists_every_property_in_required() {
+    fn image_figures_schema_has_18_plain_typed_properties_no_unions() {
+        // Anthropic caps a schema at 16 nullable/union-typed properties
+        // (confirmed via a live 400) — assert we never regress back to
+        // anyOf/type-arrays on all 18 fields.
         let schema = image_figures_json_schema();
-        let props: Vec<String> = schema["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect();
-        let required: Vec<String> = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        for p in &props {
-            assert!(required.contains(p), "property {p} missing from required");
+        let props = schema["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 18);
+        for (name, def) in props {
+            assert!(def.get("anyOf").is_none(), "{name} still uses anyOf (union-type cap)");
+            let ty = def.get("type").unwrap_or_else(|| panic!("{name} has no plain type"));
+            assert!(ty.is_string(), "{name}'s type must be a plain string, not an array/union");
         }
+        assert!(schema.get("required").is_none(), "no field should be required — model omits what it can't read");
         assert_eq!(schema["additionalProperties"], false);
     }
 }
