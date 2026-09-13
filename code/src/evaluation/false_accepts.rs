@@ -100,7 +100,17 @@ pub fn image_gold_findings(code_dir: &Path, repo_root: Option<&Path>) -> Result<
             match gold.get(image) {
                 None => out.push(finding("FA2_unverifiable_image_fact", format!("{image} has no audit reference"))),
                 Some(g) if g.event_id != event => out.push(finding("FA2_unverifiable_image_fact", format!("{image} fact targets {event}, reference is for {}", g.event_id))),
-                Some(g) if !cents.map(|c| g.amounts.contains(&c)).unwrap_or(false) => out.push(finding(
+                // User rulings name one figure per image (AGENT_RULES §8: image_07 = 8,528, the
+                // Grand Total): an analyst "alt" rendering is never accepted as equal.
+                Some(g) if cents.is_some_and(|c| g.amounts[1..].contains(&c)) => out.push(finding(
+                    "FA3_image_amount_alt",
+                    format!(
+                        "{image} ({event}) applied the alt rendering {:?}; the ruled figure is {}",
+                        cents.map(super::data::fmt_cents_2dp),
+                        super::data::fmt_cents_2dp(g.amounts[0])
+                    ),
+                )),
+                Some(g) if cents != Some(g.amounts[0]) => out.push(finding(
                     "FA1_image_amount_wrong",
                     format!(
                         "{image} ({event}) applied {:?}, analyst reference {:?}: model and analyst disagree, investigate (not auto-corrected)",
@@ -115,8 +125,43 @@ pub fn image_gold_findings(code_dir: &Path, repo_root: Option<&Path>) -> Result<
     Ok((out, checked))
 }
 
+/// Ship gate (AGENT_RULES §9: 02/05/10/11 accepted): images in the audit reference whose linked
+/// event is pending or scheduled (cash-moving, derived from the dataset, not ids) but have no
+/// applied image EventAmount in persisted evidence. A fail-closed row there is safe (reserved),
+/// not wrong, but it does not meet the gate.
+pub fn cash_moving_unaccepted(code_dir: &Path, repo_root: &Path, dataset_dir: &Path) -> Result<Vec<String>> {
+    let Some(gold) = gold(Some(repo_root)) else { anyhow::bail!("RULES.md S5 audit table not found") };
+    let ds = super::data::Dataset::load(dataset_dir, &dataset_dir.join("requests.csv"))?;
+    let mut applied = std::collections::BTreeSet::new();
+    if let Ok(rd) = std::fs::read_dir(code_dir.join("store/processed/evidence")) {
+        for e in rd.flatten() {
+            let v: Value = serde_json::from_str(&std::fs::read_to_string(e.path())?)?;
+            for rec in v.as_array().into_iter().flatten() {
+                if rec.get("fact").and_then(|f| f.get("EventAmount")).is_some() {
+                    let id = rec.get("record_id").and_then(Value::as_str).unwrap_or("");
+                    applied.insert(id.split('#').next().unwrap_or("").to_string());
+                }
+            }
+        }
+    }
+    Ok(gold
+        .iter()
+        .filter(|(_, g)| ds.events.get(&g.event_id).is_some_and(|e| matches!(e.status.as_str(), "pending" | "scheduled")))
+        .filter(|(image, _)| !applied.contains(*image))
+        .map(|(image, g)| format!("{image} ({})", g.event_id))
+        .collect())
+}
+
 /// Codes from other checks that are false accepts under decision.accuracy_first.
-pub const FALSE_ACCEPT_CODES: [&str; 5] = ["EC4_unexpected_fact", "EC5_model_record_ungrounded", "IA4_no_agreement", "IA5_accepted_amount", "IA11_nonpositive_cash_moving"];
+pub const FALSE_ACCEPT_CODES: [&str; 7] = [
+    "EC4_unexpected_fact",
+    "EC5_model_record_ungrounded",
+    "IA4_no_agreement",
+    "IA5_accepted_amount",
+    "IA11_nonpositive_cash_moving",
+    "IA15_accept_without_witness",
+    "IA17_final_label_contradiction",
+];
 
 #[cfg(test)]
 mod tests {
@@ -164,11 +209,31 @@ mod tests {
     }
 
     #[test]
+    fn cash_moving_images_must_be_accepted() {
+        let Some(g) = gold(Some(&repo())) else { return };
+        let dataset = repo().join("dataset");
+        let root = std::env::temp_dir().join(format!("verifier_cm_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("store/processed/evidence")).unwrap();
+        let all = cash_moving_unaccepted(&root, &repo(), &dataset).unwrap();
+        assert!(!all.is_empty(), "the audit table has pending/scheduled images");
+        // Apply every cash-moving image's figure: nothing is left unaccepted.
+        let ev: Vec<Value> = all
+            .iter()
+            .map(|s| s.split(' ').next().unwrap())
+            .map(|image| json!({"record_id": format!("{image}#ocr"), "source": "Image", "fact": {"EventAmount": {"event_id": g[image].event_id, "amount": g[image].amounts[0] * 100, "currency": "INR"}}}))
+            .collect();
+        std::fs::write(root.join("store/processed/evidence/request_x.json"), Value::Array(ev).to_string()).unwrap();
+        assert!(cash_moving_unaccepted(&root, &repo(), &dataset).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn wrong_unverifiable_or_unreferenced_image_amounts_fail() {
         let Some(g) = gold(Some(&repo())) else { return };
         for (image, ref_) in &g {
-            for a in &ref_.amounts {
-                assert!(with_fact(&format!("ok{image}{a}"), image, &ref_.event_id, *a, Some(&repo())).is_empty(), "{image}");
+            assert!(with_fact(&format!("ok{image}"), image, &ref_.event_id, ref_.amounts[0], Some(&repo())).is_empty(), "{image}");
+            for a in &ref_.amounts[1..] {
+                assert_eq!(with_fact(&format!("alt{image}{a}"), image, &ref_.event_id, *a, Some(&repo())), vec!["FA3_image_amount_alt"], "{image}");
             }
             // Off by one cent or by a whole unit: model and analyst disagree.
             let off = ref_.amounts[0] + 1;

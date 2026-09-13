@@ -83,6 +83,19 @@ pub fn image_gold(rules_md: Option<&Path>) -> Option<BTreeSet<Cents>> {
     (!set.is_empty()).then_some(set)
 }
 
+/// True when the literal starting right after `before` is the value of a number-word table entry
+/// `("<lowercase word>", N)` (e.g. `("lakh", 100_000.0)` in an amount-in-words parser): a
+/// language constant, not an answer, even when it coincides with a label figure.
+fn is_word_table_value(before: &str) -> bool {
+    let rest = before.trim_end();
+    let Some(rest) = rest.strip_suffix(',') else { return false };
+    let Some(rest) = rest.trim_end().strip_suffix('"') else { return false };
+    let word_len = rest.bytes().rev().take_while(|c| c.is_ascii_lowercase()).count();
+    let Some(open) = (word_len > 0).then(|| rest[..rest.len() - word_len].strip_suffix('"')).flatten().and_then(|r| r.trim_end().strip_suffix('(')) else { return false };
+    // A bare tuple, never a call such as `amount_for("rent", 100000.0)`.
+    !open.trim_end().ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '!')
+}
+
 /// Numeric literals in code as cents under each plausible scale (units, cents, 1e4 Money).
 fn literal_values(code: &str) -> Vec<(usize, Vec<Cents>, String)> {
     let mut out = Vec::new();
@@ -100,6 +113,9 @@ fn literal_values(code: &str) -> Vec<(usize, Vec<Cents>, String)> {
         }
         let tok: String = code[s..i].chars().filter(|c| *c != '_').collect();
         let line = code[..s].matches('\n').count() + 1;
+        if is_word_table_value(&code[..s]) {
+            continue;
+        }
         let mut vals = Vec::new();
         if let Ok(c) = parse_cents(&tok) {
             vals.push(c);
@@ -276,6 +292,11 @@ mod tests {
         let f = scan(&root, &dir, None, Some(&rules)).unwrap();
         let lines: Vec<&str> = f.iter().filter(|x| x.code == "H4_image_gold_figure").map(|x| x.request_id.as_str()).collect();
         assert_eq!(lines, vec!["src/engine/plans.rs:1", "src/engine/plans.rs:2", "src/engine/plans.rs:3"], "{f:?}");
+        // A number-word table entry is a language constant; the same figure in a call is not.
+        std::fs::write(eng.join("plans.rs"), "const S: &[(&str, f64)] = &[(\"lac\", 654.32), ( \"crore\" , 65430 )];\nfn x() { amount_for(\"rent\", 654.32); }\n").unwrap();
+        let f = scan(&root, &dir, None, Some(&rules)).unwrap();
+        let lines: Vec<&str> = f.iter().filter(|x| x.code == "H4_image_gold_figure").map(|x| x.request_id.as_str()).collect();
+        assert_eq!(lines, vec!["src/engine/plans.rs:2"], "{f:?}");
         // No audit reference: the scan cannot vouch for image figures, so it fails.
         assert!(scan(&root, &dir, None, None).unwrap().iter().any(|x| x.code == "H0_audit_reference_unavailable"));
         std::fs::remove_dir_all(&root).ok();
