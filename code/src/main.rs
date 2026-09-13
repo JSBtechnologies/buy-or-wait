@@ -353,6 +353,11 @@ fn decide_one(
     if let (Some(client), Some(prompt)) = (model_ctx.client, model_ctx.image_prompt) {
         if model_ctx.config.vlm_primary().is_some() {
             let image_max_dim_px = model_ctx.config.image_max_dim_px();
+            let history: Vec<Event> = events
+                .iter()
+                .filter(|e| e.user_id == request.user_id)
+                .filter_map(|e| Event::from_model(e).ok())
+                .collect();
             for event in events.iter().filter(|e| e.user_id == request.user_id && e.amount.is_none()) {
                 let Some(image) = images.iter().find(|i| i.related_event_id == event.event_id) else {
                     continue;
@@ -377,6 +382,7 @@ fn decide_one(
                     &image.image_id,
                     model_ctx.config,
                     &typed_event,
+                    &history,
                 ) {
                     Ok(resolution) => {
                         let accepted_amount = resolution.evidence.as_ref().and_then(|e| match &e.fact {

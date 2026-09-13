@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const ROUTER_CHAT_COMPLETIONS_URL: &str = "https://router.huggingface.co/v1/chat/completions";
+const ROUTER_MODELS_URL: &str = "https://router.huggingface.co/v1/models";
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
 
 /// One part of the user message content: plain text, or a downscaled image
@@ -201,6 +202,26 @@ impl HfClient {
         self.usage_log.lock().expect("usage_log mutex poisoned").clone()
     }
 
+    /// A cheap, zero-completion-token pre-flight check (image_accuracy_plan.md §"Live N=5":
+    /// "check HF credits first") -- GETs the router's model listing with the same bearer token
+    /// a completion call would use. Confirms the token is valid and the router is reachable
+    /// BEFORE a run that may fire up to `16 images * 4 reads * N runs` paid completion calls;
+    /// a 401/403 here means an invalid/expired token, not exhausted credits per se (the router
+    /// does not expose a separate balance endpoint), but either way this is cheaper and faster
+    /// to fail on than discovering it mid-sweep.
+    pub fn check_router_reachable(&self) -> Result<()> {
+        let resp = self
+            .http
+            .get(ROUTER_MODELS_URL)
+            .bearer_auth(&self.token)
+            .send()
+            .context("HF router unreachable (GET /v1/models)")?;
+        if !resp.status().is_success() {
+            bail!("HF router GET /v1/models returned {} -- check HF_TOKEN and account status before running a live sweep", resp.status());
+        }
+        Ok(())
+    }
+
     /// Rebuild the HTTP client with a hard per-request timeout (connect
     /// timeout is `secs / 4`, minimum 5s). Use a tight bound (e.g. the
     /// bake-off's 60s) where a hanging provider must fail fast rather than
@@ -235,6 +256,10 @@ impl HfClient {
         self.cache_dir.join(format!("{key}.json"))
     }
 
+    fn cache_path_run(&self, key: &str, run_idx: u32) -> PathBuf {
+        self.cache_dir.join(format!("{key}__run{run_idx}.json"))
+    }
+
     /// Run one chat completion. Cache-first; on a miss, calls the router
     /// with retry/backoff and writes the result back to the cache.
     pub fn chat_completion(&self, call: &ModelCall) -> Result<ModelResponse> {
@@ -263,6 +288,29 @@ impl HfClient {
         let response = self.call_with_retry(call)?;
         let key = cache_key_for(call);
         self.write_cache(&self.cache_path(&key), &response);
+        self.record_usage(&response.usage);
+        Ok(response)
+    }
+
+    /// Same as `chat_completion_cold`, but also persists this run's raw
+    /// response under its own `{key}__run{run_idx}.json` file, alongside the
+    /// canonical `{key}.json` (still overwritten each run, unchanged, so
+    /// `--rescore-from-cache` keeps working off the latest response).
+    /// Without this, a stability sweep (N runs of the identical call, same
+    /// cache key by construction) only ever leaves the *last* run's raw text
+    /// on disk -- runs 1..N-1 are silently lost once run N writes over them.
+    /// A sign-off audit needs every run's raw response persisted for review
+    /// without re-calling the API (analyst request, bus topic `blocker`,
+    /// RULES.md#S5).
+    pub fn chat_completion_cold_numbered(
+        &self,
+        call: &ModelCall,
+        run_idx: u32,
+    ) -> Result<ModelResponse> {
+        let response = self.call_with_retry(call)?;
+        let key = cache_key_for(call);
+        self.write_cache(&self.cache_path(&key), &response);
+        self.write_cache(&self.cache_path_run(&key, run_idx), &response);
         self.record_usage(&response.usage);
         Ok(response)
     }
@@ -447,6 +495,7 @@ impl Pricing {
 struct ModelTotals {
     provider: String,
     calls: u64,
+    cache_hits: u64,
     prompt_tokens: u64,
     completion_tokens: u64,
     cost_usd: f64,
@@ -475,6 +524,9 @@ pub fn render_usage_report(
             ..Default::default()
         });
         entry.calls += 1;
+        if r.cache_hit {
+            entry.cache_hits += 1;
+        }
         entry.prompt_tokens += r.prompt_tokens;
         entry.completion_tokens += r.completion_tokens;
         if let Some(p) = pricing.get(&r.model_id) {
@@ -483,6 +535,7 @@ pub fn render_usage_report(
     }
 
     let total_calls: u64 = by_model.values().map(|m| m.calls).sum();
+    let total_cache_hits: u64 = by_model.values().map(|m| m.cache_hits).sum();
     let total_prompt: u64 = by_model.values().map(|m| m.prompt_tokens).sum();
     let total_completion: u64 = by_model.values().map(|m| m.completion_tokens).sum();
     let total_tokens = total_prompt + total_completion;
@@ -506,6 +559,14 @@ pub fn render_usage_report(
     s.push_str(&format!("- Input tokens: {total_prompt}\n"));
     s.push_str(&format!("- Output tokens: {total_completion}\n"));
     s.push_str(&format!("- Total tokens: {total_tokens}\n"));
+    if total_calls > 0 {
+        s.push_str(&format!(
+            "- Cache hit rate: {:.1}% ({total_cache_hits}/{total_calls} calls served from the \u{a7}2.11 disk cache, 0 tokens/cost)\n",
+            100.0 * total_cache_hits as f64 / total_calls as f64
+        ));
+    } else {
+        s.push_str("- Cache hit rate: N/A (0 calls)\n");
+    }
     if total_requests > 0 {
         s.push_str(&format!(
             "- Avg tokens per request: {:.1}\n",
@@ -530,11 +591,11 @@ pub fn render_usage_report(
 
     s.push_str("## Per-model breakdown\n\n");
     s.push_str(
-        "| Model | Provider | Calls | Input tokens | Output tokens | Total tokens | Avg tokens/call | Est. cost |\n",
+        "| Model | Provider | Calls | Cache hits | Input tokens | Output tokens | Total tokens | Avg tokens/call | Est. cost |\n",
     );
-    s.push_str("|---|---|---|---|---|---|---|---|\n");
+    s.push_str("|---|---|---|---|---|---|---|---|---|\n");
     if by_model.is_empty() {
-        s.push_str("| — | — | 0 | 0 | 0 | 0 | 0.0 | $0.000000 |\n");
+        s.push_str("| — | — | 0 | 0 (—) | 0 | 0 | 0 | 0.0 | $0.000000 |\n");
     } else {
         for (model_id, m) in &by_model {
             let total = m.prompt_tokens + m.completion_tokens;
@@ -544,9 +605,10 @@ pub fn render_usage_report(
             } else {
                 "N/A (no pricing on file)".to_string()
             };
+            let hit_rate = if m.calls == 0 { 0.0 } else { 100.0 * m.cache_hits as f64 / m.calls as f64 };
             s.push_str(&format!(
-                "| {model_id} | {} | {} | {} | {} | {} | {avg_per_call:.1} | {cost_cell} |\n",
-                m.provider, m.calls, m.prompt_tokens, m.completion_tokens, total
+                "| {model_id} | {} | {} | {} ({hit_rate:.1}%) | {} | {} | {} | {avg_per_call:.1} | {cost_cell} |\n",
+                m.provider, m.calls, m.cache_hits, m.prompt_tokens, m.completion_tokens, total
             ));
         }
     }
@@ -555,8 +617,9 @@ pub fn render_usage_report(
     } else {
         total_tokens as f64 / total_calls as f64
     };
+    let overall_hit_rate = if total_calls == 0 { 0.0 } else { 100.0 * total_cache_hits as f64 / total_calls as f64 };
     s.push_str(&format!(
-        "| **Overall** | — | {total_calls} | {total_prompt} | {total_completion} | {total_tokens} | {overall_avg:.1} | ${total_cost:.6} |\n",
+        "| **Overall** | — | {total_calls} | {total_cache_hits} ({overall_hit_rate:.1}%) | {total_prompt} | {total_completion} | {total_tokens} | {overall_avg:.1} | ${total_cost:.6} |\n",
     ));
 
     s

@@ -28,8 +28,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use buyorwait::engine::ledger::Fact;
+use buyorwait::engine::types::Event as ProdEvent;
 use buyorwait::extract::images::{self as prod_images, ImageFigures};
+use buyorwait::extract::model_config::ModelsConfig as ProdModelsConfig;
+use buyorwait::extract::prompts as prod_prompts;
 use buyorwait::hf::{ContentPart, HfClient, ModelCall, Usage};
+use buyorwait::model as prod_model;
 use chrono::NaiveDate;
 use serde::Deserialize;
 use serde_json::Value;
@@ -164,6 +169,11 @@ struct Args {
     /// selector fix) against already-obtained model outputs. Requires the
     /// same `--cache-dir` used for the original run.
     rescore_from_cache: bool,
+    /// `--image-prompt <filename>`: which file under `--prompts-dir` to load
+    /// for image transcription. Defaults to v1 for backward compatibility;
+    /// the v2 re-read (board `finding.image05_root_cause`) passes
+    /// `image_transcription.v2.md`.
+    image_prompt: String,
 }
 
 fn parse_args() -> Args {
@@ -187,6 +197,7 @@ fn parse_args() -> Args {
         runs: get("runs", "5").parse().unwrap_or(5),
         fixed_resolution: map.get("fixed-resolution").and_then(|v| v.parse().ok()),
         rescore_from_cache: get("rescore-from-cache", "false") == "true",
+        image_prompt: get("image-prompt", "image_transcription.v1.md"),
     }
 }
 
@@ -508,7 +519,20 @@ struct VlmCandidateReport {
     stats: RunStats,
     stability_rate: f64,
     pricing: Pricing,
+    /// True only when the circuit breaker tripped before a single usable
+    /// call succeeded (zero real data at all) -- the whole row renders as
+    /// UNAVAILABLE. Distinct from `partial_note` below: a candidate that got
+    /// SOME real data before tripping must never have that data discarded
+    /// (lead directive, board:blocker.anthropic_usage_limit -- "real data
+    /// must never be discarded").
     unavailable: bool,
+    /// Set when the circuit breaker stopped the run early but real data was
+    /// already gathered (e.g. a mid-run rate/usage-limit wall): describes
+    /// exactly how much of the requested N runs actually completed, so the
+    /// report never silently presents a partial N as a full one. `None` for
+    /// both a fully unavailable candidate and a candidate that completed
+    /// every requested run.
+    partial_note: Option<String>,
     selector_results: Vec<PerImageSelectorResult>,
 }
 
@@ -559,6 +583,7 @@ fn image_call(
     prompt: &PromptSet,
     image_b64: &str,
     rescore_from_cache: bool,
+    run_idx: Option<u32>,
 ) -> Result<(Option<Value>, Usage)> {
     let is_anthropic = candidate.provider == "anthropic";
     let call = ModelCall {
@@ -589,11 +614,15 @@ fn image_call(
         let ac = anthropic_client.context("anthropic candidate but no AnthropicClient configured")?;
         if rescore_from_cache {
             ac.chat_completion(&call)?
+        } else if let Some(idx) = run_idx {
+            ac.chat_completion_cold_numbered(&call, idx)?
         } else {
             ac.chat_completion_cold(&call)?
         }
     } else if rescore_from_cache {
         client.chat_completion(&call)?
+    } else if let Some(idx) = run_idx {
+        client.chat_completion_cold_numbered(&call, idx)?
     } else {
         client.chat_completion_cold(&call)?
     };
@@ -645,7 +674,7 @@ fn run_vlm_candidate(
         for img in &labeled {
             let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
             let b64 = downscale_and_encode(&path, max_dim)?;
-            let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
+            let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache, None);
             let parsed = match outcome {
                 Ok((parsed, _usage)) => {
                     consecutive_failures = 0;
@@ -690,17 +719,24 @@ fn run_vlm_candidate(
     // --- full pass at chosen resolution: N runs over all 16 images ---
     let mut stats = RunStats::default();
     let mut per_image_outputs: HashMap<String, Vec<Option<Value>>> = HashMap::new();
+    // Set when the circuit breaker trips mid-run so the caller can report
+    // exactly how far the candidate got, rather than silently discarding
+    // whatever real data was already gathered (lead directive,
+    // board:blocker.anthropic_usage_limit).
+    let mut stopped_early: Option<String> = None;
     if !unavailable {
         consecutive_failures = 0;
         'runs: for run_idx in 0..runs {
+            let mut images_done_this_run = 0usize;
             for img in &gold.images {
                 eprintln!("  [{}] run {}/{runs}: calling {} ...", candidate.id, run_idx + 1, img.image_id);
                 let path = dataset_dir.join("media/images").join(format!("{}.png", img.image_id));
                 let b64 = downscale_and_encode(&path, chosen_max_dim)?;
-                let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache);
+                let outcome = image_call(client, anthropic_client, candidate, &models_cfg.decoding, prompt, &b64, rescore_from_cache, Some(run_idx));
                 let parsed = match outcome {
                     Ok((parsed, usage)) => {
                         consecutive_failures = 0;
+                        images_done_this_run += 1;
                         stats.record_usage(&usage);
                         if parsed.is_some() {
                             stats.valid_json += 1;
@@ -717,8 +753,22 @@ fn run_vlm_candidate(
                         stats.record_failure();
                         consecutive_failures += 1;
                         if consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
-                            eprintln!("  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> marking unavailable, skipping rest", candidate.id);
-                            unavailable = true;
+                            eprintln!(
+                                "  [{}] {CIRCUIT_BREAKER_THRESHOLD} consecutive failures -> stopping early (run {}/{runs}, {images_done_this_run}/{} images done this run); preserving real data gathered so far, never discarding it",
+                                candidate.id, run_idx + 1, gold.images.len()
+                            );
+                            stopped_early = Some(if run_idx == 0 {
+                                format!(
+                                    "stopped mid-run 1/{runs} after {images_done_this_run}/{} images (0 complete runs) -- {CIRCUIT_BREAKER_THRESHOLD} consecutive call failures",
+                                    gold.images.len()
+                                )
+                            } else {
+                                format!(
+                                    "runs 1-{run_idx} complete + run {}/{runs} stopped after {images_done_this_run}/{} images -- {CIRCUIT_BREAKER_THRESHOLD} consecutive call failures",
+                                    run_idx + 1,
+                                    gold.images.len()
+                                )
+                            });
                             break 'runs;
                         }
                         None
@@ -737,6 +787,15 @@ fn run_vlm_candidate(
             }
         }
     }
+    // The circuit breaker tripping mid-run means unavailable (zero real data
+    // at all -- e.g. the very first call failed) only when NOTHING usable
+    // was gathered; any candidate with at least one successful call keeps
+    // its real stats/selector_results and is reported as partial, never
+    // discarded wholesale (lead directive, board:blocker.anthropic_usage_limit).
+    if stopped_early.is_some() && stats.calls == stats.failed_calls {
+        unavailable = true;
+    }
+    let partial_note = if unavailable { None } else { stopped_early };
 
     // stability: fraction of images whose N parsed outputs are all identical
     let mut stable_images = 0usize;
@@ -802,6 +861,7 @@ fn run_vlm_candidate(
             stability_rate,
             pricing: candidate.pricing_usd_per_m_tokens.clone(),
             unavailable,
+            partial_note,
             selector_results,
         },
         unlabeled_first_run,
@@ -1026,9 +1086,14 @@ fn render_vlm_section(
             r.stats.avg_prompt_tokens() as u64,
             r.stats.avg_completion_tokens() as u64,
         );
+        let id_cell = if r.partial_note.is_some() {
+            format!("{} \u{26a0}\u{fe0f} PARTIAL/rate-limited", r.id)
+        } else {
+            r.id.clone()
+        };
         s.push_str(&format!(
             "| {} | {} | {} | {:.1}% | {:.1}% | {:.1}% | {:.1}% | {:.0} | {:.0} | {:.0} | ${:.5} | ${:.4} |\n",
-            r.id,
+            id_cell,
             r.provider,
             r.chosen_max_dim,
             r.stats.field_acc.rate() * 100.0,
@@ -1041,6 +1106,14 @@ fn render_vlm_section(
             cost_per_item,
             cost_per_item * FULL_RUN_IMAGES as f64,
         ));
+    }
+    for r in vlm {
+        if let Some(note) = &r.partial_note {
+            s.push_str(&format!(
+                "\n\u{26a0}\u{fe0f} **`{}` is PARTIAL, not a full N={runs} run** ({note}). All numbers above for this row are real (never discarded), computed only over the calls that actually succeeded before the stop -- treat them as a smaller-N spot check, not a stability claim at the requested N.\n",
+                r.id
+            ));
+        }
     }
     s.push_str(&format!(
         "\n**Note on labeled-image count:** this run scored against {labeled_count} labeled images (the gold subset actually loaded for this run — see the file/commit noted above). An earlier posted table said \"5 labeled\" from a stale binary whose report-header text hadn't picked up extraction's image_10/image_11 addition yet; the underlying field-accuracy numbers in that run were already computed against every image with `expected_figures` present, so only the header text was wrong, not the scoring.\n\n"
@@ -1213,8 +1286,278 @@ fn splice_into_bakeoff_md(out_path: &Path, new_section: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Live N=5 witness-gate sweep (image_accuracy_plan.md §"Live N=5" / Phase A DONE
+// criteria): runs the REAL production path (`extract::images::resolve_blank_amount_
+// numbered_run`, the same function main.rs's pipeline calls) against every blank-
+// amount event's linked image, `--runs` (default 5) times each, with every raw model
+// response persisted per run (`hf::HfClient::chat_completion_cold_numbered`, no cache
+// replay). Usage: `cargo run --release --bin bakeoff -- --live-n5 [--runs 5]
+// [--config config/models.toml] [--dataset-dir ../dataset] [--prompts-dir prompts]
+// [--cache-dir store/bakeoff_live_n5] [--out ../docs/bakeoff.md]`.
+// ---------------------------------------------------------------------------
+
+/// One attempted resolution of one image on one run.
+struct LiveRunRow {
+    image_id: String,
+    run_idx: u32,
+    reads_used: usize,
+    normalized_figure: Option<f64>,
+    witness: Option<String>,
+    /// bus topic `bakeoff` #16/#18: the witness identity's own arithmetic result, not always
+    /// identical to `normalized_figure` (image_07: figure = Grand Total 8,528, computed = the
+    /// plain Total's 8,528.10, which rounds to it).
+    witness_computed: Option<f64>,
+    outcome: String,
+    total_tokens: u64,
+}
+
+/// `[selected]` injected HF-only for Phase A (image_accuracy_plan.md §2, RULES.md S8: no
+/// Claude dependency) -- matches the values recorded, but not yet activated, in
+/// `config/models.toml`'s "PENDING ACTIVATION" comment block (integrator's work item 1
+/// activates them for real). Injected into a LOCAL copy of the config so this sweep never
+/// depends on (or mutates) the committed file's activation state.
+const LIVE_N5_SELECTED_BLOCK: &str = r#"
+[selected]
+vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+vlm_escalation = "google/gemma-4-31B-it"
+vlm_mode = "agreement"
+image_max_dim_px = 1024
+llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
+"#;
+
+fn run_live_n5(args: &Args) -> Result<()> {
+    fs::create_dir_all(&args.cache_dir)?;
+
+    let base_config_text = fs::read_to_string(&args.config)
+        .with_context(|| format!("reading {}", args.config.display()))?;
+    let injected_config_text = format!("{base_config_text}\n{LIVE_N5_SELECTED_BLOCK}");
+    let live_config_path = args.cache_dir.join("_live_n5_models.toml");
+    fs::write(&live_config_path, &injected_config_text)
+        .with_context(|| format!("writing {}", live_config_path.display()))?;
+    let prod_cfg = ProdModelsConfig::load(&live_config_path)
+        .context("loading the [selected]-injected config for the live N=5 sweep")?;
+
+    let events = prod_model::load_financial_events(args.dataset_dir.join("financial_events.csv"))
+        .context("loading financial_events.csv")?;
+    let images_csv = prod_model::load_images(args.dataset_dir.join("images.csv"))
+        .context("loading images.csv")?;
+
+    struct Target {
+        image_id: String,
+        image_path: PathBuf,
+        event: ProdEvent,
+        user_id: String,
+    }
+    let mut targets: Vec<Target> = Vec::new();
+    for event in &events {
+        if event.amount.is_some() {
+            continue;
+        }
+        let Some(image) = images_csv.iter().find(|i| i.related_event_id == event.event_id) else {
+            continue;
+        };
+        let Ok(typed) = ProdEvent::from_model(event) else { continue };
+        let image_path = args.dataset_dir.join("media/images").join(format!("{}.png", image.image_id));
+        targets.push(Target { image_id: image.image_id.clone(), image_path, event: typed, user_id: event.user_id.clone() });
+    }
+    targets.sort_by(|a, b| a.image_id.cmp(&b.image_id));
+
+    eprintln!(
+        "live N=5: {} blank-amount images with a linked image row, {} runs each ({})",
+        targets.len(),
+        args.runs,
+        live_config_path.display()
+    );
+
+    // image_accuracy_plan.md §"Live N=5": check HF credits/router reachability BEFORE a run
+    // that may fire up to `images * up-to-4-reads * runs` paid completion calls.
+    let client = HfClient::with_cache_dir(&args.cache_dir)?
+        .with_request_timeout(90)?
+        .with_retry_policy(3, 1000, 2.0, 8000);
+    client
+        .check_router_reachable()
+        .context("HF router pre-flight check failed -- aborting before the live N=5 sweep")?;
+
+    let prompt = prod_prompts::load(&args.prompts_dir.join("image_transcription.v3.md"), "User prompt template")
+        .context("loading prompt v3")?;
+
+    let mut rows: Vec<LiveRunRow> = Vec::new();
+    for target in &targets {
+        let history: Vec<ProdEvent> = events
+            .iter()
+            .filter(|e| e.user_id == target.user_id)
+            .filter_map(|e| ProdEvent::from_model(e).ok())
+            .collect();
+
+        for run_idx in 0..args.runs {
+            let before = client.usage_records().len();
+            let result = prod_images::resolve_blank_amount_numbered_run(
+                &client,
+                None, // image_accuracy_plan.md/RULES.md S8: no Anthropic client on this path
+                &prompt,
+                prod_cfg.image_max_dim_px(),
+                &target.image_path,
+                &target.image_id,
+                &prod_cfg,
+                &target.event,
+                &history,
+                run_idx,
+            );
+            let after_usage = client.usage_records();
+            let total_tokens: u64 = after_usage[before..]
+                .iter()
+                .map(|u| u.prompt_tokens + u.completion_tokens)
+                .sum();
+
+            let row = match result {
+                Ok(resolution) => {
+                    let normalized_figure = resolution.evidence.as_ref().and_then(|e| match &e.fact {
+                        Fact::EventAmount { amount, .. } => Some(amount.to_f64()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    });
+                    let witnessing_read = normalized_figure.and_then(|amt| {
+                        resolution
+                            .reads
+                            .iter()
+                            .find(|r| r.witness.is_some() && r.selected_amount.map(|a| (a - amt).abs() < 0.01).unwrap_or(false))
+                    });
+                    LiveRunRow {
+                        image_id: target.image_id.clone(),
+                        run_idx,
+                        reads_used: resolution.reads.len(),
+                        normalized_figure,
+                        witness: witnessing_read.and_then(|r| r.witness.clone()),
+                        witness_computed: witnessing_read.and_then(|r| r.witness_computed),
+                        outcome: resolution.outcome.clone(),
+                        total_tokens,
+                    }
+                }
+                Err(e) => {
+                    eprintln!("live N=5: {} run {}: {e:#}", target.image_id, run_idx + 1);
+                    LiveRunRow {
+                        image_id: target.image_id.clone(),
+                        run_idx,
+                        reads_used: 0,
+                        normalized_figure: None,
+                        witness: None,
+                        witness_computed: None,
+                        outcome: format!("error: {e:#}"),
+                        total_tokens,
+                    }
+                }
+            };
+            eprintln!(
+                "  [{}] run {}/{}: outcome={} figure={:?} witness={:?} computed={:?} reads={} tokens={}",
+                row.image_id, row.run_idx + 1, args.runs, row.outcome, row.normalized_figure, row.witness, row.witness_computed, row.reads_used, row.total_tokens
+            );
+            rows.push(row);
+        }
+    }
+
+    let stability = live_n5_stability_summary(&rows, targets.iter().map(|t| t.image_id.as_str()));
+    let table = render_live_n5_section(&rows, &stability, args.runs);
+    splice_live_n5_section(&args.out, &table)?;
+
+    eprintln!(
+        "live N=5 sweep complete: {} rows across {} images written to {}",
+        rows.len(),
+        targets.len(),
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// Per image: whether every run resolved (accepted, non-error outcome) to the SAME
+/// normalized figure (or every run fail-closed identically) -- Phase A DONE criterion.
+fn live_n5_stability_summary<'a>(rows: &[LiveRunRow], image_ids: impl Iterator<Item = &'a str>) -> Vec<(String, bool, usize, usize)> {
+    image_ids
+        .map(|id| {
+            let this_image: Vec<&LiveRunRow> = rows.iter().filter(|r| r.image_id == id).collect();
+            let total = this_image.len();
+            let accepted = this_image.iter().filter(|r| r.normalized_figure.is_some()).count();
+            let stable = if accepted == 0 {
+                true // every run fail-closed -- identically, since there is nothing to disagree on
+            } else if accepted != total {
+                false // some runs accepted, some fail-closed: not identical across runs
+            } else {
+                let first = this_image[0].normalized_figure;
+                this_image.iter().all(|r| match (r.normalized_figure, first) {
+                    (Some(a), Some(b)) => (a - b).abs() < 0.01,
+                    _ => false,
+                })
+            };
+            (id.to_string(), stable, accepted, total)
+        })
+        .collect()
+}
+
+fn render_live_n5_section(rows: &[LiveRunRow], stability: &[(String, bool, usize, usize)], runs: u32) -> String {
+    let mut s = String::new();
+    s.push_str("## Step 5 — Live N=5 witness-gate sweep (Phase A OCR)\n\n");
+    s.push_str(&format!(
+        "Production path (`extract::images::resolve_blank_amount_numbered_run`), HF-only \
+         (Qwen3-VL-235B + gemma-4-31B, image_accuracy_plan.md §2 witness gate, RULES.md S8), \
+         prompt v3, {runs} runs per image, no cache replay (every raw response persisted per \
+         run). 0 wrong figures and images 02/05/10/11 accepted 5/5 are the Phase A DONE gate.\n\n"
+    ));
+    s.push_str("| image_id | stable 5/5 | accepted/total | figure (if accepted) | witness (last accepted run) | computed |\n");
+    s.push_str("|---|---|---|---|---|---|\n");
+    for (image_id, stable, accepted, total) in stability {
+        let last_accept = rows
+            .iter()
+            .filter(|r| &r.image_id == image_id && r.normalized_figure.is_some())
+            .next_back();
+        let figure = last_accept.and_then(|r| r.normalized_figure).map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string());
+        let witness = last_accept.and_then(|r| r.witness.clone()).unwrap_or_else(|| "—".to_string());
+        let computed = last_accept.and_then(|r| r.witness_computed).map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string());
+        s.push_str(&format!(
+            "| {image_id} | {} | {accepted}/{total} | {figure} | {witness} | {computed} |\n",
+            if *stable { "yes" } else { "NO" }
+        ));
+    }
+    s.push_str("\n### Per image × run detail\n\n");
+    s.push_str("| image_id | run | reads used | normalized figure | witness | computed | outcome | tokens |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|\n");
+    for row in rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            row.image_id,
+            row.run_idx + 1,
+            row.reads_used,
+            row.normalized_figure.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
+            row.witness.clone().unwrap_or_else(|| "—".to_string()),
+            row.witness_computed.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
+            row.outcome,
+            row.total_tokens,
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// Same splice-or-append pattern as `splice_into_bakeoff_md`, with this section's own
+/// markers so a re-run replaces the prior sweep's table instead of duplicating it. This
+/// section is the last one in the file (after Step 4), so its own heading is both start
+/// and (implicit) end marker -- it always runs to EOF.
+fn splice_live_n5_section(out_path: &Path, new_section: &str) -> Result<()> {
+    let existing = fs::read_to_string(out_path).unwrap_or_default();
+    let start_marker = "## Step 5 — Live N=5 witness-gate sweep";
+    let spliced = match existing.find(start_marker) {
+        Some(start) => format!("{}{}", &existing[..start], new_section),
+        None => format!("{}\n{}", existing.trim_end(), new_section),
+    };
+    fs::write(out_path, spliced)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = parse_args();
+
+    if env::args().any(|a| a == "--live-n5") {
+        return run_live_n5(&args);
+    }
 
     let config_text = fs::read_to_string(&args.config)
         .with_context(|| format!("reading {}", args.config.display()))?;
@@ -1227,7 +1570,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("parsing {}", args.gold_subset.display()))?;
 
     let image_prompt = load_prompt(
-        &args.prompts_dir.join("image_transcription.v1.md"),
+        &args.prompts_dir.join(&args.image_prompt),
         "User prompt template",
     )?;
     let message_prompt = load_prompt(
@@ -1281,6 +1624,7 @@ fn main() -> Result<()> {
             stability_rate: 0.0,
             pricing: candidate.pricing_usd_per_m_tokens.clone(),
             unavailable: true,
+            partial_note: None,
             selector_results: Vec::new(),
         }
     }

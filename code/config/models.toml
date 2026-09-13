@@ -29,7 +29,13 @@ top_p = 1.0
 # small typed figure schema; the LLM only emits typed records or the 4-field
 # request struct. Neither ever writes decision_explanation (deterministic
 # template, 0 tokens) or free prose.
-max_tokens_vlm = 400
+# max_tokens_vlm raised 400 -> 1400 (ml-engineer, live N=5 run 2026-09-13): prompt v3's
+# line_items/charges_breakdown arrays (image_accuracy_plan.md §1/§2) made several images'
+# replies truncate mid-JSON at 400 tokens (image_02's 7-line charges_breakdown alone runs
+# past it; image_10's 20+ line_items array needs far more) -- v1/v2's flat-scalar schema
+# never needed this headroom, but v3's witness fields genuinely do. Verified against the
+# widest image (image_10, ~26 line items) plus margin.
+max_tokens_vlm = 1400
 max_tokens_llm = 300
 response_format = "json_object" # constrained via supports_structured_output where available
 
@@ -292,24 +298,34 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# PENDING ACTIVATION (board decision.selected_activation_question, 2026-09-12):
-# [selected] deliberately left ABSENT below. 9d96dcd's [selected] was riding
-# into extraction's lockstep and would have reached `main` before the lead
-# is ready to announce activation. The chosen values are recorded here as a
-# commented block so nothing is lost; activating them is a separate,
-# single commit the lead announces explicitly once ready:
+# PENDING ACTIVATION (work item 1, image_accuracy_plan.md: integrator adds
+# `[selected]` for real; `main.rs` also still needs its resolve_blank_amount
+# call fixed and prompt v3 loaded first, image_accuracy_plan.md context).
+# `[selected]` stays deliberately ABSENT here so a stray `cargo run` by any
+# other agent never fires live model calls through main.rs's still-unfixed
+# call site. ml-engineer's own Phase A N=5 harness (`bin/bakeoff.rs`) proves
+# the OCR path against a LOCAL copy of this file with `[selected]` injected,
+# never against this committed one -- see docs/bakeoff.md for that run.
+#
+# HF-only, no vlm_fallback (RULES.md S8: the Anthropic org cap blocks
+# claude-opus-5 until 2026-10-01 -- a final user ruling, so it is dropped
+# from `[selected]` entirely here rather than left in as an inert fallback
+# slot). `extract::images::resolve_blank_amount_agreement` (image_accuracy_
+# plan.md §2 witness gate) no longer calls a third/tiebreak model at all: it
+# reads `vlm_primary`@1024px and `vlm_escalation`@768px, and only escalates
+# resolution (`vlm_primary`@1536px, `vlm_escalation`@1024px) on a failed
+# gate -- never a different model. Values to activate, unchanged since
+# `decision.vlm_setup`:
 #
 #   [selected]
 #   vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
 #   vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px
-#   vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (failed the backup gate), claude-opus-5 IN -- USER ACCEPTED (board decision.backup_gate, criterion 5 [>=2 providers] waived for a direct-API model): 90.6% field accuracy (best of any VLM tested), 100% valid-JSON, 83.3% selected-figure accuracy, 83.3% reconciliation, 0 false-accepts (docs/bakeoff.md)
-#   vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
-#   image_max_dim_px = 1024
-#   llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai
-#   llm_fallback = "deepseek-ai/DeepSeek-V4-Pro-0813"    # deepinfra, passed its backup-gate check
+#   vlm_mode = "agreement"                              # images.rs's Agreement-mode fn IS the witness gate
+#   image_max_dim_px = 1024                             # global default; the gate's own per-role resolutions above take precedence
+#   llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai (board decision.vlm_setup, unchanged)
 #
-# [[fallback.candidates]] (catalog), [vlm_routing] (routing table), and all
-# pricing stay live/unchanged below -- only the activation switch moved.
+# `[[fallback.candidates]]` (catalog) and `[vlm_routing]` stay live/unchanged
+# below -- only the activation switch moved, and vlm_fallback is dropped.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -348,6 +364,16 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 # not yet screened for claude-opus-5 specifically -- a known gap.
 # ---------------------------------------------------------------------------
 
+# INERT under the Phase A witness gate (image_accuracy_plan.md §2): the table below is the
+# OLD per-class-routing + tiebreak design (`extract::model_config::readers_for`/`tiebreak_for`/
+# `classify_event`, still compiled and unit-tested in model_config.rs). `extract::images::
+# resolve_blank_amount_agreement` no longer calls any of those three functions -- it reads
+# `vlm_primary`/`vlm_escalation` from `[selected]` directly with a flat, class-independent
+# HF-only read budget (module doc, images.rs). Left in place, unmodified, for
+# `evaluation::image_agreement` (verifier's signoff tool, which parses this table itself and is
+# not wired into the runtime pipeline) until Phase B's verifier realigns it to the new
+# architecture (image_accuracy_plan.md work item 5) -- do not treat this table as describing
+# current production routing.
 [vlm_routing]
 default_class = "settled_expense_receipt"
 # Verifier gate #250: cross-model agreement/tiebreak matching tolerance
@@ -359,15 +385,19 @@ default_class = "settled_expense_receipt"
 # "agreeing".
 tolerance = 0.01
 
-# CORRECTED SHAPE (extraction #278/#281, board:decision.tiebreak_distinct_shape):
-# the previous version self-tiebroke -- each class's "tiebreak" was one of
-# its own 2 `readers`, which hard-errors at load. Every class now has its
-# own 2-reader AGREEMENT pair (`readers`) plus a SEPARATE, distinct third
-# `tiebreak` reader consulted only when the pair disagrees. Best-faith
-# reconstruction for `income_payslip` (not itself covered by the lead's 2
-# named examples: default/settled_expense_receipt and pending_bill_due_date)
-# -- mirrors the "default" class's shape since it historically used the
-# same plain 235B+gemma pairing; flagged for confirmation.
+# ROUTING V3 (board decision.vlm_routing_v3, USER DECISION): claude-opus-5
+# becomes TIEBREAK-ONLY everywhere -- every class now shares the identical
+# shape (readers = Qwen-235B@1024 + gemma@768, tiebreak = claude-opus-5@1024),
+# replacing routing v2's per-class reader-pair variation (pending_bill_due_date
+# previously paired 235B+claude as primaries). Motivation: the v2 re-read
+# (docs/bakeoff.md Step 3a) showed claude-opus-5 is by far the most expensive
+# candidate ($0.01764/item vs Qwen's $0.00036 and gemma's $0.00014) and prompt
+# v2 alone (unambiguous due_cutoff_date/amount_due_by_cutoff/
+# amount_due_after_cutoff schema) already fixed the image_05 root cause for
+# every model, including gemma (0/5 -> 5/5 correct) -- claude-opus-5 no longer
+# needs to be a routine PRIMARY reader on any class, only the distinct
+# tiebreak when Qwen+gemma disagree (decision.tiebreak_distinct still holds:
+# tiebreak stays a genuinely different model from both primaries).
 
 [[vlm_routing.classes]]
 name = "income_payslip"
@@ -385,24 +415,25 @@ name = "pending_bill_due_date"
 event_types = []
 statuses = ["pending", "scheduled"]
 categories = []
-# routing v2 (lead-specified exactly): readers = 235B@1024 + claude-opus-5@1024,
-# tiebreak = gemma@768. A gemma tiebreak read only counts if it satisfies the
-# due-date cutoff rule in the selector, so a wrong pre-cutoff read (e.g.
-# image_05's 704.05) can never be selected as correct -- worst case is
-# disagreement -> missing, which board decision.accuracy_first accepts.
+# routing v3: readers = 235B@1024 + gemma@768 (was 235B+claude in v2), tiebreak
+# = claude-opus-5@1024 (was gemma in v2). Prompt v2's unambiguous cutoff schema
+# means gemma no longer drops the due-date fields on this shape (v1's root
+# cause, board finding.image05_root_cause) -- it can be a routine primary
+# reader on pending-bill classes again, with claude reserved for tiebreak.
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
-  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 },
+  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
 ]
-tiebreak = { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 }
+tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
 
 [[vlm_routing.classes]]
 name = "settled_expense_receipt"
 event_types = []
 statuses = ["settled"]
 categories = []
-# routing v2 (lead-specified exactly, this is default_class): readers =
-# 235B@1024 + gemma@768, tiebreak = claude-opus-5@1024.
+# routing v3 (this is default_class): readers = 235B@1024 + gemma@768,
+# tiebreak = claude-opus-5@1024. Unchanged from v2 -- this class already had
+# claude tiebreak-only.
 readers = [
   { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
   { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },

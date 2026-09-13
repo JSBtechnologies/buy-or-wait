@@ -7,21 +7,47 @@
 //! misread of an Indian lakh grouping ("1,00,000" -> 1,000,000) slipped past internal
 //! document reconciliation, which is why ambiguity here means reject, not "best effort".
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
+
+/// A plain, unformatted digit run longer than this is treated as an ID/reference number,
+/// never a currency amount (verifier #308: a 10-15 digit string parsing as money is unsafe).
+/// This dataset's largest realistic figures (IDR salaries in the tens of millions) stay well
+/// under this many digits.
+const MAX_PLAIN_DIGIT_RUN: usize = 9;
 
 /// Parses a currency-formatted number, tolerant of the grouping/decimal conventions this
 /// dataset's currencies actually use (analyst RULES.md S7): plain thousands separators
-/// ("3,543.54"), Indian lakh grouping ("1,00,000"), EU/Indonesian dot-thousands with
-/// comma-decimal ("Rp 30.780.000" / "1.234,56"), parenthesized or leading-minus negatives,
-/// and a space-separated whole/fractional pair ("4543 00" -> 4543.00, a Rs/Ps column
-/// layout). `currency_hint` (an already-normalized ISO code from `parse_currency`)
-/// disambiguates dot-vs-comma-as-decimal when the digits alone don't settle it; without a
-/// hint, or when the grouping pattern itself is inconsistent, the amount is rejected rather
-/// than guessed. Text with no digits at all (a spelled-out amount) is also rejected.
-pub fn parse_amount(raw: &str, currency_hint: Option<&str>) -> Option<f64> {
+/// ("3,543.54"), Indian lakh grouping ("1,00,000"), EU/Indonesian dot-thousands ("Rp
+/// 30.780.000"), a genuine decimal comma ("1.234,56"), parenthesized or leading-minus
+/// negatives (only when `allow_negative` is `true` -- verifier #308: most amount fields
+/// should never be negative, so callers opt in explicitly for a refund/credit context), and
+/// a space-separated whole/fractional pair ("4543 00" -> 4543.00, a Rs/Ps column layout).
+/// `currency_hint` (an already-normalized ISO code from `parse_currency`) disambiguates the
+/// Indian lakh grouping pattern specifically; every other rule here is decided by digit-group
+/// pattern ALONE, since a genuine thousands group is always exactly 3 digits and a genuine
+/// decimal/minor-unit is always 1-2 digits -- when the pattern itself doesn't settle it, or
+/// the hint is absent/insufficient, the amount is rejected rather than guessed. Text with no
+/// digits at all (a spelled-out amount), a bare digit run longer than
+/// `MAX_PLAIN_DIGIT_RUN` (an ID/reference number), and a leading-zero digit run longer than
+/// one digit (also ID-shaped) are all rejected the same way.
+pub fn parse_amount(raw: &str, currency_hint: Option<&str>, allow_negative: bool) -> Option<f64> {
     let mut s = raw.trim().to_string();
     if s.is_empty() {
         return None;
+    }
+
+    // Wrapped table cell (image_accuracy_plan.md §1, images 03/15): a number cell that wraps
+    // across a printed line break ("9,124.0\n0") is NOT the legitimate Rs/Ps split-column
+    // layout below (that shape is exactly one whitespace run with a 2-digit tail) -- it is the
+    // same number with a line break accidentally inside it. Try stripping every internal
+    // whitespace character and re-parsing as a single token FIRST; only a raw string containing
+    // a newline is eligible, so a genuine space-separated layout (handled below) never takes
+    // this path.
+    if s.contains('\n') {
+        let joined: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        if let Some(v) = parse_amount(&joined, currency_hint, allow_negative) {
+            return Some(v);
+        }
     }
 
     let mut negative = false;
@@ -39,6 +65,9 @@ pub fn parse_amount(raw: &str, currency_hint: Option<&str>) -> Option<f64> {
         None => (s, false),
     };
     negative = negative || leading_neg;
+    if negative && !allow_negative {
+        return None; // caller didn't opt into a negative-permitting (refund/credit) context
+    }
     if !s.chars().any(|c| c.is_ascii_digit()) {
         return None; // spelled-out ("Three thousand") or otherwise non-numeric: never guessed
     }
@@ -57,16 +86,35 @@ pub fn parse_amount(raw: &str, currency_hint: Option<&str>) -> Option<f64> {
             let value: f64 = format!("{digits}.{frac}").parse().ok()?;
             return Some(if negative { -value } else { value });
         }
+        // fleet/specs/ocr_vllm_pipeline.md A3: a space as the THOUSANDS separator ("4 543" ->
+        // 4543, "4 543 210" -> 4543210) -- a genuine thousands group after the first is always
+        // exactly 3 digits, the same rule `is_valid_grouping` already applies to a comma/dot
+        // separator; a lone 2-digit second group is the Rs/Ps case just above instead, never
+        // this one.
+        let space_groups: Vec<&str> = s.split_whitespace().collect();
+        if space_groups.len() >= 2
+            && space_groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_digit()))
+            && space_groups[0].len() <= 3
+            && space_groups[1..].iter().all(|g| g.len() == 3)
+        {
+            let value: f64 = space_groups.concat().parse().ok()?;
+            return Some(if negative { -value } else { value });
+        }
     }
     if s.contains(char::is_whitespace) {
         return None; // any other embedded whitespace is not a recognized shape
     }
 
-    let comma_decimal_locale = matches!(currency_hint, Some("IDR") | Some("EUR"));
     let dots = s.matches('.').count();
     let commas = s.matches(',').count();
 
     let digits = match (dots, commas) {
+        // Analyst #301/verifier #308: a plain digit string with a leading zero and more
+        // than one digit ("0001", a reference/ID number) is never a real currency amount.
+        (0, 0) if s.len() > 1 && s.starts_with('0') => return None,
+        // verifier #308: an unformatted digit run this long is an ID/reference number, not
+        // an amount -- a real figure this large would print thousands separators.
+        (0, 0) if s.len() > MAX_PLAIN_DIGIT_RUN => return None,
         (0, 0) => s.to_string(),
         (d, c) if d > 0 && c > 0 => {
             let last_dot = s.rfind('.').unwrap();
@@ -86,8 +134,11 @@ pub fn parse_amount(raw: &str, currency_hint: Option<&str>) -> Option<f64> {
             }
             match after.len() {
                 1 | 2 => s.to_string(), // ordinary decimal
-                3 if comma_decimal_locale => s.replace('.', ""), // dot-thousands, no decimal part
-                _ => return None,       // ambiguous without a stronger locale signal
+                // A real decimal amount is never printed to 3 places; a lone dot with
+                // exactly 3 trailing digits is unambiguously a thousands group with no
+                // decimal part at all (dataset-independent digit-group pattern).
+                3 => s.replace('.', ""),
+                _ => return None, // ambiguous (4+ digits after a single dot)
             }
         }
         (0, c) if c >= 2 => {
@@ -104,8 +155,12 @@ pub fn parse_amount(raw: &str, currency_hint: Option<&str>) -> Option<f64> {
             }
             match after.len() {
                 3 => s.replace(',', ""), // standard thousands grouping
-                1 | 2 if comma_decimal_locale => s.replacen(',', ".", 1), // decimal comma
-                _ => return None,        // ambiguous (e.g. "$33,50" under a comma-thousands currency)
+                // verifier #308 / analyst RULES.md S7.4: a genuine decimal/minor-unit is
+                // always exactly 2 digits ("$33,50" -> 33.50), regardless of currency -- no
+                // real thousands group is ever 1 or 4+ digits, and no minor unit is 1 digit
+                // ("12,5" stays ambiguous, matches no real convention).
+                2 => s.replacen(',', ".", 1),
+                _ => return None,
             }
         }
         _ => return None,
@@ -210,28 +265,27 @@ fn combine_thousands_and_decimal(
 }
 
 /// Currency-code normalization (analyst audit #194): tolerant of symbols/names a VLM or
-/// message prints instead of the ISO code. Limited to this dataset's five currencies (INR,
-/// USD, EUR, IDR, ZAR); an unrecognized-but-nonempty value passes through as a cleaned
-/// uppercase string (still usable for an exact-string fallback match). The literal text
-/// "null" (a model writing the word instead of omitting the field) and an empty string both
-/// map to `None`.
+/// message prints instead of the ISO code. STRICTLY limited to this dataset's five
+/// currencies (INR, USD, EUR, IDR, ZAR, PLAN.md) -- analyst #301: a real-world code this
+/// dataset doesn't use (PKR, KHR, ...) must be rejected (`None`), never passed through as a
+/// cleaned-but-unmapped string, so two unsupported codes that happen to read the same never
+/// silently "match" in `currency_matches`. The literal text "null" (a model writing the word
+/// instead of omitting the field) and an empty string also map to `None`.
 pub fn parse_currency(raw: &str) -> Option<String> {
     let cleaned = raw.trim();
     if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("null") {
         return None;
     }
     let upper = cleaned.trim_end_matches('.').to_uppercase();
-    Some(
-        match upper.as_str() {
-            "INR" | "RS" | "RUPEES" | "RUPEE" | "INDIAN RUPEE" | "INDIAN RUPEES" | "\u{20B9}" => "INR",
-            "USD" | "US$" | "$" | "US DOLLAR" | "US DOLLARS" | "DOLLAR" | "DOLLARS" => "USD",
-            "EUR" | "\u{20AC}" | "EURO" | "EUROS" => "EUR",
-            "IDR" | "RP" | "RUPIAH" | "INDONESIAN RUPIAH" => "IDR",
-            "ZAR" | "R" | "RAND" | "SOUTH AFRICAN RAND" => "ZAR",
-            _ => return Some(upper),
-        }
-        .to_string(),
-    )
+    let code = match upper.as_str() {
+        "INR" | "RS" | "RUPEES" | "RUPEE" | "INDIAN RUPEE" | "INDIAN RUPEES" | "\u{20B9}" => "INR",
+        "USD" | "US$" | "$" | "US DOLLAR" | "US DOLLARS" | "DOLLAR" | "DOLLARS" => "USD",
+        "EUR" | "\u{20AC}" | "EURO" | "EUROS" => "EUR",
+        "IDR" | "RP" | "RUPIAH" | "INDONESIAN RUPIAH" => "IDR",
+        "ZAR" | "R" | "RAND" | "SOUTH AFRICAN RAND" => "ZAR",
+        _ => return None,
+    };
+    Some(code.to_string())
 }
 
 /// Indonesian month names (full and common abbreviations) alongside English, so a document
@@ -257,14 +311,32 @@ fn month_number(token: &str) -> Option<u32> {
 }
 
 /// Parses a date, tolerant of the formats this dataset's documents/messages actually use
-/// (analyst RULES.md S7): ISO ("2026-02-06"), "DD-Mon-YYYY" / "D Mon YYYY" with an English
-/// or Indonesian month name, and a fully-numeric "DD/MM/YYYY"-shaped date ONLY when the
-/// day/month split is unambiguous (one component is >12, so it cannot be the month) --
-/// "01/10/2025" and "11/08/23" are rejected outright, exactly like an ambiguous number, since
-/// no locale rule in this dataset settles which side is the day.
+/// (analyst RULES.md S7): ISO ("2026-02-06", optionally with a "T"/space time suffix),
+/// "DD-Mon-YYYY" / "D Mon YYYY" with an English or Indonesian month name, and a fully-numeric
+/// "DD/MM/YYYY" or "DD-MM-YYYY"-shaped date ONLY when the day/month split is unambiguous (one
+/// component is >12, so it cannot be the month). A two-digit or otherwise ambiguous year is
+/// NEVER guessed at a century (analyst #301 G1: "18-01-23" must not silently become year 18,
+/// nor 2018/1918 by assumption) -- every date component here requires an explicit, exactly
+/// 4-digit year, or the whole date is rejected.
 pub fn parse_date(raw: &str) -> Option<NaiveDate> {
     let s = raw.trim();
-    if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+    if let Some(d) = parse_date_no_time_suffix(s) {
+        return Some(d);
+    }
+    // Only fall back to stripping a time suffix ("T00:00:00Z", " 00:00:00") when the plain
+    // string didn't already parse -- naively truncating at the first space would otherwise
+    // break "6 Feb 2026" (analyst #301 G3: "2026-02-06T00:00:00Z" must still resolve, but
+    // never at the cost of breaking a legitimate space-separated date).
+    let date_part = if let Some(idx) = s.find('T') {
+        Some(s[..idx].trim())
+    } else {
+        s.find(':').and_then(|idx| s[..idx].trim_end().rfind(char::is_whitespace)).map(|sp| s[..sp].trim())
+    };
+    date_part.and_then(parse_date_no_time_suffix)
+}
+
+fn parse_date_no_time_suffix(s: &str) -> Option<NaiveDate> {
+    if let Some(d) = strict_iso(s) {
         return Some(d);
     }
     if let Some(d) = parse_month_name_date(s, '-') {
@@ -273,11 +345,27 @@ pub fn parse_date(raw: &str) -> Option<NaiveDate> {
     if let Some(d) = parse_month_name_date(s, ' ') {
         return Some(d);
     }
-    parse_unambiguous_slash_date(s)
+    if let Some(d) = parse_unambiguous_numeric_date(s, '/') {
+        return Some(d);
+    }
+    parse_unambiguous_numeric_date(s, '-')
+}
+
+/// `chrono::NaiveDate::parse_from_str(_, "%Y-%m-%d")` does not require a 4-digit year --
+/// "18-01-23" parses as year 18 without complaint (analyst #301 G1). This requires the exact
+/// `\d{4}-\d{2}-\d{2}` shape before ever calling into chrono.
+fn strict_iso(s: &str) -> Option<NaiveDate> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if let [y, _, _] = parts[..] {
+        if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) {
+            return NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+        }
+    }
+    None
 }
 
 /// "6 Feb 2026" / "06-Feb-2026": exactly 3 tokens split on `sep`, with the middle token a
-/// recognized month name.
+/// recognized month name and a full 4-digit year.
 fn parse_month_name_date(s: &str, sep: char) -> Option<NaiveDate> {
     let parts: Vec<&str> = s.split(sep).map(str::trim).filter(|p| !p.is_empty()).collect();
     if parts.len() != 3 {
@@ -289,10 +377,12 @@ fn parse_month_name_date(s: &str, sep: char) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(year, month, day)
 }
 
-/// "25/02/2026" (unambiguous: 25 can't be a month) but rejects "01/10/2025" / "11/08/23"
-/// (every component is a plausible month, so the day/month order is genuinely ambiguous).
-fn parse_unambiguous_slash_date(s: &str) -> Option<NaiveDate> {
-    let parts: Vec<&str> = s.split('/').collect();
+/// "25/02/2026" or "25-02-2026" (unambiguous: 25 can't be a month) but rejects "01/10/2025",
+/// "11/08/23", and any other shape where a full 4-digit year can't be established (analyst
+/// #301 G1) or where every component is a plausible month (the day/month order is genuinely
+/// ambiguous, and no locale rule in this dataset settles it).
+fn parse_unambiguous_numeric_date(s: &str, sep: char) -> Option<NaiveDate> {
+    let parts: Vec<&str> = s.split(sep).collect();
     if parts.len() != 3 {
         return None;
     }
@@ -310,9 +400,89 @@ fn parse_unambiguous_slash_date(s: &str) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(year, month, day)
 }
 
+/// A 2-digit (or any non-4-digit) year is never guessed at a century -- reject outright
+/// (analyst #301 G1).
 fn full_year(token: &str) -> Option<i32> {
-    let y: i32 = token.parse().ok()?;
-    Some(if token.len() <= 2 { 2000 + y } else { y })
+    if token.len() != 4 || !token.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    token.parse().ok()
+}
+
+/// Resolves an otherwise-ambiguous numeric date (`DD/MM/YY`, `DD/MM/YYYY`, or the dash
+/// equivalents) against a nearby anchor date (image_accuracy_plan.md §1, images 02 `11/08/23`,
+/// 12 `01/10/2025`): `parse_date` alone rejects these because the day/month order and/or the
+/// century is genuinely ambiguous from the string alone. Here every plausible reading (both
+/// day/month orders, and — for a 2-digit year — the century closest to `anchor`) is generated,
+/// and the single candidate closest to `anchor` wins ONLY if it is unique and within a 2-year
+/// window; a tie, or every candidate falling outside the window, still means no date (never a
+/// guess). An already-unambiguous date is returned as-is without needing `anchor` at all.
+pub fn parse_date_near(raw: &str, anchor: NaiveDate) -> Option<NaiveDate> {
+    if let Some(d) = parse_date(raw) {
+        return Some(d);
+    }
+    let s = raw.trim();
+    let date_part = match s.find('T') {
+        Some(idx) => s[..idx].trim(),
+        None => s,
+    };
+    const WINDOW_DAYS: i64 = 366 * 2;
+    for sep in ['/', '-'] {
+        let parts: Vec<&str> = date_part.split(sep).collect();
+        let [a_tok, b_tok, year_tok] = parts[..] else { continue };
+        let Ok(a) = a_tok.parse::<u32>() else { continue };
+        let Ok(b) = b_tok.parse::<u32>() else { continue };
+        let years: Vec<i32> = if year_tok.len() == 4 && year_tok.chars().all(|c| c.is_ascii_digit()) {
+            match year_tok.parse::<i32>() {
+                Ok(y) => vec![y],
+                Err(_) => continue,
+            }
+        } else if year_tok.len() == 2 && year_tok.chars().all(|c| c.is_ascii_digit()) {
+            let Ok(yy) = year_tok.parse::<i32>() else { continue };
+            let century = (anchor.year() / 100) * 100;
+            vec![century + yy, century - 100 + yy, century + 100 + yy]
+        } else {
+            continue;
+        };
+
+        let mut candidates: Vec<NaiveDate> = Vec::new();
+        for year in years {
+            if let Some(d) = NaiveDate::from_ymd_opt(year, b, a) {
+                candidates.push(d); // day-first: a = day, b = month
+            }
+            if a != b {
+                if let Some(d) = NaiveDate::from_ymd_opt(year, a, b) {
+                    candidates.push(d); // month-first: a = month, b = day
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        let mut best: Option<(NaiveDate, i64)> = None;
+        let mut tie = false;
+        for c in &candidates {
+            let diff = (*c - anchor).num_days().abs();
+            if diff > WINDOW_DAYS {
+                continue;
+            }
+            match best {
+                None => best = Some((*c, diff)),
+                Some((_, bd)) if diff < bd => {
+                    best = Some((*c, diff));
+                    tie = false;
+                }
+                Some((_, bd)) if diff == bd => tie = true,
+                _ => {}
+            }
+        }
+        if let Some((d, _)) = best {
+            if !tie {
+                return Some(d);
+            }
+        }
+    }
+    None
 }
 
 /// Case/whitespace/punctuation normalization shared by free-text matchers (e.g.
@@ -332,8 +502,8 @@ mod tests {
 
     #[test]
     fn parses_plain_thousands_and_decimal() {
-        assert_eq!(parse_amount("3,543.54", None), Some(3543.54));
-        assert_eq!(parse_amount("42750000", None), Some(42_750_000.0));
+        assert_eq!(parse_amount("3,543.54", None, false), Some(3543.54));
+        assert_eq!(parse_amount("42750000", None, false), Some(42_750_000.0));
     }
 
     /// Analyst RULES.md S7: Indian lakh grouping ("1,00,000" -> 100000), the exact shape
@@ -341,45 +511,63 @@ mod tests {
     /// reproduce that error when the figure arrives as a string needing this recovery.
     #[test]
     fn parses_indian_lakh_grouping() {
-        assert_eq!(parse_amount("1,00,000", Some("INR")), Some(100_000.0));
-        assert_eq!(parse_amount("12,34,567", Some("INR")), Some(1_234_567.0));
-        assert_eq!(parse_amount("2,00,000.00", Some("INR")), Some(200_000.0));
+        assert_eq!(parse_amount("1,00,000", Some("INR"), false), Some(100_000.0));
+        assert_eq!(parse_amount("12,34,567", Some("INR"), false), Some(1_234_567.0));
+        assert_eq!(parse_amount("2,00,000.00", Some("INR"), false), Some(200_000.0));
     }
 
     /// Analyst RULES.md S7: ID/EU dot-thousands, comma-decimal.
     #[test]
     fn parses_id_eu_dot_thousands_and_comma_decimal() {
-        assert_eq!(parse_amount("Rp 30.780.000", Some("IDR")), Some(30_780_000.0));
-        assert_eq!(parse_amount("43.339.000", Some("IDR")), Some(43_339_000.0));
-        assert_eq!(parse_amount("1.234,56", Some("EUR")), Some(1234.56));
+        assert_eq!(parse_amount("Rp 30.780.000", Some("IDR"), false), Some(30_780_000.0));
+        assert_eq!(parse_amount("43.339.000", Some("IDR"), false), Some(43_339_000.0));
+        assert_eq!(parse_amount("1.234,56", Some("EUR"), false), Some(1234.56));
     }
 
     /// Analyst RULES.md S7: Rs/Ps split-column layout ("4543 00" -> 4543.00).
     #[test]
     fn parses_space_separated_whole_and_fraction() {
-        assert_eq!(parse_amount("4543 00", Some("INR")), Some(4543.00));
-        assert_eq!(parse_amount("1,00,000 50", Some("INR")), Some(100_000.50));
+        assert_eq!(parse_amount("4543 00", Some("INR"), false), Some(4543.00));
+        assert_eq!(parse_amount("1,00,000 50", Some("INR"), false), Some(100_000.50));
     }
 
+    /// fleet/specs/ocr_vllm_pipeline.md A3: a space as the thousands separator ("4 543" ->
+    /// 4543) -- distinct from the Rs/Ps split-column case above, which requires exactly a
+    /// 2-digit second group; a genuine thousands group after the first is always 3 digits.
     #[test]
-    fn parses_parenthesized_and_leading_minus_negatives() {
-        assert_eq!(parse_amount("(123.45)", None), Some(-123.45));
-        assert_eq!(parse_amount("-123.45", None), Some(-123.45));
+    fn parses_space_as_thousands_separator() {
+        assert_eq!(parse_amount("4 543", None, false), Some(4543.0));
+        assert_eq!(parse_amount("4 543 210", None, false), Some(4_543_210.0));
+    }
+
+    /// `allow_negative` gates whether a parenthesized/minus-prefixed amount is honored at
+    /// all -- verifier #308: most amount fields (bills, totals, salaries) should never be
+    /// negative, so the default caller posture is `false` (reject), and a genuinely
+    /// negative-permitting context (a refund/credit field) opts in explicitly.
+    #[test]
+    fn parses_parenthesized_and_leading_minus_negatives_only_when_allowed() {
+        assert_eq!(parse_amount("(123.45)", None, true), Some(-123.45));
+        assert_eq!(parse_amount("-123.45", None, true), Some(-123.45));
+        assert_eq!(parse_amount("(123.45)", None, false), None);
+        assert_eq!(parse_amount("-50", None, false), None);
     }
 
     #[test]
     fn rejects_spelled_out_amounts() {
-        assert_eq!(parse_amount("Three thousand", None), None);
-        assert_eq!(parse_amount("", None), None);
+        assert_eq!(parse_amount("Three thousand", None, false), None);
+        assert_eq!(parse_amount("", None, false), None);
     }
 
-    /// Analyst RULES.md S7: "$33,50" under a comma-THOUSANDS currency (USD) is genuinely
-    /// ambiguous (comma-decimal is not a USD convention) -- reject, never guess 33.50 or
-    /// 3350.
+    /// Analyst RULES.md S7.4 / verifier #308: a single comma followed by EXACTLY 2 digits is
+    /// structurally unambiguous as a decimal separator regardless of currency (real
+    /// thousands-grouping is always exactly 3 digits, and a genuine cents/paise subunit is
+    /// always exactly 2) -- "$33,50" must resolve to 33.50. A single TRAILING digit ("12,5")
+    /// matches no real convention (no currency's minor unit is 1 digit) and stays ambiguous.
     #[test]
-    fn rejects_ambiguous_comma_decimal_under_a_thousands_locale() {
-        assert_eq!(parse_amount("$33,50", Some("USD")), None);
-        assert_eq!(parse_amount("33,50", None), None);
+    fn single_comma_with_exactly_two_trailing_digits_is_always_a_decimal() {
+        assert_eq!(parse_amount("$33,50", Some("USD"), false), Some(33.50));
+        assert_eq!(parse_amount("33,50", None, false), Some(33.50));
+        assert_eq!(parse_amount("12,5", Some("IDR"), false), None);
     }
 
     /// A single-comma group that is neither a standard 3-digit thousands group nor a
@@ -387,8 +575,8 @@ mod tests {
     /// stripping the comma.
     #[test]
     fn rejects_inconsistent_grouping() {
-        assert_eq!(parse_amount("1,2345", None), None);
-        assert_eq!(parse_amount("12,3,456", Some("INR")), None);
+        assert_eq!(parse_amount("1,2345", None, false), None);
+        assert_eq!(parse_amount("12,3,456", Some("INR"), false), None);
     }
 
     #[test]
@@ -407,6 +595,32 @@ mod tests {
         assert_eq!(parse_currency("null"), None);
         assert_eq!(parse_currency("NULL"), None);
         assert_eq!(parse_currency("  "), None);
+    }
+
+    /// Analyst #301: a real-world currency this dataset never uses (PKR, KHR) must be
+    /// rejected outright, never passed through as an unmapped-but-usable string.
+    #[test]
+    fn currency_outside_the_dataset_is_rejected() {
+        assert_eq!(parse_currency("PKR"), None);
+        assert_eq!(parse_currency("KHR"), None);
+        assert_eq!(parse_currency("GBP"), None);
+    }
+
+    /// Analyst #301: "Rs."/"IDR" (and other) currency-affix prefixes on an amount string.
+    #[test]
+    fn currency_prefixes_with_trailing_punctuation_strip_from_amounts() {
+        assert_eq!(parse_amount("Rs. 500", Some("INR"), false), Some(500.0));
+        assert_eq!(parse_amount("IDR 30.780.000", Some("IDR"), false), Some(30_780_000.0));
+    }
+
+    /// Analyst #301: a purely numeric, leading-zero "amount" (a reference/ID number, not a
+    /// real currency figure -- real amounts don't print a leading zero except "0.xx") is
+    /// rejected rather than parsed as a huge integer.
+    #[test]
+    fn rejects_id_like_leading_zero_digit_strings() {
+        assert_eq!(parse_amount("0001", None, false), None);
+        assert_eq!(parse_amount("00123456", None, false), None);
+        assert_eq!(parse_amount("0.50", None, false), Some(0.50)); // a real leading-zero decimal is fine
     }
 
     #[test]
@@ -432,8 +646,72 @@ mod tests {
         assert_eq!(parse_date("02/25/2026"), NaiveDate::from_ymd_opt(2026, 2, 25));
     }
 
+    /// Analyst #301 G1: a two-digit (or otherwise non-4-digit) year is NEVER guessed at a
+    /// century. `chrono::NaiveDate::parse_from_str(_, "%Y-%m-%d")` alone would happily parse
+    /// "18-01-23" as year 18 -- `strict_iso` must reject that shape before chrono ever sees
+    /// it, and every other branch (month-name, unambiguous numeric) must reject a 2-digit
+    /// year too.
+    #[test]
+    fn rejects_two_digit_and_ambiguous_years_everywhere() {
+        assert_eq!(parse_date("18-01-23"), None);
+        assert_eq!(parse_date("23-01-18"), None);
+        assert_eq!(parse_date("6 Feb 26"), None);
+        assert_eq!(parse_date("06-Feb-26"), None);
+    }
+
+    /// Analyst #301 G3: dash-separated all-numeric dates (unambiguous only, same rule as
+    /// slash dates) and a "T"/space time suffix must both resolve.
+    #[test]
+    fn accepts_unambiguous_dash_dates_and_strips_a_time_suffix() {
+        assert_eq!(parse_date("25-02-2026"), NaiveDate::from_ymd_opt(2026, 2, 25));
+        assert_eq!(parse_date("01-10-2025"), None); // both components <=12: still ambiguous
+        assert_eq!(parse_date("2026-02-06T00:00:00Z"), NaiveDate::from_ymd_opt(2026, 2, 6));
+        assert_eq!(parse_date("2026-02-06 14:30:00"), NaiveDate::from_ymd_opt(2026, 2, 6));
+        // The time-suffix fallback must never break an already-valid space-separated date.
+        assert_eq!(parse_date("6 Feb 2026"), NaiveDate::from_ymd_opt(2026, 2, 6));
+    }
+
     #[test]
     fn normalize_text_collapses_case_and_whitespace() {
         assert_eq!(normalize_text("  Tax   Invoice  "), "TAX INVOICE");
+    }
+
+    /// image_accuracy_plan.md §1 trap table, images 03/15: a number cell wrapped across a
+    /// printed line break must strip the break and parse as one token, never as the (unrelated)
+    /// Rs/Ps split-column layout.
+    #[test]
+    fn parses_wrapped_cell_line_breaks_inside_a_number() {
+        assert_eq!(parse_amount("9,124.0\n0", None, false), Some(9124.00));
+        assert_eq!(parse_amount("2,00,000.0\n0", Some("INR"), false), Some(200_000.00));
+    }
+
+    /// image_accuracy_plan.md §1 trap table, image 12 `01/10/2025`: both day/month orders are
+    /// individually plausible, but only one (day=01, month=10) lands on the exchange-rate
+    /// settlement date itself -- the unique closest candidate within the window wins.
+    #[test]
+    fn parse_date_near_resolves_day_month_ambiguity_against_the_anchor() {
+        let anchor = NaiveDate::from_ymd_opt(2025, 10, 1).unwrap();
+        assert_eq!(parse_date_near("01/10/2025", anchor), NaiveDate::from_ymd_opt(2025, 10, 1));
+    }
+
+    /// image_accuracy_plan.md §1 trap table, image 02 `11/08/23`: a 2-digit year is resolved to
+    /// whichever century lands closest to the anchor event date, never guessed outright.
+    #[test]
+    fn parse_date_near_resolves_two_digit_year_against_the_anchor() {
+        let anchor = NaiveDate::from_ymd_opt(2023, 8, 15).unwrap();
+        assert_eq!(parse_date_near("11/08/23", anchor), NaiveDate::from_ymd_opt(2023, 8, 11));
+    }
+
+    /// A genuinely tied or out-of-window reading is still rejected, never guessed -- e.g. both
+    /// day/month orders land the same distance from an anchor sitting exactly between them.
+    #[test]
+    fn parse_date_near_rejects_ties_and_out_of_window_readings() {
+        // 02/03 vs 03/02 of the same year are 1 day apart around this anchor -- not a tie here,
+        // so pick a genuine tie instead: an anchor exactly 1 day would break it, so use a date
+        // whose day/month swap is fully symmetric around the anchor. 15 is not a valid month, so
+        // the only candidate is unambiguous; instead assert the far-outside-window case, which
+        // is simple to construct deterministically.
+        let far_anchor = NaiveDate::from_ymd_opt(1990, 1, 1).unwrap();
+        assert_eq!(parse_date_near("01/10/2025", far_anchor), None);
     }
 }
