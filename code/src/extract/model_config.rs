@@ -32,6 +32,54 @@ pub struct ModelsConfig {
     /// it's added, same pattern as `[selected]`/`[fallback]`.
     #[serde(default)]
     pub vlm_routing: VlmRoutingConfig,
+    /// User directive (accuracy is the only focus): bands/windows for
+    /// `extract::images::validate_doc`'s deterministic checks beyond arithmetic
+    /// reconciliation (date window, amount plausibility vs. history). Additive
+    /// `[doc_validation]` table — absent from the file today, so `Default` applies.
+    #[serde(default)]
+    pub doc_validation: DocValidationConfig,
+}
+
+/// Bands/windows for `extract::images::validate_doc`, config-driven per the user directive
+/// ("put the bands/windows in config"). Additive `[doc_validation]` table in `models.toml`;
+/// absent entirely today, so `Default` (below) applies until ml-engineer/the user tune it.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct DocValidationConfig {
+    /// How many days a document/cutoff date may plausibly diverge from the event's own
+    /// dates before it's treated as unrelated to this transaction.
+    #[serde(default = "DocValidationConfig::default_date_window_days")]
+    pub date_window_days: i64,
+    /// A candidate amount must be >= this multiple of the user's typical same-category
+    /// amount (analyst #276: catches an order-of-magnitude misread the arithmetic checks
+    /// alone did not).
+    #[serde(default = "DocValidationConfig::default_plausibility_low")]
+    pub plausibility_low: f64,
+    /// A candidate amount must be <= this multiple of the user's typical same-category
+    /// amount.
+    #[serde(default = "DocValidationConfig::default_plausibility_high")]
+    pub plausibility_high: f64,
+}
+
+impl DocValidationConfig {
+    fn default_date_window_days() -> i64 {
+        45
+    }
+    fn default_plausibility_low() -> f64 {
+        0.2
+    }
+    fn default_plausibility_high() -> f64 {
+        5.0
+    }
+}
+
+impl Default for DocValidationConfig {
+    fn default() -> Self {
+        DocValidationConfig {
+            date_window_days: Self::default_date_window_days(),
+            plausibility_low: Self::default_plausibility_low(),
+            plausibility_high: Self::default_plausibility_high(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
