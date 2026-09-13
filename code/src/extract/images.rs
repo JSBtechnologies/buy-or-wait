@@ -343,12 +343,15 @@ pub fn select(figures: &ImageFigures, event: &Event) -> Option<f64> {
         (EventType::Income, Status::Settled | Status::Scheduled) => {
             figures.net_pay.or(figures.total)
         }
-        // engine analyst audit RULES.md S5 image_12: prefer the labeled `total` over
-        // `amount_paid` for a settled expense. A receipt's "amount paid"/"cash" line can be
-        // the cash tendered (e.g. "Cash 35.00, Change 6.25" against a 28.75 total), which is
+        // bus topic bakeoff #16 (lead ruling, image_07): a distinctly-labeled Grand Total
+        // outranks a plain Total whenever the page prints both (image_07: "Total: 8,528.10"
+        // AND "Grand Total (RS): 8,528" -- the Grand Total is the amount actually paid).
+        // engine analyst audit RULES.md S5 image_12: below that, prefer the labeled `total`
+        // over `amount_paid` for a settled expense. A receipt's "amount paid"/"cash" line can
+        // be the cash tendered (e.g. "Cash 35.00, Change 6.25" against a 28.75 total), which is
         // not the expense amount; the printed total is the authoritative figure whenever
         // it's present, with amount_paid only as a fallback when no total is printed.
-        (_, Status::Settled) => figures.total.or(figures.amount_paid),
+        (_, Status::Settled) => figures.grand_total.or(figures.total).or(figures.amount_paid),
         (_, Status::Pending | Status::Scheduled) => select_pending_or_scheduled(figures, event),
         _ => figures.total,
     }
@@ -440,10 +443,23 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
     let mut any_ran = false;
     let mut any_passed = false;
 
-    if let (Some(sub), Some(tax), Some(total)) = (figures.subtotal, figures.tax, figures.total) {
-        any_ran = true;
-        if close(sub + tax, total, ROUNDING_TOLERANCE_2TERM) {
-            any_passed = true;
+    // bus topic bakeoff #18 (image_05): on a pending bill with a due-date cutoff split, the
+    // generic `total`/`amount_paid` identities below test the wrong slice of the document --
+    // `total` here is frequently a duplicate of `subtotal` (the pre-cutoff amount) rather than
+    // a taxed whole, and `amount_paid` can be an unrelated carried-forward balance, not a
+    // payment toward THIS bill. Once a cutoff is resolved, `select_pending_or_scheduled` never
+    // even reads `total`/`subtotal`/`tax`/`amount_paid` to pick the figure -- it comes entirely
+    // from `amount_due_by_cutoff`/`amount_due_after_cutoff`, corroborated by the witness gate's
+    // own `CutoffAfterExceedsWitnessedBefore` identity, not by these. Generic on the document
+    // SHAPE (has a cutoff), never on an image id.
+    let has_cutoff_split = figures.due_cutoff_date.is_some();
+
+    if !has_cutoff_split {
+        if let (Some(sub), Some(tax), Some(total)) = (figures.subtotal, figures.tax, figures.total) {
+            any_ran = true;
+            if close(sub + tax, total, ROUNDING_TOLERANCE_2TERM) {
+                any_passed = true;
+            }
         }
     }
     if let (Some(gross), Some(ded), Some(net)) = (figures.gross_pay, figures.deductions, figures.net_pay)
@@ -458,26 +474,28 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
     // construction, not a mismatch, regardless of what balance_due says. Only fall through
     // to the paid+balance_due=total identity when paid is actually less than total (a real
     // partial payment / balance-owed scenario).
-    if let (Some(paid), Some(total)) = (figures.amount_paid, figures.total) {
-        any_ran = true;
-        // analyst audit #200 FA1 (image_02): the paid>=total "cash tendered, change given"
-        // shortcut falsely accepted a misread where paid (1,000,000) trivially exceeded
-        // total but the page also printed a real, non-zero balance_due -- i.e. this was
-        // actually an outstanding-balance scenario, not a fully-paid-with-change one. The
-        // shortcut now requires balance_due to be absent or ~0 (nothing left owing) AND
-        // paid to stay within a plausible cash-tendered range (under 2x total -- change
-        // given is normally a fraction of the total, never several times it).
-        let balance_clears = figures.balance_due.map_or(true, |b| b.abs() <= ROUNDING_TOLERANCE_2TERM);
-        if paid + ROUNDING_TOLERANCE_2TERM >= total && balance_clears && paid < 2.0 * total {
-            any_passed = true;
-        } else if let Some(bal) = figures.balance_due {
-            if close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
+    if !has_cutoff_split {
+        if let (Some(paid), Some(total)) = (figures.amount_paid, figures.total) {
+            any_ran = true;
+            // analyst audit #200 FA1 (image_02): the paid>=total "cash tendered, change given"
+            // shortcut falsely accepted a misread where paid (1,000,000) trivially exceeded
+            // total but the page also printed a real, non-zero balance_due -- i.e. this was
+            // actually an outstanding-balance scenario, not a fully-paid-with-change one. The
+            // shortcut now requires balance_due to be absent or ~0 (nothing left owing) AND
+            // paid to stay within a plausible cash-tendered range (under 2x total -- change
+            // given is normally a fraction of the total, never several times it).
+            let balance_clears = figures.balance_due.map_or(true, |b| b.abs() <= ROUNDING_TOLERANCE_2TERM);
+            if paid + ROUNDING_TOLERANCE_2TERM >= total && balance_clears && paid < 2.0 * total {
                 any_passed = true;
+            } else if let Some(bal) = figures.balance_due {
+                if close(paid + bal, total, ROUNDING_TOLERANCE_2TERM) {
+                    any_passed = true;
+                }
             }
+            // else: paid < total and no balance_due stated -- this identity had enough data to
+            // attempt (paid, total) but not enough to confirm or reject the gap; left un-passed,
+            // same as a failed attempt, so it cannot by itself validate the figure.
         }
-        // else: paid < total and no balance_due stated -- this identity had enough data to
-        // attempt (paid, total) but not enough to confirm or reject the gap; left un-passed,
-        // same as a failed attempt, so it cannot by itself validate the figure.
     }
     // image_accuracy_plan.md §2: a breakdown that does NOT sum to the target is a note, never
     // a rejection (pages are often cut off) -- so this identity only ever sets `any_ran` when
@@ -778,6 +796,11 @@ pub struct ImageReadProvenance {
     /// or a witnessed cutoff relationship) that proved `selected_amount` on THIS read's own
     /// figures, if any. Only ever populated when `selected_amount.is_some()`.
     pub witness: Option<String>,
+    /// bus topic `bakeoff` #16/#18 (engine's `Fact::AmountWitness`): the witness identity's own
+    /// arithmetic/corroborating result, which is not always identical to `selected_amount`
+    /// (image_07: `selected_amount` = the Grand Total 8,528; `witness_computed` = the plain
+    /// Total's 8,528.10, which rounds to it). Only ever populated alongside `witness`.
+    pub witness_computed: Option<f64>,
     /// image_accuracy_plan.md §2: the first final-labeled field on THIS read's own figures
     /// that disagrees with `selected_amount` beyond tolerance, if any (`(field, value)` as
     /// `"field=value"`). A non-summing itemized breakdown is never reported here (module doc,
@@ -952,6 +975,7 @@ fn read_candidate(
         after_amount: None,
         error: None,
         witness: None,
+        witness_computed: None,
         contradiction: None,
     };
     match call_vlm(client, anthropic, cold, run_idx, prompt, decoding, pick.candidate, pick.max_tokens, image_b64) {
@@ -978,9 +1002,28 @@ fn read_candidate(
                     // figures, never across reads -- a non-summing breakdown never rejects
                     // (`find_witness` only ever reports a passing identity), and a real
                     // final-label contradiction is recorded for the caller to veto on.
-                    prov.witness = witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM)
-                        .map(|k| k.label().to_string());
-                    prov.contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM)
+                    //
+                    // bus topic bakeoff #16/#18 (image_02, image_05): `select_pending_or_
+                    // scheduled` never picks a whole-document `total`/`grand_total`/`net_pay`
+                    // -- a REMAINING-owed `balance_due`/`amount_due` (image_02) is legitimately
+                    // smaller than `total` (a partial payment already made), and a due-date-
+                    // cutoff-resolved before/after amount (image_05) makes even `balance_due`/
+                    // `amount_due` untrustworthy (observed: an unrelated carried-forward
+                    // figure) -- only the cutoff identity itself corroborates there.
+                    let scope = match event.status {
+                        Status::Pending | Status::Scheduled if prov.due_date.is_some() => {
+                            witness::FinalLabelScope::CutoffResolved
+                        }
+                        Status::Pending | Status::Scheduled => witness::FinalLabelScope::RemainingOwed,
+                        _ => witness::FinalLabelScope::Whole,
+                    };
+                    if let Some((kind, computed)) =
+                        witness::find_witness(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope)
+                    {
+                        prov.witness = Some(kind.label().to_string());
+                        prov.witness_computed = Some(computed);
+                    }
+                    prov.contradiction = witness::final_label_contradicts(&figures, amount, ROUNDING_TOLERANCE_2TERM, scope)
                         .map(|(field, value)| format!("{field}={value}"));
                 }
             }
@@ -1651,6 +1694,7 @@ mod tests {
             after_amount: None,
             error: None,
             witness: None,
+            witness_computed: None,
             contradiction: None,
         }
     }
@@ -1856,19 +1900,107 @@ mod tests {
             ("Qwen/Qwen3-VL-235B-A22B-Instruct", "deepinfra", "710c13861be6c466e66de3f484069440b8f31389", 1024u32),
             ("google/gemma-4-31B-it", "deepinfra", "842da3794eaa0b77d5f08bae87a17459d91ff475", 768u32),
         ];
-        for (id, provider, revision, dim) in candidates {
-            let candidate = CandidateConfig {
-                id: id.to_string(),
-                provider: provider.to_string(),
-                model_revision: revision.to_string(),
-                supports_structured_output: true,
-                role: None,
-            };
-            let b64 = downscale_and_encode(Path::new("../dataset/media/images/image_04.png"), dim)
+        for image_id in ["image_04", "image_05"] {
+            eprintln!("\n########## {image_id} ##########");
+            for (id, provider, revision, dim) in candidates {
+                let candidate = CandidateConfig {
+                    id: id.to_string(),
+                    provider: provider.to_string(),
+                    model_revision: revision.to_string(),
+                    supports_structured_output: true,
+                    role: None,
+                };
+                let b64 = downscale_and_encode(
+                    Path::new(&format!("../dataset/media/images/{image_id}.png")),
+                    dim,
+                )
                 .expect("downscale should succeed");
-            match call_vlm(&client, None, true, None, &prompt, &decoding, &candidate, decoding.max_tokens_vlm, &b64) {
-                Ok(figures) => eprintln!("=== {id}@{dim} ===\n{figures:#?}\n"),
-                Err(e) => eprintln!("=== {id}@{dim} ERROR ===\n{e:#}\n"),
+                match call_vlm(&client, None, true, None, &prompt, &decoding, &candidate, decoding.max_tokens_vlm, &b64) {
+                    Ok(figures) => eprintln!("=== {id}@{dim} ===\n{figures:#?}\n"),
+                    Err(e) => eprintln!("=== {id}@{dim} ERROR ===\n{e:#}\n"),
+                }
+            }
+        }
+    }
+
+    /// Debug-only live probe (bus topic `bakeoff` #6/#18, lead): live N=5 accepts 0/5 on
+    /// images 02/05/09/10/12/16 with no JSON parse errors (ruling out truncation) -- prints
+    /// each base reader's full `ImageReadProvenance` (reconciled, selected_amount, witness,
+    /// contradiction) against the REAL linked event from `dataset/financial_events.csv`, so the
+    /// exact reason the gate withholds a figure is visible directly. Not run by default:
+    /// `cargo test -- --ignored images_debug_02_05_no_agreement_live -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn images_debug_02_05_no_agreement_live() {
+        let prompt = crate::extract::prompts::load(
+            Path::new("prompts/image_transcription.v3.md"),
+            "User prompt template",
+        )
+        .expect("image_transcription.v3.md should parse");
+        let client = crate::hf::HfClient::with_cache_dir("store/debug_02_05_cache")
+            .expect("HF_TOKEN must be set");
+        let decoding = DecodingConfig { temperature: 0.0, seed: 42, max_tokens_vlm: 1400, max_tokens_llm: 300 };
+        let doc_validation = DocValidationConfig::default();
+        let qwen = CandidateConfig {
+            id: "Qwen/Qwen3-VL-235B-A22B-Instruct".to_string(),
+            provider: "deepinfra".to_string(),
+            model_revision: "710c13861be6c466e66de3f484069440b8f31389".to_string(),
+            supports_structured_output: true,
+            role: None,
+        };
+        let gemma = CandidateConfig {
+            id: "google/gemma-4-31B-it".to_string(),
+            provider: "deepinfra".to_string(),
+            model_revision: "842da3794eaa0b77d5f08bae87a17459d91ff475".to_string(),
+            supports_structured_output: true,
+            role: None,
+        };
+
+        // dataset/financial_events.csv, dataset/images.csv -- exact rows for image_02/image_05.
+        let image_02_event = Event {
+            id: "event_1442".into(),
+            event_type: EventType::Expense,
+            description: "Outstanding rent balance".into(),
+            category: "rent".into(),
+            direction: Direction::Debit,
+            amount: None,
+            currency: "INR".into(),
+            event_date: NaiveDate::from_ymd_opt(2023, 8, 11).unwrap(),
+            settlement_date: Some(NaiveDate::from_ymd_opt(2023, 8, 16).unwrap()),
+            status: Status::Scheduled,
+            linked_event_id: None,
+            flexibility: Flexibility::Fixed,
+            minimum_allowed_amount: None,
+        };
+        let image_05_event = Event {
+            id: "event_1786".into(),
+            event_type: EventType::Expense,
+            description: "Outstanding telecom bill".into(),
+            category: "utilities".into(),
+            direction: Direction::Debit,
+            amount: None,
+            currency: "INR".into(),
+            event_date: NaiveDate::from_ymd_opt(2026, 2, 6).unwrap(),
+            settlement_date: Some(NaiveDate::from_ymd_opt(2026, 2, 9).unwrap()),
+            status: Status::Pending,
+            linked_event_id: None,
+            flexibility: Flexibility::Fixed,
+            minimum_allowed_amount: None,
+        };
+
+        for (image_id, event) in [("image_02", &image_02_event), ("image_05", &image_05_event)] {
+            eprintln!("\n########## {image_id} ##########");
+            for (role, candidate, dim) in [("vlm_primary", &qwen, 1024u32), ("vlm_escalation", &gemma, 768u32)] {
+                let b64 = downscale_and_encode(
+                    Path::new(&format!("../dataset/media/images/{image_id}.png")),
+                    dim,
+                )
+                .expect("downscale should succeed");
+                let pick = ReaderPick { role, candidate, max_dim_px: dim, max_tokens: decoding.max_tokens_vlm };
+                let prov = read_candidate(
+                    &client, None, true, None, &prompt, &decoding, pick, &b64, image_id, event, &[], &doc_validation,
+                );
+                eprintln!("--- {role} ({}) ---\n{prov:#?}\n", candidate.id);
             }
         }
     }

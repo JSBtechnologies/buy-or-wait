@@ -1304,6 +1304,10 @@ struct LiveRunRow {
     reads_used: usize,
     normalized_figure: Option<f64>,
     witness: Option<String>,
+    /// bus topic `bakeoff` #16/#18: the witness identity's own arithmetic result, not always
+    /// identical to `normalized_figure` (image_07: figure = Grand Total 8,528, computed = the
+    /// plain Total's 8,528.10, which rounds to it).
+    witness_computed: Option<f64>,
     outcome: String,
     total_tokens: u64,
 }
@@ -1413,19 +1417,19 @@ fn run_live_n5(args: &Args) -> Result<()> {
                         #[allow(unreachable_patterns)]
                         _ => None,
                     });
-                    let witness = normalized_figure.and_then(|amt| {
+                    let witnessing_read = normalized_figure.and_then(|amt| {
                         resolution
                             .reads
                             .iter()
                             .find(|r| r.witness.is_some() && r.selected_amount.map(|a| (a - amt).abs() < 0.01).unwrap_or(false))
-                            .and_then(|r| r.witness.clone())
                     });
                     LiveRunRow {
                         image_id: target.image_id.clone(),
                         run_idx,
                         reads_used: resolution.reads.len(),
                         normalized_figure,
-                        witness,
+                        witness: witnessing_read.and_then(|r| r.witness.clone()),
+                        witness_computed: witnessing_read.and_then(|r| r.witness_computed),
                         outcome: resolution.outcome.clone(),
                         total_tokens,
                     }
@@ -1438,14 +1442,15 @@ fn run_live_n5(args: &Args) -> Result<()> {
                         reads_used: 0,
                         normalized_figure: None,
                         witness: None,
+                        witness_computed: None,
                         outcome: format!("error: {e:#}"),
                         total_tokens,
                     }
                 }
             };
             eprintln!(
-                "  [{}] run {}/{}: outcome={} figure={:?} witness={:?} reads={} tokens={}",
-                row.image_id, row.run_idx + 1, args.runs, row.outcome, row.normalized_figure, row.witness, row.reads_used, row.total_tokens
+                "  [{}] run {}/{}: outcome={} figure={:?} witness={:?} computed={:?} reads={} tokens={}",
+                row.image_id, row.run_idx + 1, args.runs, row.outcome, row.normalized_figure, row.witness, row.witness_computed, row.reads_used, row.total_tokens
             );
             rows.push(row);
         }
@@ -1497,8 +1502,8 @@ fn render_live_n5_section(rows: &[LiveRunRow], stability: &[(String, bool, usize
          prompt v3, {runs} runs per image, no cache replay (every raw response persisted per \
          run). 0 wrong figures and images 02/05/10/11 accepted 5/5 are the Phase A DONE gate.\n\n"
     ));
-    s.push_str("| image_id | stable 5/5 | accepted/total | figure (if accepted) | witness (last accepted run) |\n");
-    s.push_str("|---|---|---|---|---|\n");
+    s.push_str("| image_id | stable 5/5 | accepted/total | figure (if accepted) | witness (last accepted run) | computed |\n");
+    s.push_str("|---|---|---|---|---|---|\n");
     for (image_id, stable, accepted, total) in stability {
         let last_accept = rows
             .iter()
@@ -1506,22 +1511,24 @@ fn render_live_n5_section(rows: &[LiveRunRow], stability: &[(String, bool, usize
             .next_back();
         let figure = last_accept.and_then(|r| r.normalized_figure).map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string());
         let witness = last_accept.and_then(|r| r.witness.clone()).unwrap_or_else(|| "—".to_string());
+        let computed = last_accept.and_then(|r| r.witness_computed).map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string());
         s.push_str(&format!(
-            "| {image_id} | {} | {accepted}/{total} | {figure} | {witness} |\n",
+            "| {image_id} | {} | {accepted}/{total} | {figure} | {witness} | {computed} |\n",
             if *stable { "yes" } else { "NO" }
         ));
     }
     s.push_str("\n### Per image × run detail\n\n");
-    s.push_str("| image_id | run | reads used | normalized figure | witness | outcome | tokens |\n");
-    s.push_str("|---|---|---|---|---|---|---|\n");
+    s.push_str("| image_id | run | reads used | normalized figure | witness | computed | outcome | tokens |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|\n");
     for row in rows {
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             row.image_id,
             row.run_idx + 1,
             row.reads_used,
             row.normalized_figure.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
             row.witness.clone().unwrap_or_else(|| "—".to_string()),
+            row.witness_computed.map(|f| format!("{f:.2}")).unwrap_or_else(|| "—".to_string()),
             row.outcome,
             row.total_tokens,
         ));

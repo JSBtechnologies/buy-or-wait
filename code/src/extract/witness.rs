@@ -151,18 +151,45 @@ impl WitnessKind {
     }
 }
 
-/// Every final-labeled field this dataset's documents print (Total, Grand Total, Total
-/// paid/Amount Payable/Balance/Balance Due -> `amount_due`/`balance_due`, Net Pay). Deliberately
-/// excludes `amount_paid` (see module doc) and `previous_balance` (a carry-forward figure, not
-/// this document's own final amount).
-fn final_label_fields(figures: &ImageFigures) -> [(&'static str, Option<f64>); 5] {
-    [
-        ("total", figures.total),
-        ("grand_total", figures.grand_total),
-        ("amount_due", figures.amount_due),
-        ("balance_due", figures.balance_due),
-        ("net_pay", figures.net_pay),
-    ]
+/// Which final-labeled fields are trustworthy corroboration/contradiction for `target`,
+/// depending on how `extract::images::select` chose it (bus topic `bakeoff` #16/#18, images
+/// 02/05). Computed by the caller from the event's status and whether this read resolved a
+/// due-date cutoff -- never from an image id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalLabelScope {
+    /// `target` is meant to be the document's WHOLE final amount (a settled expense/income, or
+    /// the default `_ => total` selection) -- every final-labeled field applies normally.
+    Whole,
+    /// `target` is a REMAINING-owed `balance_due`/`amount_due` on a pending/scheduled bill with
+    /// no due-date cutoff (image_02) -- `total`/`grand_total`/`net_pay` legitimately differ (a
+    /// partial payment already made) and neither corroborate nor contradict it.
+    RemainingOwed,
+    /// `target` is a due-date-cutoff-resolved before/after amount (image_05) -- NONE of the
+    /// generic final-labeled fields are trustworthy here (observed: `total` duplicated from the
+    /// pre-cutoff subtotal, `balance_due`/`amount_due` an unrelated carried-forward figure);
+    /// only the cutoff identity itself (`WitnessKind::CutoffAfterExceedsWitnessedBefore`)
+    /// corroborates, and nothing here can contradict it.
+    CutoffResolved,
+}
+
+/// Every final-labeled field this dataset's documents print, filtered to what `scope` says is
+/// trustworthy for `target` (Total, Grand Total, Total paid/Amount Payable/Balance/Balance Due
+/// -> `amount_due`/`balance_due`, Net Pay). Deliberately excludes `amount_paid` (see module doc)
+/// and `previous_balance` (a carry-forward figure, not this document's own final amount).
+fn final_label_fields(figures: &ImageFigures, scope: FinalLabelScope) -> Vec<(&'static str, Option<f64>)> {
+    match scope {
+        FinalLabelScope::CutoffResolved => vec![],
+        FinalLabelScope::RemainingOwed => {
+            vec![("amount_due", figures.amount_due), ("balance_due", figures.balance_due)]
+        }
+        FinalLabelScope::Whole => vec![
+            ("total", figures.total),
+            ("grand_total", figures.grand_total),
+            ("amount_due", figures.amount_due),
+            ("balance_due", figures.balance_due),
+            ("net_pay", figures.net_pay),
+        ],
+    }
 }
 
 /// True when `target` is exactly the page's own `subtotal` (bus topic `bakeoff` #6, lead
@@ -173,8 +200,14 @@ fn final_label_fields(figures: &ImageFigures) -> [(&'static str, Option<f64>); 5
 /// -- a partially-visible delivery fee below the crop -- never read). Generic on the VALUE
 /// relationship, never on an image id: whenever `target` and `subtotal` coincide, an item-sum
 /// witness contributes nothing, regardless of which image it came from.
-fn target_is_bare_subtotal(figures: &ImageFigures, target: f64, tolerance: f64) -> bool {
-    figures.subtotal.is_some_and(|s| approx_eq(s, target, tolerance))
+///
+/// Only applies to `FinalLabelScope::Whole` (bus topic `bakeoff` #18, image_05): a pending/
+/// scheduled bill's before-cutoff amount IS legitimately the page's own subtotal by
+/// construction (the amount owed before any late fee applies) -- that is the intended witness
+/// (image_accuracy_plan.md §3: "580.65+16.00+107.40 proves 704.05"), not the image_04
+/// duplicated-into-`total` failure mode this guard exists for.
+fn target_is_bare_subtotal(figures: &ImageFigures, target: f64, tolerance: f64, scope: FinalLabelScope) -> bool {
+    scope == FinalLabelScope::Whole && figures.subtotal.is_some_and(|s| approx_eq(s, target, tolerance))
 }
 
 /// At least one independent identity that proves `target`, beyond the bare fact that two reads
@@ -183,29 +216,44 @@ fn target_is_bare_subtotal(figures: &ImageFigures, target: f64, tolerance: f64) 
 /// subtotal or item bill is never itself promoted to the event amount (module doc,
 /// `target_is_bare_subtotal`) -- an item-sum witness only counts when it proves a genuine
 /// final-labeled figure distinct from the bare subtotal.
-pub fn find_witness(figures: &ImageFigures, target: f64, tolerance: f64) -> Option<WitnessKind> {
-    if !figures.line_items.is_empty() && !target_is_bare_subtotal(figures, target, tolerance) {
+///
+/// Returns `(kind, computed)`: `computed` is the identity's own arithmetic/corroborating result
+/// (bus topic `bakeoff` #16/#18, engine's `Fact::AmountWitness`) -- usually within `tolerance`
+/// of `target` but not always identical to it (image_07: `target` = the Grand Total 8,528;
+/// `computed` = the plain Total's 8,528.10, which rounds to it). Never itself a contradiction
+/// (`final_label_contradicts` already tolerates the same rounding gap): a printed Total that
+/// rounds to a distinct Grand Total is exactly what `RepeatedFinalLabel` treats as corroboration.
+pub fn find_witness(
+    figures: &ImageFigures,
+    target: f64,
+    tolerance: f64,
+    scope: FinalLabelScope,
+) -> Option<(WitnessKind, f64)> {
+    if !figures.line_items.is_empty() && !target_is_bare_subtotal(figures, target, tolerance, scope) {
         let sum: f64 = figures.line_items.iter().sum();
         if approx_eq(sum, target, tolerance) {
-            return Some(WitnessKind::LineItemSum);
+            return Some((WitnessKind::LineItemSum, sum));
         }
     }
     if let Some(subtotal) = figures.subtotal {
         if !figures.charges_breakdown.is_empty() {
             let charges: f64 = figures.charges_breakdown.iter().sum();
-            if approx_eq(subtotal + charges, target, tolerance) {
-                return Some(WitnessKind::SubtotalPlusCharges);
+            let computed = subtotal + charges;
+            if approx_eq(computed, target, tolerance) {
+                return Some((WitnessKind::SubtotalPlusCharges, computed));
             }
         }
     }
     if let (Some(sub), Some(tax)) = (figures.subtotal, figures.tax) {
-        if approx_eq(sub + tax, target, tolerance) {
-            return Some(WitnessKind::SubtotalPlusTax);
+        let computed = sub + tax;
+        if approx_eq(computed, target, tolerance) {
+            return Some((WitnessKind::SubtotalPlusTax, computed));
         }
     }
     if let (Some(gross), Some(ded)) = (figures.gross_pay, figures.deductions) {
-        if approx_eq(gross - ded, target, tolerance) {
-            return Some(WitnessKind::GrossMinusDeductions);
+        let computed = gross - ded;
+        if approx_eq(computed, target, tolerance) {
+            return Some((WitnessKind::GrossMinusDeductions, computed));
         }
     }
     // Both `paid + balance = total` and `total - paid = balance` are the same underlying
@@ -214,32 +262,37 @@ pub fn find_witness(figures: &ImageFigures, target: f64, tolerance: f64) -> Opti
     // field is equal to itself; that degenerate case is `RepeatedFinalLabel`'s job instead
     // (image_accuracy_plan.md §3 image_11: amount_paid = 0, target = 3,650).
     if let (Some(paid), Some(balance)) = (figures.amount_paid, figures.balance_due) {
-        if paid > tolerance && approx_eq(paid + balance, target, tolerance) {
-            return Some(WitnessKind::PaidPlusBalance);
+        let computed = paid + balance;
+        if paid > tolerance && approx_eq(computed, target, tolerance) {
+            return Some((WitnessKind::PaidPlusBalance, computed));
         }
     }
     if let (Some(total), Some(paid)) = (figures.total, figures.amount_paid) {
-        if paid > tolerance && approx_eq(total - paid, target, tolerance) {
-            return Some(WitnessKind::TotalMinusPaid);
+        let computed = total - paid;
+        if paid > tolerance && approx_eq(computed, target, tolerance) {
+            return Some((WitnessKind::TotalMinusPaid, computed));
         }
     }
     if let Some(words) = figures.amount_in_words.as_deref() {
         if let Some(n) = words_to_number(words) {
             if approx_eq(n, target, tolerance) {
-                return Some(WitnessKind::AmountInWords);
+                return Some((WitnessKind::AmountInWords, n));
             }
         }
     }
     // The same final amount repeated under a second final label (e.g. image_11: Total Bill
-    // Amount = Amount Payable = Balance, all 3,650) -- needs at least two DISTINCT final-label
-    // fields to actually equal the target, not just one.
-    let repeats = final_label_fields(figures)
+    // Amount = Amount Payable = Balance, all 3,650; image_07: Total 8,528.10 rounds to Grand
+    // Total 8,528) -- needs at least two DISTINCT final-label fields to actually equal the
+    // target, not just one. `computed` surfaces a genuinely different corroborating value when
+    // one exists, else the corroborating value is identical to `target`.
+    let matches: Vec<f64> = final_label_fields(figures, scope)
         .into_iter()
         .filter_map(|(_, v)| v)
         .filter(|v| approx_eq(*v, target, tolerance))
-        .count();
-    if repeats >= 2 {
-        return Some(WitnessKind::RepeatedFinalLabel);
+        .collect();
+    if matches.len() >= 2 {
+        let computed = matches.iter().find(|v| !approx_eq(**v, target, 1e-9)).copied().unwrap_or(target);
+        return Some((WitnessKind::RepeatedFinalLabel, computed));
     }
     // image_accuracy_plan.md §3 image_05: the after-cutoff figure is proven by exceeding an
     // independently witnessed before-cutoff figure (a late fee is a knowable positive delta),
@@ -250,9 +303,9 @@ pub fn find_witness(figures: &ImageFigures, target: f64, tolerance: f64) -> Opti
     ) {
         if approx_eq(after, target, tolerance)
             && after > before
-            && find_witness(figures, before, tolerance).is_some()
+            && find_witness(figures, before, tolerance, scope).is_some()
         {
-            return Some(WitnessKind::CutoffAfterExceedsWitnessedBefore);
+            return Some((WitnessKind::CutoffAfterExceedsWitnessedBefore, after));
         }
     }
     None
@@ -261,8 +314,14 @@ pub fn find_witness(figures: &ImageFigures, target: f64, tolerance: f64) -> Opti
 /// `Some((field name, its value))` for the first final-labeled field that disagrees with
 /// `target` beyond tolerance -- a real contradiction, per module doc. `None` means every
 /// final-labeled field present either agrees with `target` or wasn't printed at all.
-pub fn final_label_contradicts(figures: &ImageFigures, target: f64, tolerance: f64) -> Option<(&'static str, f64)> {
-    final_label_fields(figures)
+/// `scope`: see `final_label_fields`/`FinalLabelScope`.
+pub fn final_label_contradicts(
+    figures: &ImageFigures,
+    target: f64,
+    tolerance: f64,
+    scope: FinalLabelScope,
+) -> Option<(&'static str, f64)> {
+    final_label_fields(figures, scope)
         .into_iter()
         .find_map(|(name, v)| v.filter(|v| !approx_eq(*v, target, tolerance)).map(|v| (name, v)))
 }
@@ -317,7 +376,7 @@ mod tests {
             f.amount_paid = Some(100_000.0);
             f.balance_due = Some(100_000.0);
         });
-        assert_eq!(find_witness(&figures, 100_000.0, WITNESS_TOLERANCE), Some(WitnessKind::TotalMinusPaid));
+        assert_eq!(find_witness(&figures, 100_000.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), Some((WitnessKind::TotalMinusPaid, 100_000.0)));
     }
 
     /// bus topic `bakeoff` #6 (lead ruling, image_04): a cropped page can duplicate its
@@ -332,8 +391,8 @@ mod tests {
             f.total = Some(2854.0); // the model duplicated subtotal into total (cropped page)
             f.line_items = vec![95.0, 531.0, 0.0, 186.0, 122.0, 464.0, 184.0, 144.0, 75.0, 366.0, 190.0, 121.0, 376.0];
         });
-        assert_eq!(find_witness(&figures, 2854.0, WITNESS_TOLERANCE), None);
-        assert!(target_is_bare_subtotal(&figures, 2854.0, WITNESS_TOLERANCE));
+        assert_eq!(find_witness(&figures, 2854.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), None);
+        assert!(target_is_bare_subtotal(&figures, 2854.0, WITNESS_TOLERANCE, FinalLabelScope::Whole));
     }
 
     /// When the line items themselves include a further charge beyond the subtotal (e.g. a
@@ -348,7 +407,7 @@ mod tests {
             items.push(16.0); // the delivery fee, itself printed as a line item
             f.line_items = items;
         });
-        assert_eq!(find_witness(&figures, 2870.0, WITNESS_TOLERANCE), Some(WitnessKind::LineItemSum));
+        assert_eq!(find_witness(&figures, 2870.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), Some((WitnessKind::LineItemSum, 2870.0)));
     }
 
     /// image_accuracy_plan.md §3 image_07: round(8,122 + 203.05 + 203.05) = round(8,528.10) ~=
@@ -358,7 +417,9 @@ mod tests {
         let figures = figures_with(|f| {
             f.line_items = vec![8122.0, 203.05, 203.05];
         });
-        assert_eq!(find_witness(&figures, 8528.0, WITNESS_TOLERANCE), Some(WitnessKind::LineItemSum));
+        let (kind, computed) = find_witness(&figures, 8528.0, WITNESS_TOLERANCE, FinalLabelScope::Whole).expect("should witness");
+        assert_eq!(kind, WitnessKind::LineItemSum);
+        assert!((computed - 8528.10).abs() < 1e-6);
     }
 
     /// image_accuracy_plan.md §3 image_11: Total Bill Amount = Amount Payable = Balance = 3,650
@@ -375,8 +436,8 @@ mod tests {
             // must not cause `find_witness` to reject; it just isn't itself the proof.
             f.line_items = vec![500.0];
         });
-        assert_eq!(find_witness(&figures, 3650.0, WITNESS_TOLERANCE), Some(WitnessKind::RepeatedFinalLabel));
-        assert_eq!(final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE), None);
+        assert_eq!(find_witness(&figures, 3650.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), Some((WitnessKind::RepeatedFinalLabel, 3650.0)));
+        assert_eq!(final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), None);
     }
 
     /// image_accuracy_plan.md §3 image_12: 28.50 + 5.00 witnesses 33.50; cash tendered (40.00)
@@ -386,7 +447,7 @@ mod tests {
         let figures = figures_with(|f| {
             f.line_items = vec![28.50, 5.00];
         });
-        assert_eq!(find_witness(&figures, 33.50, WITNESS_TOLERANCE), Some(WitnessKind::LineItemSum));
+        assert_eq!(find_witness(&figures, 33.50, WITNESS_TOLERANCE, FinalLabelScope::Whole), Some((WitnessKind::LineItemSum, 33.50)));
     }
 
     /// image_accuracy_plan.md §3 image_05: 822.05 (after cutoff) is proven by exceeding the
@@ -399,8 +460,8 @@ mod tests {
             f.amount_due_after_cutoff = Some(822.05);
         });
         assert_eq!(
-            find_witness(&figures, 822.05, WITNESS_TOLERANCE),
-            Some(WitnessKind::CutoffAfterExceedsWitnessedBefore)
+            find_witness(&figures, 822.05, WITNESS_TOLERANCE, FinalLabelScope::CutoffResolved),
+            Some((WitnessKind::CutoffAfterExceedsWitnessedBefore, 822.05))
         );
     }
 
@@ -411,7 +472,7 @@ mod tests {
             f.total = Some(9999.0);
         });
         assert_eq!(
-            final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE),
+            final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE, FinalLabelScope::Whole),
             Some(("total", 9999.0))
         );
     }
@@ -425,7 +486,7 @@ mod tests {
             f.total = Some(3650.0);
             f.amount_paid = Some(0.0);
         });
-        assert_eq!(final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE), None);
+        assert_eq!(final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), None);
     }
 
     /// A non-summing line-item breakdown alone (no other identity, no final-label match) simply
@@ -435,7 +496,53 @@ mod tests {
         let figures = figures_with(|f| {
             f.line_items = vec![500.0];
         });
-        assert_eq!(find_witness(&figures, 3650.0, WITNESS_TOLERANCE), None);
-        assert_eq!(final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE), None);
+        assert_eq!(find_witness(&figures, 3650.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), None);
+        assert_eq!(final_label_contradicts(&figures, 3650.0, WITNESS_TOLERANCE, FinalLabelScope::Whole), None);
+    }
+
+    /// bus topic `bakeoff` #16 (lead ruling, image_02): a REMAINING-owed balance_due naturally
+    /// differs from `total` (a partial payment already made) -- `total` disagreeing with it is
+    /// not a contradiction under `FinalLabelScope::RemainingOwed`, and `total_minus_paid` still
+    /// witnesses the balance directly.
+    #[test]
+    fn total_never_contradicts_a_pending_scheduled_balance_due() {
+        let figures = figures_with(|f| {
+            f.total = Some(200_000.0);
+            f.amount_paid = Some(100_000.0);
+            f.balance_due = Some(100_000.0);
+            f.amount_due = Some(100_000.0);
+        });
+        assert_eq!(
+            final_label_contradicts(&figures, 100_000.0, WITNESS_TOLERANCE, FinalLabelScope::RemainingOwed),
+            None
+        );
+        let (kind, _) = find_witness(&figures, 100_000.0, WITNESS_TOLERANCE, FinalLabelScope::RemainingOwed)
+            .expect("should witness");
+        assert!(matches!(kind, WitnessKind::TotalMinusPaid | WitnessKind::RepeatedFinalLabel));
+    }
+
+    /// bus topic `bakeoff` #18 (image_05): the after-cutoff amount naturally differs from a
+    /// `total` field the model duplicated from the pre-cutoff subtotal, and `balance_due`/
+    /// `amount_due` may be an unrelated carried-forward figure -- neither contradicts under
+    /// `FinalLabelScope::CutoffResolved`.
+    #[test]
+    fn total_never_contradicts_a_resolved_cutoff_amount() {
+        let figures = figures_with(|f| {
+            f.subtotal = Some(704.05);
+            f.tax = Some(107.4);
+            f.total = Some(704.05); // duplicated from subtotal, unrelated to the after-cutoff figure
+            f.balance_due = Some(0.0); // an unrelated carried-forward figure, not the after-cutoff amount
+            f.amount_due_by_cutoff = Some(704.05);
+            f.amount_due_after_cutoff = Some(822.05);
+            f.line_items = vec![580.65, 16.0, 107.4];
+        });
+        assert_eq!(
+            final_label_contradicts(&figures, 822.05, WITNESS_TOLERANCE, FinalLabelScope::CutoffResolved),
+            None
+        );
+        assert_eq!(
+            find_witness(&figures, 822.05, WITNESS_TOLERANCE, FinalLabelScope::CutoffResolved),
+            Some((WitnessKind::CutoffAfterExceedsWitnessedBefore, 822.05))
+        );
     }
 }
