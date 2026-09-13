@@ -576,6 +576,7 @@ fn image_call(
         seed: cfg.seed,
         max_tokens: cfg.max_tokens_vlm,
         json_response: candidate.supports_structured_output,
+        json_schema: None,
     };
     // Rescore mode (--rescore-from-cache): read the existing cache, never
     // call the router. Used to re-run select()/reconciles() against
@@ -841,6 +842,7 @@ fn run_llm_candidate(
             // per-user batch is far smaller and uses the config default.
             max_tokens: 6000,
             json_response: candidate.supports_structured_output,
+            json_schema: None,
         };
         let resp = match client.chat_completion_cold(&call) {
             Ok(resp) => {

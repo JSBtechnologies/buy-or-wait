@@ -258,3 +258,96 @@ context_length = 1048576
 pricing_usd_per_m_tokens = { input = 1.20, output = 4.00 }
 supports_structured_output = true
 notes = "Text-only frontier alternative, different lineage from DeepSeek (diversifies the fallback away from a single vendor's outage risk). novita/together/baseten also live, structured-output present on novita/baseten/deepinfra."
+
+# ---------------------------------------------------------------------------
+# USER DECISION (board decision.vlm_setup, 2026-09-12): VLM picked, LLM still
+# undecided (msg_86 only in production — see docs/bakeoff.md "LLM candidates").
+#
+# NOT MERGE-ANNOUNCED YET: committed on ml-engineer's branch only. Setting
+# `[selected]` activates live model calls (extract/model_config.rs resolves
+# these into real HfClient calls the moment this file is merged/read by the
+# pipeline) — hold the bus "done" announcement until extraction's
+# `vlm_mode = "agreement"` handling lands. Today's extract/model_config.rs
+# only implements primary -> escalation-on-reconciliation-failure ->
+# fallback-on-error; it has no cross-model agreement/voting code path yet
+# and does not even parse a `vlm_mode` key (present here as a forward
+# declaration, currently inert/ignored by extraction's Selected struct).
+#
+# KNOWN SCHEMA GAP: vlm_primary and vlm_escalation were bake-off-screened at
+# DIFFERENT resolutions (1024px and 768px respectively — see docs/bakeoff.md),
+# but extract/model_config.rs's `Selected` only has one global
+# `image_max_dim_px`, not a per-role value. Set below to vlm_primary's
+# resolution (1024px); vlm_escalation would run at 1024px too until
+# extraction adds a per-role field, not its own screened 768px. Flagging
+# for extraction, not deciding this myself.
+# ---------------------------------------------------------------------------
+
+[selected]
+vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
+vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px (see schema-gap note above)
+vlm_fallback = "moonshotai/Kimi-K3"                  # from [[fallback.candidates]] -- FAILS the backup gate (docs/bakeoff.md "Backup models"); left as-is per lead's instruction to hold [selected] unannounced until credits are back and verifier/analyst confirm the replacement
+vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
+image_max_dim_px = 1024
+
+# ---------------------------------------------------------------------------
+# Per-event-class VLM reader routing (extraction 32c17d5, board decision
+# decision.vlm_setup / decision.tiebreak_distinct). Written EXPLICITLY here
+# rather than relying on extract/model_config.rs's Rust `Default` — the user
+# wants routing tunable in shipped config, and the verifier's gate validates
+# against this table, not the Rust fallback. Mirrors that Default exactly;
+# posted on bus topic `extract` for extraction/verifier to confirm.
+#
+# A linked event classifies by event_type/status/category (never the
+# model's own free-text doc_type — analyst audit #184/#194 found doc_type
+# unreliable, the event row is not) into one of the classes below, in
+# order, first match wins; `default_class` is used when nothing matches.
+# Each class names exactly 2 readers by role ("vlm_primary" |
+# "vlm_escalation" | "vlm_fallback", resolved against `[selected]` above).
+# `max_dim_px`/`max_tokens` per reader come from ml-engineer's bake-off
+# (PLAN.md §2.11: a different px changes the cache key, silently forcing a
+# new paid call instead of a cache hit; max_tokens=1500 vs the ~400 decoding
+# default is the fix for Kimi-K3 as a thinking model, PLAN.md §3 -- see
+# docs/bakeoff.md "Backup models" for the probe evidence).
+#
+# `pending_bill_due_date` excludes gemma-4-31B-it as escalation reader:
+# analyst's pre-audit (board:verify.image_agree_preaudit) found it drops
+# due-date fields on that document shape 4/4, silently falling back to the
+# pre-cutoff amount even when the correct, later, larger figure applies
+# (image_05) -- so that class routes to vlm_fallback (Kimi-K3) instead. Note
+# this pairing depends on vlm_fallback passing the backup gate above, which
+# it currently does not; the class is written to match extraction's
+# Default exactly and needs revisiting once a passing fallback is chosen.
+# ---------------------------------------------------------------------------
+
+[vlm_routing]
+default_class = "settled_expense_receipt"
+
+[[vlm_routing.classes]]
+name = "income_payslip"
+event_types = ["income"]
+statuses = []
+categories = []
+readers = [
+  { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
+  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
+]
+
+[[vlm_routing.classes]]
+name = "pending_bill_due_date"
+event_types = []
+statuses = ["pending", "scheduled"]
+categories = []
+readers = [
+  { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
+  { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 1500 },
+]
+
+[[vlm_routing.classes]]
+name = "settled_expense_receipt"
+event_types = []
+statuses = ["settled"]
+categories = []
+readers = [
+  { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 },
+  { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 },
+]
