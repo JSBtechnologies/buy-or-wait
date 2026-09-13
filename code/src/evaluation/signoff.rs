@@ -149,11 +149,12 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
         }
     }
 
-    // Board decision.vlm_setup: image amounts only on 2-model agreement (or fallback tiebreak).
+    // Image amounts only through the witness gate (OCR / witness modes) or, for legacy routed
+    // provenance, [vlm_routing] agreement; no Claude dependency (RULES.md S8).
     match super::image_agreement::check(&repo_for_code.join("code"), dataset_dir, &repo_for_code.join("code/config/models.toml")) {
         Err(e) => {
             gate_ran = false;
-            s.check("image amounts: 2-model agreement", false, format!("could not run: {e}"))
+            s.check("image amounts: witness gate", false, format!("could not run: {e}"))
         }
         Ok(f) => {
             collect(&f, &mut false_accepts);
@@ -161,7 +162,7 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
                 .map(|rd| rd.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).map(|t| t.matches("\"EventAmount\"").count()).sum::<usize>())
                 .unwrap_or(0);
             s.check(
-                "image amounts: routed agreement per [vlm_routing] (decision.vlm_setup)",
+                "image amounts: witness gate re-derived from persisted reads (IA*)",
                 f.is_empty(),
                 if f.is_empty() { format!("ok; {image_facts} EventAmount facts in persisted evidence") } else { f.iter().take(8).map(|x| x.to_string()).collect::<Vec<_>>().join(" | ") },
             );
@@ -191,6 +192,11 @@ pub fn run(dataset_dir: &Path, output: &Path, usage: &Path, rerun: Option<&Path>
             format!("{} false accepts: {}", false_accepts.len(), false_accepts.join(" | "))
         },
     );
+
+    match super::false_accepts::cash_moving_unaccepted(&repo_for_code.join("code"), repo_for_code, dataset_dir) {
+        Err(e) => s.check("cash-moving images accepted (pending/scheduled)", false, format!("could not run: {e}")),
+        Ok(missing) => s.check("cash-moving images accepted (pending/scheduled)", missing.is_empty(), if missing.is_empty() { "all accepted".to_string() } else { format!("not accepted: {missing:?}") }),
+    }
 
     // Engine-backed stage: re-run the batch path and check what the file alone cannot show.
     match super::mirror::run(dataset_dir, &dataset_dir.join("requests.csv"), &rows) {
