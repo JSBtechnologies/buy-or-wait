@@ -1834,4 +1834,42 @@ mod tests {
             other => panic!("expected EventAmount, got {other:?}"),
         }
     }
+
+    /// Debug-only live probe (bus topic `bakeoff` #6, lead): the live N=5 sweep accepted
+    /// image_04 at 2,854.0 on 3/5 runs via `line_item_sum`, which RULES.md S8 says must fail
+    /// closed 5/5 (cropped, history-only). Prints both base readers' raw `ImageFigures` so the
+    /// specific field(s) the witness gate trusted can be inspected directly, rather than
+    /// guessing from the summary table alone. Not run by default:
+    /// `cargo test -- --ignored image_04_debug_raw_figures_live -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn image_04_debug_raw_figures_live() {
+        let prompt = crate::extract::prompts::load(
+            Path::new("prompts/image_transcription.v3.md"),
+            "User prompt template",
+        )
+        .expect("image_transcription.v3.md should parse");
+        let client = crate::hf::HfClient::with_cache_dir("store/debug_image_04_cache")
+            .expect("HF_TOKEN must be set");
+        let decoding = DecodingConfig { temperature: 0.0, seed: 42, max_tokens_vlm: 1400, max_tokens_llm: 300 };
+        let candidates = [
+            ("Qwen/Qwen3-VL-235B-A22B-Instruct", "deepinfra", "710c13861be6c466e66de3f484069440b8f31389", 1024u32),
+            ("google/gemma-4-31B-it", "deepinfra", "842da3794eaa0b77d5f08bae87a17459d91ff475", 768u32),
+        ];
+        for (id, provider, revision, dim) in candidates {
+            let candidate = CandidateConfig {
+                id: id.to_string(),
+                provider: provider.to_string(),
+                model_revision: revision.to_string(),
+                supports_structured_output: true,
+                role: None,
+            };
+            let b64 = downscale_and_encode(Path::new("../dataset/media/images/image_04.png"), dim)
+                .expect("downscale should succeed");
+            match call_vlm(&client, None, true, None, &prompt, &decoding, &candidate, decoding.max_tokens_vlm, &b64) {
+                Ok(figures) => eprintln!("=== {id}@{dim} ===\n{figures:#?}\n"),
+                Err(e) => eprintln!("=== {id}@{dim} ERROR ===\n{e:#}\n"),
+            }
+        }
+    }
 }

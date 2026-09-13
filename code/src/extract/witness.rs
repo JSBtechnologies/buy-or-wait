@@ -165,11 +165,26 @@ fn final_label_fields(figures: &ImageFigures) -> [(&'static str, Option<f64>); 5
     ]
 }
 
+/// True when `target` is exactly the page's own `subtotal` (bus topic `bakeoff` #6, lead
+/// ruling, image_04): a line-item sum only ever proves the SUBTOTAL by construction -- it is
+/// never by itself proof of a genuinely distinct final total. A cropped or otherwise
+/// incomplete page can have the model duplicate its subtotal into the `total` field with
+/// nothing left to distinguish the two (image_04: `total = subtotal = 2,854`, the real total
+/// -- a partially-visible delivery fee below the crop -- never read). Generic on the VALUE
+/// relationship, never on an image id: whenever `target` and `subtotal` coincide, an item-sum
+/// witness contributes nothing, regardless of which image it came from.
+fn target_is_bare_subtotal(figures: &ImageFigures, target: f64, tolerance: f64) -> bool {
+    figures.subtotal.is_some_and(|s| approx_eq(s, target, tolerance))
+}
+
 /// At least one independent identity that proves `target`, beyond the bare fact that two reads
 /// picked the same number. Only ever returns a PASSING identity (see module doc: a non-summing
-/// breakdown is never itself checked here as a failure, it simply contributes no witness).
+/// breakdown is never itself checked here as a failure, it simply contributes no witness). A
+/// subtotal or item bill is never itself promoted to the event amount (module doc,
+/// `target_is_bare_subtotal`) -- an item-sum witness only counts when it proves a genuine
+/// final-labeled figure distinct from the bare subtotal.
 pub fn find_witness(figures: &ImageFigures, target: f64, tolerance: f64) -> Option<WitnessKind> {
-    if !figures.line_items.is_empty() {
+    if !figures.line_items.is_empty() && !target_is_bare_subtotal(figures, target, tolerance) {
         let sum: f64 = figures.line_items.iter().sum();
         if approx_eq(sum, target, tolerance) {
             return Some(WitnessKind::LineItemSum);
@@ -303,6 +318,37 @@ mod tests {
             f.balance_due = Some(100_000.0);
         });
         assert_eq!(find_witness(&figures, 100_000.0, WITNESS_TOLERANCE), Some(WitnessKind::TotalMinusPaid));
+    }
+
+    /// bus topic `bakeoff` #6 (lead ruling, image_04): a cropped page can duplicate its
+    /// subtotal into `total`, with the line items summing to exactly that same value -- an
+    /// item-sum witness must NOT confirm this, since it only ever proves the subtotal, never a
+    /// genuinely distinct final total. With no other final-labeled field to corroborate it,
+    /// `find_witness` must return `None` (fail closed), not `LineItemSum`.
+    #[test]
+    fn line_item_sum_never_promotes_a_bare_subtotal_to_the_event_amount() {
+        let figures = figures_with(|f| {
+            f.subtotal = Some(2854.0);
+            f.total = Some(2854.0); // the model duplicated subtotal into total (cropped page)
+            f.line_items = vec![95.0, 531.0, 0.0, 186.0, 122.0, 464.0, 184.0, 144.0, 75.0, 366.0, 190.0, 121.0, 376.0];
+        });
+        assert_eq!(find_witness(&figures, 2854.0, WITNESS_TOLERANCE), None);
+        assert!(target_is_bare_subtotal(&figures, 2854.0, WITNESS_TOLERANCE));
+    }
+
+    /// When the line items themselves include a further charge beyond the subtotal (e.g. a
+    /// delivery fee), their sum is genuinely distinct from the bare subtotal -- the item-sum
+    /// witness still proves that larger, distinct target normally.
+    #[test]
+    fn line_item_sum_still_witnesses_a_target_distinct_from_the_subtotal() {
+        let figures = figures_with(|f| {
+            f.subtotal = Some(2854.0);
+            f.total = Some(2870.0); // subtotal + a 16.0 delivery fee, genuinely distinct
+            let mut items = vec![95.0, 531.0, 0.0, 186.0, 122.0, 464.0, 184.0, 144.0, 75.0, 366.0, 190.0, 121.0, 376.0];
+            items.push(16.0); // the delivery fee, itself printed as a line item
+            f.line_items = items;
+        });
+        assert_eq!(find_witness(&figures, 2870.0, WITNESS_TOLERANCE), Some(WitnessKind::LineItemSum));
     }
 
     /// image_accuracy_plan.md §3 image_07: round(8,122 + 203.05 + 203.05) = round(8,528.10) ~=
