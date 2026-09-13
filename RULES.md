@@ -279,6 +279,54 @@ Only facts that change a forecast item. Everything else in a message is ignored.
 
 Note on message_08 (user_11): "confirmed base salary IDR 38,760,000" conflicts with five settled 23,256,000 base-salary rows. Using 23,256,000 gives safe within 0.9% of the label; 38,760,000 only changes E-side numbers after 2025-05-15. Keep settled history as the amount unless the message states an effective date (conflict rule 3 "settled over estimate"). [FIT]
 
+### S5.1 Per-image rulings (final user decisions; do not re-litigate)
+
+Source: fleet/AGENT_RULES.md §8 and docs/image_accuracy_plan.md §3. Verbatim page strings and witnesses for every image are in S9.
+
+| image | ruling | why |
+|---|---|---|
+| 02 | **100,000** | `Balance Due: 1,00,000.00`, Indian lakh grouping. Witness: 2,00,000 total − 1,00,000 received. |
+| 05 | **822.05** | The outstanding bill settles 2026-02-09, after the `06-Feb-2026` cutoff, so the after-cutoff amount applies. The fleet gold stands. |
+| 07 | **8,528** | `Grand Total (RS) : 8528` is what was paid. `Total : 8528.10` rounds to it and is logged as the computed value. |
+| 11 | **3,650** | The final printed amount is truth. The detailed breakup summing to 3,150 never rejects it. |
+| 12 | **USD 33.50** | `Total: $33,50` uses a comma decimal. Convert with the exchange_rates.csv row for 2025-10-01 (USD→INR 83.33). Cash paid 40.00 is never the amount. |
+| 04 | **fail closed** | The page is cropped below `Item Bill ₹2854.00`, so no final total is visible. Settled and history-only, so this is safe. |
+
+### S5.2 Witness spec: the acceptance gate for an image figure F
+
+Names follow `extract::witness` (ml-engineer 12488dd). F is **accepted** only when all three hold:
+1. 2 reads select the same normalized F, and agree on the due-date cutoff when one is printed.
+2. At least one witness on the page proves F (`find_witness`, tolerance `WITNESS_TOLERANCE = 1.0`). The witness kinds are:
+   - `line_item_sum`, `subtotal_plus_charges`, `subtotal_plus_tax`;
+   - `gross_minus_deductions`, `paid_plus_balance`, `total_minus_paid`;
+   - `amount_in_words`, `repeated_final_label`;
+   - `cutoff_after_exceeds_witnessed_before`.
+3. No final-labeled figure contradicts F (`final_label_contradicts`).
+
+Final-labeled fields:
+- They are `total`, `grand_total`, `amount_due`, `balance_due` and `net_pay`. Printed labels that map to them include Total, Grand Total, Total paid, Total Amount Received, Amount Payable, Total Bill Amount, Balance, Balance Due, Net Pay and Cash Paid.
+- **Not final:** `amount_paid`, `previous_balance`, and any subtotal (Item Bill, Subtotal, Sub Total, Item Total). A line-item sum that proves only the subtotal never promotes it to F (image_04).
+- The scope depends on how `select` chose F:
+  - `Whole` (settled / default): all final fields apply.
+  - `RemainingOwed` (pending/scheduled balance with no cutoff, image_02): only `amount_due`/`balance_due` apply. Total 2,00,000 is not a contradiction.
+  - `CutoffResolved` (image_05): no generic final field applies; only the cutoff identity corroborates.
+
+**The final printed amount is truth (user rule).**
+- A breakdown that sums to F is a witness.
+- A breakdown that does not sum to F is a read note only. It is never a contradiction, never rejects F, and never appears in the explanation. Examples: image_11's detailed breakup is 3,150 against 3,650; image_06's line totals are 1,994.99 against 1,995.00.
+- Two final labels within 1 unit (image_07: 8,528 vs 8,528.10) corroborate each other.
+
+**Read budget (HF-only, no Claude in the default chain; Anthropic is capped until 2026-10-01):**
+- Qwen3-VL-235B@1024 + gemma-4-31B@768.
+- If the gate fails, add 235B@1536 then gemma@1024, stopping at the first pass.
+
+**Otherwise the image fails closed.**
+- A pending/scheduled row (02, 05, 10, 11) that fails closed is never silently skipped. Extraction emits `Fact::UnverifiedEventAmount` with the largest amount selected across validated reads (lead ruling, bus #15).
+- The engine reserves that amount.
+- A settled row that fails closed is excluded from estimators and is never 0.
+
+### S5.3 Image table (pre-v3 reference, updated to S5.1/S5.2)
+
 Images (blank-amount events). Selector by linked event:
 | image | event | figure to use | effect |
 |---|---|---|---|
@@ -304,22 +352,22 @@ select (pending/scheduled):
 ```
 image_05 v2 expected read: `{due_cutoff_date: "2026-02-06", amount_due_by_cutoff: 704.05, amount_due_after_cutoff: 822.05}`; event_1786 cash date 2026-02-09 > cutoff → **822.05**.
 
-Routing for the audit (board `decision.vlm_routing_v2`, `decision.tiebreak_distinct`): pending/scheduled rows (02, 05, 10, 11) read by Qwen3-VL-235B@1024 + claude-opus-5, tiebreak gemma-4-31B@768 counting only if it satisfies the cutoff rule; every other row read by 235B + gemma, tiebreak claude-opus-5.
+**[SUPERSEDED by S5.2: HF-only, AGENT_RULES §8]** Old routing, kept as history (board `decision.vlm_routing_v2`, `decision.tiebreak_distinct`): pending/scheduled rows (02, 05, 10, 11) read by Qwen3-VL-235B@1024 + claude-opus-5, tiebreak gemma-4-31B@768 counting only if it satisfies the cutoff rule; every other row read by 235B + gemma, tiebreak claude-opus-5.
 
 | image | event (status, cur) | expected | wrong-but-plausible figures on the page | risk |
 |---|---|---|---|---|
 | 01 | event_253 salary, settled, IDR | **4,365,000** net pay | total earnings 4,780,800; subtotal deductions 415,800. Arrears 1,964,250 is NOT on the payslip (separate settled event_211); never add it | history only |
 | 02 | event_1442 rent, **scheduled**, INR | **100,000** balance due | total 2,00,000; amount received 1,00,000 | cash-moving (−100,000 on 2023-08-16) |
 | 03 | event_1545 groceries, settled, INR | **41,272** cash paid | — | history; excluded from estimator (S5) |
-| 04 | event_1700 groceries, settled, INR | item bill **2,854** (line sum 2,854). The page is cropped below "Delivery…", so no final total is visible | a delivery fee line is cut off | selector returns None (no total/paid) → acceptable: history-only row, excluded from estimator; never 0 |
+| 04 | event_1700 groceries, settled, INR | item bill **2,854** (line sum 2,854). The page is cropped below "Delivery…", so no final total is visible | a delivery fee line is cut off | **fail closed** (S5.1). Accepting 2,854 counts as a false accept: a line-item sum proves only the subtotal. History-only row, excluded from the estimator; never 0 |
 | 05 | event_1786 utilities, **pending**, INR, settles 2026-02-09 | **822.05** = `amount_due_after_cutoff` (v2); `due_cutoff_date` 2026-02-06, `amount_due_by_cutoff` 704.05 | 704.05 by-cutoff amount (the v1 trap); previous balance 3,543.54 | cash-moving; a 704.05 accept is a false accept |
 | 06 | event_3051 groceries, settled, INR | **1,995.00** invoice total | per-line totals 565/552/289; CGST/SGST 47.49 | history |
-| 07 | event_3231 dining, settled, INR | **8,528** grand total paid (alt 8,528.10 "Total") | subtotal 8,122; SGST/CGST 203.05 | reconciliation: subtotal 8,122 + tax 406.10 = 8,528.10, so a VLM `total` of 8,528 fails the exact check → rejected; allow ≥1 unit rounding tolerance or read `total`=8,528.10 |
+| 07 | event_3231 dining, settled, INR | **8,528** grand total paid (alt 8,528.10 "Total") | subtotal 8,122; SGST/CGST 203.05 | **ruling 8,528.** Accepted within `WITNESS_TOLERANCE` 1.0: subtotal 8,122 + tax 406.10 = 8,528.10, and Total 8,528.10 repeats the Grand Total. Log 8,528.10 as the computed value |
 | 08 | event_4535 housing, settled, INR | **15,339** total amount received | line items 13,880 / 1,050 / 409 | history (message_35 confirms date only) |
 | 09 | event_5170 utilities, settled, INR | **723** total amount received | — | history |
 | 10 | event_6033 groceries, **pending**, INR | **79,679.26** balance due | subtotal 72,045; any single tax line 1,513.13 / 2,304 | cash-moving |
-| 11 | event_6859 healthcare, **scheduled**, INR | **3,650** amount payable / balance | detailed-breakup subtotals sum to **3,150** (250+1,400+1,000+500), inconsistent with the 3,650 summary; amount paid 0 | cash-moving; if the VLM fills `line_items_sum_check` from the breakup, the sum check (3,150 ≠ 3,650) rejects the image → leave that check off for this layout or take it from the top table (1,650+1,000+1,000) |
-| 12 | event_7307 transport, settled, **USD** | **33.50 USD** total (→ INR at the 2025-10-01 USD→INR row) | **cash paid 40.00**, change 6.50 | `select` prefers `amount_paid` → 40.00 would be wrong; amount paid must be net of change (= total) |
+| 11 | event_6859 healthcare, **scheduled**, INR | **3,650** amount payable / balance | detailed-breakup subtotals sum to **3,150** (250+1,400+1,000+500), inconsistent with the 3,650 summary; amount paid 0 | cash-moving. **Ruling 3,650; the final amount is truth** (S5.2). Witnesses: repeated_final_label and the provisional-bill sum 1,650 + 1,000 + 1,000. The breakup total of 3,150 is a read note only and never rejects |
+| 12 | event_7307 transport, settled, **USD** | **33.50 USD** total (→ INR at the 2025-10-01 USD→INR row) | **cash paid 40.00**, change 6.50 | **ruling USD 33.50**, printed as `$33,50` with a comma decimal. `amount_paid` 40.00 is gross of change and is never F. Witness: subtotal_plus_charges 28.50 + 5.00 |
 | 13 | event_7941 shopping, settled, INR | **2,298** total paid | item prices 699 / 1,599 | history |
 | 14 | event_9421 healthcare, settled, INR (handwritten) | **4,543** total (lines 1,500+724+796+550+303+670) | struck-through line reads as 670 | history; handwriting read risk |
 | 15 | event_9806 transport, settled, INR | **9,968.00** grand total | 9,580 (air travel line incl. taxes), 9,512 (total excl. tax), 9,124 taxable | history |
@@ -329,7 +377,7 @@ Routing for the audit (board `decision.vlm_routing_v2`, `decision.tiebreak_disti
 
 Cash-moving images (change a request's forecast): **02, 05, 10, 11**. The other 12 only feed stream estimators, and a missing figure there is safe (row excluded) as long as it is never read as 0.
 
-**Routing v3 gate result (ml-engineer 28b0b72/5bdb0f2 reads; 235B + gemma primary, claude-opus-5 tiebreak only; cutoff-date agreement guard on; `scratch/gate_v2.py` ROUTING=v3 GUARD=date).** Reads from `ml-engineer/code/store/bakeoff_cache_v2` (50 files, all attributed). Every read combination: accept_ok_pair 33, accept_ok_tiebreak 3, escalate 4, **FALSE_ACCEPT 0**. The result is the same without the date guard.
+**[SUPERSEDED by S5.2: HF-only witness gate.** image_11 no longer depends on a Claude read. It is accepted on 2 HF reads plus repeated_final_label. The block below is kept as history.**]** **Routing v3 gate result (ml-engineer 28b0b72/5bdb0f2 reads; 235B + gemma primary, claude-opus-5 tiebreak only; cutoff-date agreement guard on; `scratch/gate_v2.py` ROUTING=v3 GUARD=date).** Reads from `ml-engineer/code/store/bakeoff_cache_v2` (50 files, all attributed). Every read combination: accept_ok_pair 33, accept_ok_tiebreak 3, escalate 4, **FALSE_ACCEPT 0**. The result is the same without the date guard.
 
 | image | 235B | gemma | claude | outcome |
 |---|---|---|---|---|
