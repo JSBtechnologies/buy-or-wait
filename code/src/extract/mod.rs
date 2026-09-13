@@ -12,6 +12,7 @@ pub mod images;
 pub mod intake;
 pub mod messages;
 pub mod model_config;
+pub mod normalize;
 pub mod prompts;
 pub mod retrieval;
 

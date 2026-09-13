@@ -20,6 +20,7 @@ use crate::engine::ledger::{EvidenceRecord, EvidenceSource, Fact};
 use crate::engine::money::Money;
 use crate::engine::types::{Event, EventType, Status};
 use crate::extract::model_config::{CandidateConfig, DecodingConfig, ModelsConfig, ReaderPick, VlmMode};
+use crate::extract::normalize;
 use crate::extract::parse_json_reply;
 use crate::extract::prompts::PromptSet;
 use anyhow::Context as _;
@@ -66,22 +67,18 @@ impl DocType {
             .collect::<Vec<_>>()
             .join("_");
         match normalized.as_str() {
-            "payslip" | "pay_slip" | "salary_slip" | "pay_stub" | "paystub" => DocType::Payslip,
-            "receipt" | "cash_receipt" | "sales_receipt" | "bill_of_supply" | "cash_bill" => {
-                DocType::Receipt
-            }
-            "invoice" | "tax_invoice" | "gst_invoice" | "sales_invoice" | "gst_tax_invoice" => {
-                DocType::Invoice
-            }
-            "bill" | "provisional_bill" | "hospital_bill" | "utility_bill" | "rent_receipt" => {
-                DocType::Bill
-            }
-            "delivery_summary" | "order_summary" | "delivery_receipt" | "order_details" => {
-                DocType::DeliverySummary
-            }
-            "bank_statement_excerpt" | "bank_statement" | "statement" | "account_summary" => {
-                DocType::BankStatementExcerpt
-            }
+            "payslip" | "pay_slip" | "salary_slip" | "pay_stub" | "paystub"
+            | "slip_gaji" | "slip_gajian" => DocType::Payslip,
+            "receipt" | "cash_receipt" | "sales_receipt" | "bill_of_supply" | "cash_bill"
+            | "kwitansi" | "struk" | "nota" => DocType::Receipt,
+            "invoice" | "tax_invoice" | "gst_invoice" | "sales_invoice" | "gst_tax_invoice"
+            | "faktur" | "faktur_pajak" => DocType::Invoice,
+            "bill" | "provisional_bill" | "hospital_bill" | "utility_bill" | "rent_receipt"
+            | "tagihan" | "tagihan_listrik" | "tagihan_air" => DocType::Bill,
+            "delivery_summary" | "order_summary" | "delivery_receipt" | "order_details"
+            | "ringkasan_pesanan" | "rincian_pesanan" => DocType::DeliverySummary,
+            "bank_statement_excerpt" | "bank_statement" | "statement" | "account_summary"
+            | "rekening_koran" | "mutasi_rekening" => DocType::BankStatementExcerpt,
             _ => DocType::Other,
         }
     }
@@ -190,12 +187,14 @@ struct RawImageFigures {
     line_items_sum_check: Option<Value>,
 }
 
-/// Accepts a JSON number or a numeric-looking string; anything else (including a date
-/// string landing in a numeric field) is `None` rather than a hard parse error.
-fn coerce_f64(v: &Option<Value>) -> Option<f64> {
+/// Accepts a JSON number as-is, or a numeric-looking string via `normalize::parse_amount`
+/// (thousands/lakh grouping, currency-aware decimal-vs-thousands disambiguation, analyst
+/// RULES.md S7); anything else (including a date string landing in a numeric field, or a
+/// genuinely ambiguous grouping) is `None` rather than a hard parse error or a guess.
+fn coerce_f64(v: &Option<Value>, currency_hint: Option<&str>) -> Option<f64> {
     match v.as_ref()? {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().replace(',', "").parse::<f64>().ok(),
+        Value::String(s) => normalize::parse_amount(s, currency_hint),
         _ => None,
     }
 }
@@ -222,6 +221,12 @@ fn date_string_hint(v: &Option<Value>) -> Option<String> {
 
 impl From<RawImageFigures> for ImageFigures {
     fn from(raw: RawImageFigures) -> Self {
+        // Resolved first so every amount field can disambiguate its own grouping/decimal
+        // convention against it (normalize::parse_amount, analyst RULES.md S7).
+        let currency = coerce_string(&raw.currency);
+        let currency_hint = currency.as_deref().and_then(normalize::parse_currency);
+        let currency_hint = currency_hint.as_deref();
+
         let mut before_value = coerce_string(&raw.amount_due_before_date_value);
         if before_value.as_deref().and_then(parse_date).is_none() {
             before_value = date_string_hint(&raw.amount_due_before_date)
@@ -234,26 +239,26 @@ impl From<RawImageFigures> for ImageFigures {
                 .as_ref()
                 .and_then(Value::as_str)
                 .map(DocType::from_free_text),
-            currency: coerce_string(&raw.currency),
-            subtotal: coerce_f64(&raw.subtotal),
-            tax: coerce_f64(&raw.tax),
-            total: coerce_f64(&raw.total),
-            amount_due: coerce_f64(&raw.amount_due),
-            amount_paid: coerce_f64(&raw.amount_paid),
-            balance_due: coerce_f64(&raw.balance_due),
-            gross_pay: coerce_f64(&raw.gross_pay),
-            deductions: coerce_f64(&raw.deductions),
-            net_pay: coerce_f64(&raw.net_pay),
-            previous_balance: coerce_f64(&raw.previous_balance),
-            amount_due_before_date: coerce_f64(&raw.amount_due_before_date),
+            currency,
+            subtotal: coerce_f64(&raw.subtotal, currency_hint),
+            tax: coerce_f64(&raw.tax, currency_hint),
+            total: coerce_f64(&raw.total, currency_hint),
+            amount_due: coerce_f64(&raw.amount_due, currency_hint),
+            amount_paid: coerce_f64(&raw.amount_paid, currency_hint),
+            balance_due: coerce_f64(&raw.balance_due, currency_hint),
+            gross_pay: coerce_f64(&raw.gross_pay, currency_hint),
+            deductions: coerce_f64(&raw.deductions, currency_hint),
+            net_pay: coerce_f64(&raw.net_pay, currency_hint),
+            previous_balance: coerce_f64(&raw.previous_balance, currency_hint),
+            amount_due_before_date: coerce_f64(&raw.amount_due_before_date, currency_hint),
             amount_due_before_date_value: before_value,
-            amount_due_after_date: coerce_f64(&raw.amount_due_after_date),
+            amount_due_after_date: coerce_f64(&raw.amount_due_after_date, currency_hint),
             due_cutoff_date: coerce_string(&raw.due_cutoff_date),
-            amount_due_by_cutoff: coerce_f64(&raw.amount_due_by_cutoff),
-            amount_due_after_cutoff: coerce_f64(&raw.amount_due_after_cutoff),
+            amount_due_by_cutoff: coerce_f64(&raw.amount_due_by_cutoff, currency_hint),
+            amount_due_after_cutoff: coerce_f64(&raw.amount_due_after_cutoff, currency_hint),
             document_date: coerce_string(&raw.document_date),
             period_label: coerce_string(&raw.period_label),
-            line_items_sum_check: coerce_f64(&raw.line_items_sum_check),
+            line_items_sum_check: coerce_f64(&raw.line_items_sum_check, currency_hint),
         }
     }
 }
@@ -276,8 +281,11 @@ fn close(a: f64, b: f64, tolerance: f64) -> bool {
     diff <= tolerance
 }
 
+/// Delegates to the shared `normalize::parse_date` (ISO, "DD-Mon-YYYY"/"D Mon YYYY" in
+/// English or Indonesian, and an unambiguous "DD/MM/YYYY") so date parsing never drifts
+/// between the image and message evidence paths.
 fn parse_date(s: &str) -> Option<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    normalize::parse_date(s)
 }
 
 /// Deterministic selector (PLAN.md §2.3 table): which figure matters, given the linked
@@ -438,23 +446,13 @@ pub fn reconciles(figures: &ImageFigures, event: &Event) -> bool {
 /// currency in a different spelling). Limited to the dataset's five currencies (PLAN.md:
 /// INR, ZAR, IDR, USD, EUR); anything else falls back to a cleaned exact-string comparison
 /// rather than guessing a mapping.
+/// Delegates to the shared `normalize::parse_currency` so currency normalization never
+/// drifts between the image and message evidence paths. A currency that fails to normalize
+/// on either side (e.g. the literal text "null") never counts as a match.
 fn currency_matches(claimed: &str, expected: &str) -> bool {
-    normalize_currency(claimed) == normalize_currency(expected)
-}
-
-fn normalize_currency(raw: &str) -> String {
-    let cleaned = raw.trim().trim_end_matches('.').to_uppercase();
-    match cleaned.as_str() {
-        "INR" | "RS" | "RUPEES" | "RUPEE" | "INDIAN RUPEE" | "INDIAN RUPEES" | "\u{20B9}" => {
-            "INR".to_string()
-        }
-        "USD" | "US$" | "$" | "US DOLLAR" | "US DOLLARS" | "DOLLAR" | "DOLLARS" => {
-            "USD".to_string()
-        }
-        "EUR" | "\u{20AC}" | "EURO" | "EUROS" => "EUR".to_string(),
-        "IDR" | "RP" | "RUPIAH" | "INDONESIAN RUPIAH" => "IDR".to_string(),
-        "ZAR" | "R" | "RAND" | "SOUTH AFRICAN RAND" => "ZAR".to_string(),
-        _ => cleaned,
+    match (normalize::parse_currency(claimed), normalize::parse_currency(expected)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -1039,6 +1037,13 @@ mod tests {
         assert_eq!(DocType::from_free_text("Order Details"), DocType::DeliverySummary);
         assert_eq!(DocType::from_free_text("something the model made up"), DocType::Other);
 
+        // Indonesian synonyms (dataset is EN+ID, PLAN.md §2.4).
+        assert_eq!(DocType::from_free_text("Slip Gaji"), DocType::Payslip);
+        assert_eq!(DocType::from_free_text("Kwitansi"), DocType::Receipt);
+        assert_eq!(DocType::from_free_text("Faktur Pajak"), DocType::Invoice);
+        assert_eq!(DocType::from_free_text("Tagihan Listrik"), DocType::Bill);
+        assert_eq!(DocType::from_free_text("Rekening Koran"), DocType::BankStatementExcerpt);
+
         let value = serde_json::json!({"doc_type": "TAX INVOICE", "total": 100.0});
         let figures: ImageFigures = serde_json::from_value(value).expect("should not reject on doc_type");
         assert_eq!(figures.doc_type, Some(DocType::Invoice));
@@ -1058,6 +1063,31 @@ mod tests {
         assert!(currency_matches("R", "ZAR"));
         assert!(currency_matches("\u{20AC}", "EUR"));
         assert!(!currency_matches("USD", "INR"));
+    }
+
+    /// Analyst audit #276 (image_02-shaped, SYNTHETIC values -- not the real dataset
+    /// figures): two Qwen3-VL-235B reads of the real image both misread its printed Indian
+    /// lakh grouping as 10x the true amount and still passed internal reconciliation. This
+    /// test covers the specific sub-case where a model transcribes the grouped figure as a
+    /// JSON STRING (`"1,00,000"`) rather than a plain number -- `coerce_f64` must recover the
+    /// correct value via `normalize::parse_amount`'s Indian-grouping rule, not silently
+    /// accept a naive comma-strip-only misread. It does NOT cover a model emitting the wrong
+    /// value as a plain JSON number already (no text exists at that point to reparse) --
+    /// that failure mode is caught by cross-model agreement (>=2 distinct models must agree,
+    /// `resolve_blank_amount_agreement`) and the amount-plausibility-vs-history check.
+    #[test]
+    fn image_02_shaped_lakh_grouped_string_total_parses_to_the_true_amount_not_10x() {
+        let value = serde_json::json!({
+            "doc_type": "receipt",
+            "currency": "INR",
+            "total": "1,00,000",
+            "amount_paid": "1,00,000"
+        });
+        let figures: ImageFigures = serde_json::from_value(value).expect("should parse");
+        assert_eq!(figures.total, Some(100_000.0), "must recover the lakh-grouped total, not 1,000,000");
+        let event = expense_event("event_synthetic_lakh", "transport", "INR", Status::Settled);
+        assert!(reconciles(&figures, &event));
+        assert_eq!(select(&figures, &event), Some(100_000.0));
     }
 
     /// analyst audit #194: a document can print an unrelated subtotal/tax breakdown that
