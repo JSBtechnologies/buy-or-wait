@@ -291,14 +291,26 @@ notes = "Board decision.claude_backup: built specifically because Kimi-K3 failed
 # for extraction, not deciding this myself.
 # ---------------------------------------------------------------------------
 
-[selected]
-vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
-vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px (see schema-gap note above)
-vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (fails the backup gate, docs/bakeoff.md "Backup models"), claude-opus-5 IN (from [[fallback.candidates]], code/src/anthropic.rs -- needs only ANTHROPIC_API_KEY, not HF credits). Gate test pending (Step 4 of board decision.claude_backup); still held un-announced per the lead until verifier/analyst confirm.
-vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
-image_max_dim_px = 1024
-llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai, per user decision
-llm_fallback = "deepseek-ai/DeepSeek-V4-Pro-0813"    # deepinfra, from [[fallback.candidates]] -- passed its backup-gate check (docs/bakeoff.md)
+# ---------------------------------------------------------------------------
+# PENDING ACTIVATION (board decision.selected_activation_question, 2026-09-12):
+# [selected] deliberately left ABSENT below. 9d96dcd's [selected] was riding
+# into extraction's lockstep and would have reached `main` before the lead
+# is ready to announce activation. The chosen values are recorded here as a
+# commented block so nothing is lost; activating them is a separate,
+# single commit the lead announces explicitly once ready:
+#
+#   [selected]
+#   vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"    # deepinfra, screened @ 1024px
+#   vlm_escalation = "google/gemma-4-31B-it"            # deepinfra, screened @ 768px
+#   vlm_fallback = "claude-opus-5"                      # board decision.vlm_routing_v2: Kimi-K3 OUT (fails the backup gate), claude-opus-5 IN -- gate test still in progress, see docs/bakeoff.md
+#   vlm_mode = "agreement"                              # forward declaration; inert until extraction implements it
+#   image_max_dim_px = 1024
+#   llm_primary = "aisingapore/Gemma-SEA-LION-v4-27B-IT" # publicai
+#   llm_fallback = "deepseek-ai/DeepSeek-V4-Pro-0813"    # deepinfra, passed its backup-gate check
+#
+# [[fallback.candidates]] (catalog), [vlm_routing] (routing table), and all
+# pricing stay live/unchanged below -- only the activation switch moved.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Per-event-class VLM reader routing (extraction 32c17d5, board decision
@@ -336,6 +348,12 @@ llm_fallback = "deepseek-ai/DeepSeek-V4-Pro-0813"    # deepinfra, from [[fallbac
 
 [vlm_routing]
 default_class = "settled_expense_receipt"
+# Verifier #250: top-level reconciliation tolerance, must be <= 1.0 (mirrors
+# extract/images.rs's `const TOL: f64 = 0.01` for subtotal+tax=total etc.).
+# Value/key name not yet confirmed with extraction -- flagged on bus topic
+# extract for their read-side to pick this up (or say it's already an
+# internal constant and this key is unused).
+reconciliation_tolerance = 0.01
 
 [[vlm_routing.classes]]
 name = "income_payslip"
