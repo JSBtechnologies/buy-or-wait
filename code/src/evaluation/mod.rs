@@ -6,6 +6,7 @@ pub mod data;
 pub mod engine_run;
 pub mod evidence_audit;
 pub mod evidence_consistency;
+pub mod false_accepts;
 pub mod explanation;
 pub mod hardcode_scan;
 pub mod image_agreement;
