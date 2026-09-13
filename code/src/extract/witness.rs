@@ -242,7 +242,7 @@ fn repeat_witness_family_fields(
 /// construction (the amount owed before any late fee applies) -- that is the intended witness
 /// (image_accuracy_plan.md §3: "580.65+16.00+107.40 proves 704.05"), not the image_04
 /// duplicated-into-`total` failure mode this guard exists for.
-fn target_is_bare_subtotal(figures: &ImageFigures, target: f64, tolerance: f64, scope: FinalLabelScope) -> bool {
+pub fn target_is_bare_subtotal(figures: &ImageFigures, target: f64, tolerance: f64, scope: FinalLabelScope) -> bool {
     scope == FinalLabelScope::Whole && figures.subtotal.is_some_and(|s| approx_eq(s, target, tolerance))
 }
 
