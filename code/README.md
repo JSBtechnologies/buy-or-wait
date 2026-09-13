@@ -71,6 +71,12 @@ Exit code is `0` on pass, `1` on a failing check, `2` on a usage error. `signoff
 ship gate: contract, status distribution, injected-text/hardcoded-id scans, secrets, and
 the usage report's presence/sections/secrets, all in one pass/fail report.
 
+`verify signoff` is a development verification step, not part of the prediction path. Its
+accuracy gate compares model-read image amounts with the analyst's hand-read audit table in
+the repository `RULES.md` (not shipped in `code.zip`); a mismatch means model and analyst
+disagree and is investigated, never auto-corrected. The batch run never reads the audit
+table.
+
 ## Model bake-off
 
 ```bash
