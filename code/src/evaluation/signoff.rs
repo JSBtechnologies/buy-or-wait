@@ -308,7 +308,7 @@ mod tests {
     /// Mutation (analyst #276): a self-consistent 10x lakh misread by one reader must fail the
     /// accuracy gate on BOTH the no-single-read-acceptance rule (IA4) and the audit-gold comparison
     /// (FA1). The reference and the 10x figure come from RULES.md at test time; routing is
-    /// extraction's [vlm_routing] shape (explicit tiebreaks, tolerance 0.01).
+    /// decision.vlm_routing_v3 in config/models.toml shape (235B + gemma readers, claude tiebreak).
     #[test]
     fn ten_x_single_read_fails_agreement_and_gold() {
         use serde_json::{json, Value};
@@ -330,8 +330,8 @@ mod tests {
             "[selected]\nvlm_primary = \"{Q}\"\nvlm_escalation = \"{G}\"\nvlm_fallback = \"{C}\"\n\n\
              [vlm_routing]\ndefault_class = \"settled_expense_receipt\"\ntolerance = 0.01\n\n\
              [[vlm_routing.classes]]\nname = \"pending_bill_due_date\"\nevent_types = []\nstatuses = [\"pending\", \"scheduled\"]\ncategories = []\n\
-             readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }} ]\n\
-             tiebreak = {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }}\n\n\
+             readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }} ]\n\
+             tiebreak = {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }}\n\n\
              [[vlm_routing.classes]]\nname = \"settled_expense_receipt\"\nstatuses = [\"settled\"]\n\
              readers = [ {{ role = \"vlm_primary\", max_dim_px = 1024, max_tokens = 400 }}, {{ role = \"vlm_escalation\", max_dim_px = 768, max_tokens = 400 }} ]\n\
              tiebreak = {{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 4000 }}\n"
@@ -365,24 +365,24 @@ mod tests {
 
         // 2. Agreeing-looking: the same 235B read again under the second reader's role.
         let q = read("vlm_primary", Q, 1024, 400, true, Some(misread));
-        let (c, _) = gate("selfagree", vec![q.clone(), read("vlm_fallback", Q, 1024, 4000, true, Some(misread))], "agree", misread);
+        let (c, _) = gate("selfagree", vec![q.clone(), read("vlm_escalation", Q, 768, 400, true, Some(misread))], "agree", misread);
         assert!(fails_both(&c), "{c:?}");
 
         // 3. The second reader failed (no figure): still a single read.
-        let (c, _) = gate("otherfailed", vec![q.clone(), read("vlm_fallback", C, 1024, 4000, false, None)], "agree", misread);
+        let (c, _) = gate("otherfailed", vec![q.clone(), read("vlm_escalation", G, 768, 400, false, None)], "agree", misread);
         assert!(fails_both(&c), "{c:?}");
 
         // 4. The second reader reads the true figure: disagreement, no tiebreak -> nothing may be applied.
-        let (c, _) = gate("disagree", vec![q.clone(), read("vlm_fallback", C, 1024, 4000, true, Some(truth))], "agree", misread);
+        let (c, _) = gate("disagree", vec![q.clone(), read("vlm_escalation", G, 768, 400, true, Some(truth))], "agree", misread);
         assert!(fails_both(&c), "{c:?}");
 
         // 5. Defense in depth: two routed models make the same 10x error (agreement accepts it);
         //    the audit-gold comparison alone still fails the gate.
-        let (c, _) = gate("twomodels", vec![q, read("vlm_fallback", C, 1024, 4000, false, None), read("vlm_escalation", G, 768, 400, true, Some(misread))], "tiebreak_accept", misread);
+        let (c, _) = gate("twomodels", vec![q, read("vlm_escalation", G, 768, 400, false, None), read("vlm_fallback", C, 1024, 4000, true, Some(misread))], "tiebreak_accept", misread);
         assert_eq!(c, vec!["FA1_image_amount_wrong"], "{c:?}");
 
         // Control: routed agreement on the true figure passes the gate.
-        let (c, _) = gate("control", vec![read("vlm_primary", Q, 1024, 400, true, Some(truth)), read("vlm_fallback", C, 1024, 4000, true, Some(truth))], "agree", truth);
+        let (c, _) = gate("control", vec![read("vlm_primary", Q, 1024, 400, true, Some(truth)), read("vlm_escalation", G, 768, 400, true, Some(truth))], "agree", truth);
         assert!(c.is_empty(), "{c:?}");
     }
 }

@@ -374,6 +374,21 @@ pub fn decide(routing: &Routing, class: &Class, p: &Provenance, e: &Event) -> (&
     ("missing", None, notes)
 }
 
+/// Board decision.vlm_routing_v3 at role level (no model names here): every class reads with
+/// vlm_primary + vlm_escalation and tiebreaks only with vlm_fallback.
+pub fn v3_role_problems(r: &Routing) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for c in &r.classes {
+        let mut roles: Vec<&str> = c.cfg.readers.iter().map(|s| s.role.as_str()).collect();
+        roles.sort();
+        let tiebreak = c.tiebreak.as_ref().map(|t| t.role.as_str());
+        if roles != ["vlm_escalation", "vlm_primary"] || tiebreak != Some("vlm_fallback") {
+            out.push(fail("config", "IA14_routing_not_v3", format!("class {}: readers {roles:?}, tiebreak {tiebreak:?}; decision.vlm_routing_v3 wants readers vlm_primary+vlm_escalation, tiebreak vlm_fallback", c.name)));
+        }
+    }
+    out
+}
+
 fn outcome_class(recorded: &str) -> &'static str {
     match recorded {
         "agree" => "agree",
@@ -396,6 +411,7 @@ pub fn check(code_dir: &Path, dataset_dir: &Path, models_toml: &Path) -> Result<
     };
     if let Some(r) = &routing {
         out.extend(r.problems.iter().cloned());
+        out.extend(v3_role_problems(r));
     }
 
     // Image EventAmounts in applied evidence: (request, image, event, amount).
@@ -537,7 +553,7 @@ mod tests {
     const G: &str = "google/gemma-4-31B-it";
     const C: &str = "claude-opus-5";
 
-    const CONFIG: &str = r#"
+    const CONFIG_V2: &str = r#"
 [selected]
 vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"
 vlm_escalation = "google/gemma-4-31B-it"
@@ -561,6 +577,43 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
 name = "settled_expense_receipt"
 statuses = ["settled"]
 readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 } ]
+"#;
+
+    /// Routing v3 (decision.vlm_routing_v3), shaped like config/models.toml.
+    const CONFIG: &str = r#"
+[selected]
+vlm_primary = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+vlm_escalation = "google/gemma-4-31B-it"
+vlm_fallback = "claude-opus-5"
+image_max_dim_px = 1024
+
+[vlm_routing]
+default_class = "settled_expense_receipt"
+tolerance = 0.01
+
+[[vlm_routing.classes]]
+name = "income_payslip"
+event_types = ["income"]
+statuses = []
+categories = []
+readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 } ]
+tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
+
+[[vlm_routing.classes]]
+name = "pending_bill_due_date"
+event_types = []
+statuses = ["pending", "scheduled"]
+categories = []
+readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 } ]
+tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
+
+[[vlm_routing.classes]]
+name = "settled_expense_receipt"
+event_types = []
+statuses = ["settled"]
+categories = []
+readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { role = "vlm_escalation", max_dim_px = 768, max_tokens = 400 } ]
+tiebreak = { role = "vlm_fallback", max_dim_px = 1024, max_tokens = 4000 }
 "#;
 
     fn read(role: &str, model: &str, px: u32, tokens: u32, ok: bool, amt: Option<f64>) -> Value {
@@ -613,7 +666,7 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
 
     #[test]
     fn table_resolves_classes_readers_and_distinct_tiebreaks() {
-        let r = Routing::from_models_toml(CONFIG).unwrap().unwrap();
+        let r = Routing::from_models_toml(CONFIG_V2).unwrap().unwrap();
         assert!(r.problems.is_empty(), "{:?}", r.problems);
         let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
         let ds = Dataset::load(&dataset, &dataset.join("requests.csv")).unwrap();
@@ -626,123 +679,133 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         assert_eq!(class("event_1786").tiebreak.as_ref().map(|t| (t.model.as_str(), t.max_dim_px, t.max_tokens)), Some((G, 768, Some(400))));
         assert_eq!(class("event_3231").tiebreak.as_ref().map(|t| (t.model.as_str(), t.max_dim_px, t.max_tokens)), Some((C, 1024, Some(1500))));
         // Explicit tiebreak equal to a reader: IA12.
-        let bad = CONFIG.replace(
+        let bad = CONFIG_V2.replace(
             "{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 1500 } ]\n\n[[vlm_routing.classes]]\nname = \"settled_expense_receipt\"",
             "{ role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 1500 } ]\ntiebreak = { role = \"vlm_fallback\", max_dim_px = 1024, max_tokens = 1500 }\n\n[[vlm_routing.classes]]\nname = \"settled_expense_receipt\"",
         );
         let rb = Routing::from_models_toml(&bad).unwrap().unwrap();
         assert!(rb.problems.iter().any(|f| f.code == "IA12_tiebreak_equals_reader"), "{:?}", rb.problems);
+        // The v2 table is not decision.vlm_routing_v3 (pending bill reads with claude).
+        assert_eq!(v3_role_problems(&r).len(), 1, "{:?}", v3_role_problems(&r));
+
+        // Routing v3: every class reads 235B@1024 + gemma@768, tiebreak claude-opus-5@1024 only.
+        let v3 = Routing::from_models_toml(CONFIG).unwrap().unwrap();
+        assert!(v3.problems.is_empty() && v3_role_problems(&v3).is_empty(), "{:?}", v3.problems);
+        assert_eq!(v3.tolerance, 0.01);
+        for e in ["event_1786", "event_253", "event_3231"] {
+            let c = v3.class_for(&ds.events[e]).unwrap();
+            assert_eq!(c.readers.iter().map(|s| (s.model.as_str(), s.max_dim_px)).collect::<Vec<_>>(), vec![(Q, 1024), (G, 768)], "{e}");
+            assert_eq!(c.tiebreak.as_ref().map(|t| (t.model.as_str(), t.max_dim_px, t.max_tokens)), Some((C, 1024, Some(4000))), "{e}");
+        }
     }
 
     #[test]
     fn agreement_tiebreak_and_routing_violations() {
-        // Pending bill: 235B + claude (provider anthropic) agree on the after-cutoff figure.
-        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
-        let c = cut(anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25))), "06-Feb-2026", 120.75, 150.25);
-        assert!(errors(&run("a", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG)).is_empty());
+        // Routing v3 slots: readers 235B@1024/400 + gemma@768/400, tiebreak claude@1024/4000.
+        let q = |amt: Option<f64>| read("vlm_primary", Q, 1024, 400, true, amt);
+        let g = |amt: Option<f64>| read("vlm_escalation", G, 768, 400, true, amt);
+        let c = |amt: Option<f64>| anthropic(read("vlm_fallback", C, 1024, 4000, true, amt));
+        let pending = |tag: &str, reads: Vec<Value>, outcome: &str, amount: Option<f64>| errors(&run(tag, "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", reads, outcome, amount), CONFIG));
+        let settled = |tag: &str, reads: Vec<Value>, outcome: &str, amount: Option<f64>| errors(&run(tag, "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", reads, outcome, amount), CONFIG));
+
+        // Pending bill: 235B + gemma agree on the after-cutoff figure and the cutoff (formats differ, parsed equal).
+        let e = pending("a", vec![cut(q(Some(150.25)), "2026-02-06", 120.75, 150.25), cut(g(Some(150.25)), "06-Feb-2026", 120.75, 150.25)], "agree", Some(150.25));
+        assert!(e.is_empty(), "{e:?}");
 
         // Both agree on the before-cutoff figure although the cash date is after due: no accept.
-        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", 120.75, 150.25);
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
-        let e = errors(&run("b", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        let e = pending("b", vec![cut(q(Some(120.75)), "2026-02-06", 120.75, 150.25), cut(g(Some(120.75)), "2026-02-06", 120.75, 150.25)], "agree", Some(120.75));
         assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA6_outcome_mismatch"), "{e:?}");
 
-        // Readers disagree; gemma tiebreak (distinct, @768) matches 235B's after-cutoff figure: accept.
-        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
-        let g = cut(read("vlm_escalation", G, 768, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
-        assert!(errors(&run("c", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c, g], "tiebreak_accept", Some(150.25)), CONFIG)).is_empty());
+        // gemma failed; claude tiebreak (provider anthropic) matches 235B on amount and cutoff: accept.
+        let e = pending("c", vec![cut(q(Some(150.25)), "2026-02-06", 120.75, 150.25), read("vlm_escalation", G, 768, 400, false, None), cut(c(Some(150.25)), "2026-02-06", 120.75, 150.25)], "tiebreak_accept", Some(150.25));
+        assert!(e.is_empty(), "{e:?}");
 
-        // gemma tiebreak at 1024 px (global default instead of its own 768): not routed, no accept.
-        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
-        let g = read("vlm_fallback", G, 1024, 400, true, Some(150.25));
-        let e = errors(&run("d", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c, g], "tiebreak_accept", Some(150.25)), CONFIG));
+        // Anthropic unavailable (usage cap): claude read errors -> flagged missing, never an accept.
+        let mut capped = c(None);
+        capped["reconciled"] = json!(false);
+        capped["error"] = json!("usage cap");
+        let e = pending("c2", vec![cut(q(Some(150.25)), "2026-02-06", 120.75, 150.25), read("vlm_escalation", G, 768, 400, false, None), capped.clone()], "tiebreak_accept", Some(150.25));
+        assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
+        let v = run("c3", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![cut(q(Some(150.25)), "2026-02-06", 120.75, 150.25), read("vlm_escalation", G, 768, 400, false, None), capped], "no_agreement", None), CONFIG);
+        assert!(errors(&v).is_empty(), "{v:?}");
+
+        // claude tiebreak at 1500 tokens where v3 routes 4000: not routed, no accept.
+        let mut cb = cut(c(Some(150.25)), "2026-02-06", 120.75, 150.25);
+        cb["max_tokens"] = json!(1500);
+        let e = pending("d", vec![cut(q(Some(150.25)), "2026-02-06", 120.75, 150.25), read("vlm_escalation", G, 768, 400, false, None), cb], "tiebreak_accept", Some(150.25));
         assert!(e.contains(&"IA3_reader_not_routed") && e.contains(&"IA4_no_agreement"), "{e:?}");
 
-        // claude at 400 tokens where the pending class routes 1500: not its routed budget.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(5000.5));
-        let c = anthropic(read("vlm_fallback", C, 1024, 400, true, Some(5000.5)));
-        let e = errors(&run("e", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q, c], "agree", Some(5000.5)), CONFIG));
+        // gemma reader at 1024 px where v3 routes 768: not its routed resolution.
+        let e = errors(&run("e", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q(Some(5000.5)), read("vlm_escalation", G, 1024, 400, true, Some(5000.5))], "agree", Some(5000.5)), CONFIG));
         assert!(e.contains(&"IA3_reader_not_routed") && e.contains(&"IA4_no_agreement"), "{e:?}");
+
+        // v2 habit: 235B + claude recorded as a reader pair "agree". Under v3 claude only tiebreaks
+        // (gemma missing), so the decided outcome is a tiebreak, not an agreement.
+        let e = errors(&run("e2", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q(Some(5000.5)), c(Some(5000.5))], "agree", Some(5000.5)), CONFIG));
+        assert!(e.contains(&"IA6_outcome_mismatch") && !e.contains(&"IA4_no_agreement"), "{e:?}");
 
         // Pending figure 0 from both readers: never counts.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(0.0));
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(0.0)));
-        let e = errors(&run("f", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q, c], "agree", Some(0.0)), CONFIG));
+        let e = errors(&run("f", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![q(Some(0.0)), g(Some(0.0))], "agree", Some(0.0)), CONFIG));
         assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA11_nonpositive_cash_moving"), "{e:?}");
 
-        // Settled receipt: 235B@1024 + gemma@768 agree within tolerance 1.0: accept; evidence amount must match.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
-        let g = read("vlm_escalation", G, 768, 400, true, Some(812.00));
-        assert!(errors(&run("g", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q.clone(), g.clone()], "agree", Some(812.40)), CONFIG)).is_empty());
-        let e = errors(&run("h", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "agree", Some(700.0)), CONFIG));
+        // Settled receipt: readers agree; evidence amount must match what agreement accepts.
+        assert!(settled("g", vec![q(Some(812.40)), g(Some(812.40))], "agree", Some(812.40)).is_empty());
+        let e = settled("h", vec![q(Some(812.40)), g(Some(812.40))], "agree", Some(700.0));
         assert!(e.contains(&"IA5_accepted_amount"), "{e:?}");
+        // v3 tolerance 0.01: a 0.40 difference is a disagreement.
+        let e = settled("g2", vec![q(Some(812.40)), g(Some(812.00))], "agree", Some(812.40));
+        assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
 
         // Settled receipt, readers disagree, claude tiebreak matches gemma: accept.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(640.0));
-        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(812.40)));
-        assert!(errors(&run("h2", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g, c], "tiebreak_accept", Some(812.40)), CONFIG)).is_empty());
+        assert!(settled("h2", vec![q(Some(640.0)), g(Some(812.40)), c(Some(812.40))], "tiebreak_accept", Some(812.40)).is_empty());
 
         // Declining an accept the rule would give is safe (warning), never an error.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
-        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
-        let v = run("i", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "no_agreement", None), CONFIG);
+        let v = run("i", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q(Some(812.40)), g(Some(812.40))], "no_agreement", None), CONFIG);
         assert!(errors(&v).is_empty() && v.contains(&("IA6_outcome_mismatch", Severity::Warn)), "{v:?}");
 
         // Prompt v2 field names are mapped: both readers pick the by-cutoff figure after the cutoff -> no accept.
-        let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", Some(120.75), Some(150.25));
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
-        let e = errors(&run("v2a", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        let e = pending("v2a", vec![v2(q(Some(120.75)), "2026-02-06", Some(120.75), Some(150.25)), v2(g(Some(120.75)), "2026-02-06", Some(120.75), Some(150.25))], "agree", Some(120.75));
         assert!(e.contains(&"IA4_no_agreement") && !e.contains(&"IA13_unmapped_cutoff_field") && !e.contains(&"IA0_provenance_unreadable"), "{e:?}");
         // ...and on the after-cutoff figure: accept.
-        let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", Some(120.75), Some(150.25));
-        let c = anthropic(v2(read("vlm_fallback", C, 1024, 1500, true, Some(150.25)), "2026-02-06", Some(120.75), Some(150.25)));
-        assert!(errors(&run("v2b", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG)).is_empty());
+        let e = pending("v2b", vec![v2(q(Some(150.25)), "2026-02-06", Some(120.75), Some(150.25)), v2(g(Some(150.25)), "2026-02-06", Some(120.75), Some(150.25))], "agree", Some(150.25));
+        assert!(e.is_empty(), "{e:?}");
         // v2: after the cutoff with no after-cutoff amount -> nothing valid, never the by-cutoff figure.
-        let q = v2(read("vlm_primary", Q, 1024, 400, true, Some(120.75)), "2026-02-06", Some(120.75), None);
-        let c = anthropic(v2(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)), "2026-02-06", Some(120.75), None));
-        let e = errors(&run("v2c", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        let e = pending("v2c", vec![v2(q(Some(120.75)), "2026-02-06", Some(120.75), None), v2(g(Some(120.75)), "2026-02-06", Some(120.75), None)], "agree", Some(120.75));
         assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
 
-        // A renamed cutoff field (e.g. a prompt v2 schema) must not silently disable the cutoff rule.
-        let mut q = read("vlm_primary", Q, 1024, 400, true, Some(120.75));
-        q["cutoff_date"] = json!("2026-02-06");
-        q["amount_payable_after_deadline"] = json!(150.25);
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(120.75)));
-        let e = errors(&run("r", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(120.75)), CONFIG));
+        // A renamed cutoff field (e.g. a prompt schema change) must not silently disable the cutoff rule.
+        let mut qr = q(Some(120.75));
+        qr["cutoff_date"] = json!("2026-02-06");
+        qr["amount_payable_after_deadline"] = json!(150.25);
+        let e = pending("r", vec![qr, g(Some(120.75))], "agree", Some(120.75));
         assert!(e.contains(&"IA13_unmapped_cutoff_field"), "{e:?}");
 
-        // Analyst #317: counted reads must also agree on the parsed due cutoff.
+        // Analyst #317 / v3: counted reads must also agree on the parsed due cutoff.
         // Same amount, different cutoff dates -> no accept.
-        let q = cut(read("vlm_primary", Q, 1024, 400, true, Some(150.25)), "2026-02-06", 120.75, 150.25);
-        let c = cut(anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(150.25))), "2026-02-07", 120.75, 150.25);
-        let e = errors(&run("dc1", "image_05", resolution("image_05", "event_1786", "pending_bill_due_date", vec![q, c], "agree", Some(150.25)), CONFIG));
+        let e = pending("dc1", vec![cut(q(Some(150.25)), "2026-02-06", 120.75, 150.25), cut(g(Some(150.25)), "2026-02-07", 120.75, 150.25)], "agree", Some(150.25));
         assert!(e.contains(&"IA4_no_agreement") && e.contains(&"IA6_outcome_mismatch"), "{e:?}");
-        // Invented cutoff: one reader adds a cutoff the other page read does not have; same figure -> no accept.
-        let inv = cut(read("vlm_primary", Q, 1024, 400, true, Some(900.0)), "2023-01-01", 800.0, 900.0);
-        let c = anthropic(read("vlm_fallback", C, 1024, 1500, true, Some(900.0)));
-        let e = errors(&run("dc2", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv.clone(), c.clone()], "agree", Some(900.0)), CONFIG));
+        // Invented cutoff: one reader adds a cutoff the other read does not have; same figure -> no accept.
+        let inv = cut(q(Some(900.0)), "2023-01-01", 800.0, 900.0);
+        let e = errors(&run("dc2", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv.clone(), g(Some(900.0))], "agree", Some(900.0)), CONFIG));
         assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
-        // ...and a coincident tiebreak error (same figure, no cutoff) sides with the non-inventing reader: accept is legitimate.
-        let g = read("vlm_escalation", G, 768, 400, true, Some(900.0));
-        assert!(errors(&run("dc3", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv.clone(), c, g.clone()], "tiebreak_accept", Some(900.0)), CONFIG)).is_empty());
-        // Tiebreak without cutoff matching only the inventing reader (other reader failed): no accept.
-        let cf = anthropic(read("vlm_fallback", C, 1024, 1500, false, None));
-        let e = errors(&run("dc4", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv, cf, g], "tiebreak_accept", Some(900.0)), CONFIG));
+        // ...a claude tiebreak (no cutoff, same figure) sides with the non-inventing reader: legitimate accept.
+        assert!(errors(&run("dc3", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv.clone(), g(Some(900.0)), c(Some(900.0))], "tiebreak_accept", Some(900.0)), CONFIG)).is_empty());
+        // Tiebreak without cutoff matching only the inventing reader (gemma failed): no accept.
+        let e = errors(&run("dc4", "image_10", resolution("image_10", "event_6033", "pending_bill_due_date", vec![inv, read("vlm_escalation", G, 768, 400, false, None), c(Some(900.0))], "tiebreak_accept", Some(900.0)), CONFIG));
         assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
         // An unparseable cutoff never equals an absent one.
-        let mut q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
-        q["due_date"] = json!("CHARGED ON");
-        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
-        let e = errors(&run("dc5", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q, g], "agree", Some(812.40)), CONFIG));
+        let mut qx = q(Some(812.40));
+        qx["due_date"] = json!("CHARGED ON");
+        let e = settled("dc5", vec![qx, g(Some(812.40))], "agree", Some(812.40));
         assert!(e.contains(&"IA4_no_agreement"), "{e:?}");
 
         // Wrong class recorded.
-        let q = read("vlm_primary", Q, 1024, 400, true, Some(812.40));
-        let g = read("vlm_escalation", G, 768, 400, true, Some(812.40));
-        assert!(errors(&run("j", "image_07", resolution("image_07", "event_3231", "income_payslip", vec![q, g], "agree", Some(812.40)), CONFIG)).contains(&"IA10_class_mismatch"));
+        let e = errors(&run("j", "image_07", resolution("image_07", "event_3231", "income_payslip", vec![q(Some(812.40)), g(Some(812.40))], "agree", Some(812.40)), CONFIG));
+        assert!(e.contains(&"IA10_class_mismatch"), "{e:?}");
+
+        // A v2 table (claude reads pending bills) fails the v3 role expectation.
+        let v = run("cfg", "image_07", resolution("image_07", "event_3231", "settled_expense_receipt", vec![q(Some(812.40)), g(Some(812.40))], "agree", Some(812.40)), CONFIG_V2);
+        assert!(errors(&v).contains(&"IA14_routing_not_v3"), "{v:?}");
     }
 
     #[test]
@@ -753,7 +816,7 @@ readers = [ { role = "vlm_primary", max_dim_px = 1024, max_tokens = 400 }, { rol
         assert!(errors(&run("k", "image_07", p, "[selected]\nvlm_primary = \"x\"\n")).contains(&"IA9_no_routing_table"));
         let root = std::env::temp_dir().join(format!("verifier_ia3_noprov_{}", std::process::id()));
         std::fs::create_dir_all(root.join("store/processed/evidence")).unwrap();
-        std::fs::write(root.join("store/processed/evidence/request_73.json"), json!([{"record_id": "image_11#agree:vlm_primary+vlm_fallback", "source": "Image", "observed_at": "2023-01-19T00:00:00", "fact": {"EventAmount": {"event_id": "event_6859", "amount": 25_000_000_i64, "currency": "INR"}}}]).to_string()).unwrap();
+        std::fs::write(root.join("store/processed/evidence/request_73.json"), json!([{"record_id": "image_11#agree:vlm_primary+vlm_escalation", "source": "Image", "observed_at": "2023-01-19T00:00:00", "fact": {"EventAmount": {"event_id": "event_6859", "amount": 25_000_000_i64, "currency": "INR"}}}]).to_string()).unwrap();
         std::fs::write(root.join("models.toml"), CONFIG).unwrap();
         let dataset = Path::new(env!("CARGO_MANIFEST_DIR")).join("../dataset");
         assert!(check(&root, &dataset, &root.join("models.toml")).unwrap().iter().any(|f| f.code == "IA1_no_agreement_provenance"));
