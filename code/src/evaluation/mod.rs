@@ -81,6 +81,7 @@ pub fn cli(args: &[String]) -> Result<i32> {
         }
         Some("hardcode") => {
             let code_dir = code_dir.unwrap_or_else(|| PathBuf::from("."));
+            let code_dir = std::fs::canonicalize(&code_dir).unwrap_or(code_dir);
             let root = code_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(".."));
             let f = hardcode_scan::scan(&code_dir, &dataset, Some(&root.join("docs/gold_subset.json")), Some(&root.join("RULES.md")))?;
             for x in &f {
