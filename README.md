@@ -1,5 +1,7 @@
 # Buy or Wait? — a verified-or-fail-closed financial decision agent
 
+> **Postmortem:** an honest review of results (rank 141/~3,000, 95th percentile, 65.2/100), failures and lessons is in [`docs/POSTMORTEM.md`](docs/POSTMORTEM.md).
+
 **Buy or Wait?** answers one question for every purchase or payment request: *should this person pay now, pay in part, use installments, wait, or not go ahead at all?* For each of the 250 requests it:
 - **reconstructs** the user's real cash position from their profile, financial events, dated exchange rates, supplied payment options, and untrusted evidence in messages and receipt images;
 - **forecasts** the balance day by day against the minimum they want to keep;
